@@ -6,8 +6,8 @@ from PIL import Image
 LAT0 = 45.8878
 LON0 = 13.8869
 SIZE_M = 100000.0   # 100 km x 100 km (-50km..+50km)
-GRID = 1024         # 1024 x 1024 (~97.7 m/sample, bilinear in sim)
-ZOOM = 10           # ~100 m/px at 45.9 deg N -> crisp match for 100 km @ 1024
+GRID = 2048         # 1024 x 1024 (~97.7 m/sample, bilinear in sim)
+ZOOM = 11           # ~100 m/px at 45.9 deg N -> crisp match for 100 km @ 1024
 
 M_PER_DEG_LAT = 111132.92
 M_PER_DEG_LON = 111412.84 * math.cos(math.radians(LAT0))

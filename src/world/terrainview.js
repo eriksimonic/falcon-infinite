@@ -51,6 +51,246 @@ const PALETTES = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Fragment-side surface detail, one tuning block per theater.
+// rockColors: [sunlit strata, mid limestone, shadowed member, scree]
+// fieldColors: [olive grove, tilled earth, sunlit meadow, vine rows]
+// ---------------------------------------------------------------------------
+const TERRAIN_DETAILS = {
+  temperate: {
+    detailAlbedo: 1.0,
+    bump: 0.75,
+    rock: 0.9,
+    field: 0.46,
+    sheen: 0.05,
+    strataPeriod: 9.5,
+    strataContrast: 0.85,
+    rockColors: [0xb6ae9c, 0x8f887b, 0x625c52, 0x9d9484],
+    fieldColors: [0x7f9450, 0xa58d60, 0xb8c57c, 0x5c783d],
+  },
+  desert: {
+    detailAlbedo: 0.86,
+    bump: 0.82,
+    rock: 1.0,
+    field: 0.12,
+    sheen: 0.03,
+    strataPeriod: 12.5,
+    strataContrast: 0.7,
+    rockColors: [0xb38d64, 0x96714f, 0x6a513b, 0xa2805c],
+    fieldColors: [0x8f8a58, 0xb29a6b, 0xa9a06b, 0x76794a],
+  },
+  vipava: {
+    detailAlbedo: 1.06,
+    bump: 0.86,
+    rock: 1.0,
+    field: 0.72,
+    sheen: 0.06,
+    strataPeriod: 8.2,
+    strataContrast: 1.0,
+    rockColors: [0xd4cebb, 0xaba491, 0x776f62, 0xbab2a2],
+    fieldColors: [0x73923f, 0xab926a, 0xafc573, 0x50732d],
+  },
+};
+
+const DETAIL_VERTEX_PARS = /* glsl */`
+varying vec3 vTerrWorld;
+`;
+
+const DETAIL_VERTEX_MAIN = /* glsl */`
+  vTerrWorld = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz;
+`;
+
+// Fragment prologue: uniforms, hash, analytic-gradient value noise, strata.
+const DETAIL_FRAGMENT_PARS = /* glsl */`
+uniform vec3 uTerrRockLight;
+uniform vec3 uTerrRockMid;
+uniform vec3 uTerrRockDark;
+uniform vec3 uTerrScree;
+uniform vec3 uTerrFieldA;
+uniform vec3 uTerrFieldB;
+uniform vec3 uTerrFieldC;
+uniform vec3 uTerrFieldD;
+uniform vec4 uTerrShape;    // x albedo detail, y bump, z rock, w fields
+uniform vec2 uTerrStrata;   // x period (m), y contrast
+uniform float uTerrSheen;
+uniform vec3 uTerrSunDir;
+uniform vec3 uTerrSunColor;
+varying vec3 vTerrWorld;
+
+// Cheap stable hash (Dave Hoskins style); world coords up to ~5e4.
+float thHash( vec2 p ) {
+  vec3 p3 = fract( p.xyx * 0.1031 );
+  p3 += dot( p3, p3.yzx + 33.33 );
+  return fract( ( p3.x + p3.y ) * p3.z );
+}
+
+// Value noise with analytic derivatives:
+//   x = value in [0,1], yz = d(value)/d(p) in noise space.
+vec3 thNoise( vec2 p, float seed ) {
+  vec2 i = floor( p );
+  vec2 f = p - i;
+  vec2 w = f * f * f * ( f * ( f * 6.0 - 15.0 ) + 10.0 );
+  vec2 dw = 30.0 * f * f * ( f * ( f - 2.0 ) + 1.0 );
+  vec2 s = i + seed;
+  float a = thHash( s );
+  float b = thHash( s + vec2( 1.0, 0.0 ) );
+  float c = thHash( s + vec2( 0.0, 1.0 ) );
+  float d = thHash( s + vec2( 1.0, 1.0 ) );
+  float ab = a + ( b - a ) * w.x;
+  float cd = c + ( d - c ) * w.x;
+  float v = ab + ( cd - ab ) * w.y;
+  return vec3(
+    v,
+    ( ( b - a ) + ( d - c - b + a ) * w.y ) * dw.x,
+    ( cd - ab ) * dw.y
+  );
+}
+
+// Horizontal sedimentary/Karst strata: crisp members, dark seams, warped so
+// the layers undulate instead of reading as a ruler.
+float thStrata( float y, float warp, float period, float contrast ) {
+  float t = ( y + warp ) / period;
+  float s1 = abs( fract( t ) * 2.0 - 1.0 );
+  float s2 = abs( fract( t * 0.271 + 0.37 ) * 2.0 - 1.0 );
+  float band = smoothstep( 0.28, 0.62, s1 );
+  float member = smoothstep( 0.35, 0.65, s2 );
+  float seam = 1.0 - smoothstep( 0.0, 0.09, s1 );
+  return clamp( ( band * 0.72 + member * 0.28 ) * ( 1.0 - seam * 0.55 * contrast ) + 0.12, 0.0, 1.0 );
+}
+`;
+
+// Albedo / micro-roughness pass, injected right after <color_fragment>.
+const DETAIL_ALBEDO = /* glsl */`
+  vec3 terrBase = diffuseColor.rgb;
+  vec2 terrP = vTerrWorld.xz;
+  float terrDist = length( vTerrWorld - cameraPosition );
+
+  // Octave fade bands: nothing above the Nyquist limit of the far field.
+  float f6 = 1.0 - smoothstep( 400.0, 2600.0, terrDist );
+  float f28 = 1.0 - smoothstep( 1800.0, 9000.0, terrDist );
+
+  // 6 m / 28 m / 140 m world-space detail octaves.
+  vec3 n6 = thNoise( terrP * ( 1.0 / 6.0 ), 11.0 );
+  vec3 n28 = thNoise( terrP * ( 1.0 / 28.0 ), 37.0 );
+  vec3 n140 = thNoise( terrP * ( 1.0 / 140.0 ), 73.0 );
+  float d6 = n6.x - 0.5;
+  float d28 = n28.x - 0.5;
+  float d140 = n140.x - 0.5;
+
+  // Analytic detail displacement (m) and gradient (m per m).
+  float detailH = d6 * 0.55 * f6 + d28 * 1.8 * f28 + d140 * 4.2;
+  vec2 detailG = n6.yz * ( 0.55 * f6 / 6.0 )
+               + n28.yz * ( 1.8 * f28 / 28.0 )
+               + n140.yz * ( 4.2 / 140.0 );
+
+  vec3 terrN = normalize( vec4( normalize( vNormal ), 0.0 ) * viewMatrix ).xyz;
+  float terrSlope = length( terrN.xz ) / max( abs( terrN.y ), 0.08 );
+
+  vec3 terrAlb = terrBase;
+  float terrLum = dot( terrBase, vec3( 0.2126, 0.7152, 0.0722 ) );
+  float snowMask = smoothstep( 0.60, 0.80, terrLum );
+  float detailA = uTerrShape.x * ( 1.0 - 0.55 * snowMask );
+
+  // 1) Tactile albedo break-up: breaks the smooth vertex-colour plastic look.
+  float tone = 1.0 + ( d6 * 0.26 * f6 + d28 * 0.32 * f28 + d140 * 0.22 ) * detailA;
+  terrAlb *= clamp( tone, 0.62, 1.42 );
+  // sunlit ridges warm, hollows cool
+  float warmth = clamp( 0.5 + d28 * 1.7 + d6 * 0.9, 0.0, 1.0 );
+  vec3 warmTint = mix( vec3( 0.93, 0.97, 1.05 ), vec3( 1.07, 1.01, 0.92 ), warmth );
+  terrAlb *= mix( vec3( 1.0 ), warmTint, 0.34 * detailA * ( 1.0 - snowMask ) );
+
+  // 2) Geological cliffs: crisp strata bands, scree, crevice darkening.
+  float rockMask = smoothstep( 0.34, 0.62, terrSlope ) * uTerrShape.z;
+  float strataAA = 1.0 - smoothstep( 0.25, 0.85,
+    fwidth( vTerrWorld.y ) / max( uTerrStrata.x, 1.0 ) );
+  float warp = ( d140 * 0.9 + d28 * 0.15 ) * uTerrStrata.x;
+  float band = thStrata( vTerrWorld.y, warp, uTerrStrata.x, uTerrStrata.y );
+  band = mix( 0.52, band, strataAA );
+  float scree = smoothstep( 0.42, 0.80, n28.x ) * smoothstep( 0.30, 0.60, terrSlope );
+  float crev = smoothstep( 0.03, 0.34, abs( d6 ) * 2.0 );
+  crev = mix( 1.0, crev, f6 );
+
+  vec3 rockCol = mix( uTerrRockDark, uTerrRockLight, band * 0.72 + 0.14 );
+  rockCol = mix( rockCol, uTerrRockMid, 0.22 * ( 0.5 + d28 ) );
+  rockCol = mix( rockCol, uTerrScree, scree * 0.45 );
+  rockCol *= mix( 1.0, crev, 0.72 * ( 1.0 - snowMask ) );
+  rockCol *= 1.0 + d6 * 0.16 * f6 + d28 * 0.12 * f28;
+  terrAlb = mix( terrAlb, rockCol, rockMask * ( 1.0 - snowMask * 0.85 ) );
+
+  // 3) Valley agricultural patchwork: rotated parcels on flat 20..320 m land.
+  float fieldHeight = smoothstep( 20.0, 34.0, vTerrWorld.y )
+                    * ( 1.0 - smoothstep( 286.0, 320.0, vTerrWorld.y ) );
+  float fieldFlat = 1.0 - smoothstep( 0.055, 0.14, terrSlope );
+  float fieldMask = fieldHeight * fieldFlat * smoothstep( 0.30, 0.62, n140.x )
+                  * uTerrShape.w * ( 1.0 - snowMask );
+  float fieldAA = 1.0 - smoothstep( 0.16, 0.50,
+    ( fwidth( terrP.x ) + fwidth( terrP.y ) ) / 110.0 );
+
+  // Rotation drifts with the macro noise so neighbouring valleys differ.
+  float rot = mix( -0.5, 0.62, n140.x ) + d28 * 0.18;
+  float cr = cos( rot );
+  float sr = sin( rot );
+  vec2 rp = vec2( terrP.x * cr - terrP.y * sr, terrP.x * sr + terrP.y * cr );
+  vec2 gcell = rp / vec2( 96.0, 143.0 );
+  vec2 cell = floor( gcell );
+  vec2 cf = fract( gcell );
+  float ch = thHash( cell + 19.0 );
+
+  vec3 fieldCol = mix( uTerrFieldB, uTerrFieldC, smoothstep( 0.16, 0.30, ch ) );
+  fieldCol = mix( fieldCol, uTerrFieldA, smoothstep( 0.46, 0.60, ch ) );
+  fieldCol = mix( fieldCol, uTerrFieldD, smoothstep( 0.74, 0.86, ch ) );
+  fieldCol *= 0.86 + 0.30 * fract( ch * 7.31 );          // mown vs lush parcels
+  fieldCol = mix( terrBase, fieldCol, 0.72 );            // stay in palette
+
+  // Vineyard rows / plough furrows, faded before they alias.
+  float vine = smoothstep( 0.70, 0.84, ch );
+  float rowFade = ( 1.0 - smoothstep( 0.7, 2.0, fwidth( cf.x ) * 56.6 ) )
+                * ( 1.0 - smoothstep( 1400.0, 3200.0, terrDist ) );
+  float rows = 0.5 + 0.5 * sin( cf.x * 56.6 + ch * 12.0 );
+  fieldCol *= mix( 1.0, mix( 0.78, 1.10, rows ), vine * rowFade );
+
+  // Field tracks / hedgerows between parcels.
+  float edge = min( min( cf.x, 1.0 - cf.x ), min( cf.y, 1.0 - cf.y ) );
+  float border = smoothstep( 0.0, 0.045, edge );
+  fieldCol *= mix( 0.68, 1.0, border );
+
+  terrAlb = mix( terrAlb, fieldCol, fieldMask * fieldAA * mix( 0.55, 1.0, border ) );
+  diffuseColor.rgb = terrAlb;
+`;
+
+// Micro-bump pass, injected right after <normal_fragment_begin>.
+const DETAIL_NORMAL = /* glsl */`
+  // 4) Analytic micro-bump: tilt the lit normal by the detail gradient so the
+  // sun carves out ridges, ledges and terraces. Fades out before 22 km.
+  float bumpFade = 1.0 - smoothstep( 15000.0, 22000.0, terrDist );
+  float microAA = 1.0 - smoothstep( 0.35, 1.6, fwidth( terrP.x ) + fwidth( terrP.y ) );
+  float bumpAmt = uTerrShape.y * bumpFade * microAA * mix( 1.0, 1.35, rockMask );
+  vec2 bumpG = detailG;
+
+  float bandUp = thStrata( vTerrWorld.y + 0.5, warp, uTerrStrata.x, uTerrStrata.y );
+  float bandDown = thStrata( vTerrWorld.y - 0.5, warp, uTerrStrata.x, uTerrStrata.y );
+  float strataTilt = ( bandUp - bandDown ) * rockMask * strataAA * bumpFade * 0.10;
+
+  vec3 terrNp = normalize( vec3(
+    terrN.x - bumpG.x * bumpAmt,
+    terrN.y - strataTilt,
+    terrN.z - bumpG.y * bumpAmt
+  ) );
+  normal = normalize( mat3( viewMatrix ) * terrNp );
+`;
+
+// Micro-roughness sheen, injected where the outgoing radiance is summed.
+const DETAIL_SHEEN = /* glsl */`
+  // 1b) Micro-roughness: rough ground scatters, smooth ground glints.
+  vec3 terrV = normalize( cameraPosition - vTerrWorld );
+  vec3 terrH = normalize( uTerrSunDir + terrV );
+  float terrRough = clamp( 0.62 + d28 * 0.55 - d6 * 0.35
+    + terrSlope * 0.22 + rockMask * 0.25, 0.05, 1.0 );
+  float terrGlint = pow( max( dot( terrNp, terrH ), 0.0 ), mix( 90.0, 6.0, terrRough ) );
+  outgoingLight += uTerrSunColor * ( terrGlint * ( 1.0 - terrRough )
+    * uTerrSheen * bumpFade );
+`;
+
 function distanceToRect(px, pz, x, z, size) {
   const dx = Math.max(x - px, 0, px - (x + size));
   const dz = Math.max(z - pz, 0, pz - (z + size));
@@ -100,12 +340,48 @@ export class TerrainView {
     this.group.name = 'terrain';
     this.scene.add(this.group);
 
+    // Uniforms shared with the shader patch below. They outlive onBeforeCompile
+    // so retuning a theater only rewrites values, never recompiles the program.
+    this.detailUniforms = {
+      uTerrRockLight: { value: new THREE.Color(0xffffff) },
+      uTerrRockMid: { value: new THREE.Color(0xffffff) },
+      uTerrRockDark: { value: new THREE.Color(0xffffff) },
+      uTerrScree: { value: new THREE.Color(0xffffff) },
+      uTerrFieldA: { value: new THREE.Color(0xffffff) },
+      uTerrFieldB: { value: new THREE.Color(0xffffff) },
+      uTerrFieldC: { value: new THREE.Color(0xffffff) },
+      uTerrFieldD: { value: new THREE.Color(0xffffff) },
+      uTerrShape: { value: new THREE.Vector4(1, 0.8, 0.9, 0.4) },
+      uTerrStrata: { value: new THREE.Vector2(9.5, 0.9) },
+      uTerrSheen: { value: 0.05 },
+      uTerrSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.2) },
+      uTerrSunColor: { value: new THREE.Color(0xfff2d0) },
+    };
+
+    // Keep the stock Lambert material: fog, directional/hemisphere lights and
+    // shadow lookups stay exactly as Three.js computes them, and the detail is
+    // layered on top through onBeforeCompile.
     this.material = new THREE.MeshLambertMaterial({
       vertexColors: true,
       side: THREE.DoubleSide,
       emissive: 0x0a1008,
       emissiveIntensity: 0.45,
     });
+    this.material.onBeforeCompile = (shader) => {
+      Object.assign(shader.uniforms, this.detailUniforms);
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\n' + DETAIL_VERTEX_PARS)
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\n' + DETAIL_VERTEX_MAIN);
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\n' + DETAIL_FRAGMENT_PARS)
+        .replace('#include <color_fragment>', '#include <color_fragment>\n' + DETAIL_ALBEDO)
+        .replace('#include <normal_fragment_begin>', '#include <normal_fragment_begin>\n' + DETAIL_NORMAL)
+        .replace(
+          'vec3 outgoingLight = reflectedLight.directDiffuse + reflectedLight.indirectDiffuse + totalEmissiveRadiance;',
+          'vec3 outgoingLight = reflectedLight.directDiffuse + reflectedLight.indirectDiffuse + totalEmissiveRadiance;\n' + DETAIL_SHEEN,
+        );
+    };
+    this.material.customProgramCacheKey = () => 'terrain-detail-v1';
 
     this.tiles = new Map();       // key -> mesh
     this._stale = new Set();      // keys kept alive until LOD replacements build
@@ -120,6 +396,7 @@ export class TerrainView {
 
     this._leafPool = [];
     this.theater = 'temperate';
+    this._applyDetailPalette();
   }
 
   setTheater(name) {
@@ -127,11 +404,30 @@ export class TerrainView {
     if (next === this.theater) return;
     this.theater = next;
     this.water.setPalette(PALETTES[next]);
+    this._applyDetailPalette();
     // Drop every cached tile so terrain repaints cleanly in the new palette:
     // no old-LOD geometry survives to overlap the rebuilt quadtree.
     this._clearTiles();
     this.lastBuildX = Infinity;
     this.lastBuildZ = Infinity;
+  }
+
+  /** Copy the active theater's rock/field tuning into the shader uniforms. */
+  _applyDetailPalette() {
+    const d = TERRAIN_DETAILS[this.theater] || TERRAIN_DETAILS.temperate;
+    const u = this.detailUniforms;
+    const col = (hex) => new THREE.Color(hex).convertSRGBToLinear();
+    u.uTerrRockLight.value.copy(col(d.rockColors[0]));
+    u.uTerrRockMid.value.copy(col(d.rockColors[1]));
+    u.uTerrRockDark.value.copy(col(d.rockColors[2]));
+    u.uTerrScree.value.copy(col(d.rockColors[3]));
+    u.uTerrFieldA.value.copy(col(d.fieldColors[0]));
+    u.uTerrFieldB.value.copy(col(d.fieldColors[1]));
+    u.uTerrFieldC.value.copy(col(d.fieldColors[2]));
+    u.uTerrFieldD.value.copy(col(d.fieldColors[3]));
+    u.uTerrShape.value.set(d.detailAlbedo, d.bump, d.rock, d.field);
+    u.uTerrStrata.value.set(d.strataPeriod, d.strataContrast);
+    u.uTerrSheen.value = d.sheen;
   }
 
   /** Force a rebuild of the visible quadtree (used at boot and on teleport). */
@@ -164,7 +460,9 @@ export class TerrainView {
     const leaves = [];
     const maxLevel = CONFIG.world.terrainMaxLevel;
     const minSize = CONFIG.world.terrainMinSize;
-    const factor = CONFIG.world.terrainDetailDistance;
+    // Split a shade earlier than the config radius: ~6% more leaves, so ridge
+    // silhouettes stay crisp while flying fast, without a tile-count blow-up.
+    const factor = CONFIG.world.terrainDetailDistance * 1.06;
 
     const visit = (x, z, size, level) => {
       const d = distanceToRect(camX, camZ, x, z, size);
@@ -225,8 +523,10 @@ export class TerrainView {
 
   _buildTile(node) {
     const { x, z, size, level } = node;
+    // Mid rings go slightly denser than far ones (capped by the quality
+    // preset); near rings already use segmentsNear.
     const segs = level >= 6 ? this.preset.segmentsNear
-      : level >= 3 ? 28 : this.preset.segmentsFar;
+      : level >= 3 ? Math.max(28, Math.min(this.preset.segmentsNear, 32)) : this.preset.segmentsFar;
     const N = segs + 1;
     const step = size / segs;
 
@@ -367,6 +667,9 @@ export class TerrainView {
   }
 
   setAtmosphere(sunDir, sunColor, skyColor) {
+    // Keep the terrain sheen in step with the sun used by sky + water.
+    if (sunDir) this.detailUniforms.uTerrSunDir.value.copy(sunDir);
+    if (sunColor) this.detailUniforms.uTerrSunColor.value.copy(sunColor);
     this.water.setAtmosphere(sunDir, sunColor, skyColor);
   }
 
