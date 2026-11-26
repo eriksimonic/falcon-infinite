@@ -318,7 +318,136 @@ check(highLevel !== null && highLevel > lowLevel + 1,
 }
 
 // ---------------------------------------------------------------------------
-// 4. Real baked dataset builds end to end
+// 4. River samples inside lake / wide-river polygons are clipped
+// ---------------------------------------------------------------------------
+// OSM bakes wide rivers and reservoirs as BOTH a polygon and a centreline, so
+// an unclipped ribbon (heightAt + 0.35) floats under/over the lake sheet
+// (medianPerimeterH + 0.85). Centreline samples inside a water polygon must be
+// dropped, breaking the strip so no triangle spans the gap.
+function pointInPoly(x, z, pts) {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const xi = pts[i][0], zi = pts[i][1];
+    const xj = pts[j][0], zj = pts[j][1];
+    if ((zi > z) !== (zj > z) && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+{
+  const flat = () => 40;
+  const lake = [[5, 5], [995, 5], [995, 788], [5, 788]];
+  const crossPts = [[-990, 400], [1010, 400]]; // straight through the lake
+
+  const noLake = buildInlandWaterGeometry({ rivers: [{ w: 15, pts: crossPts }], lakes: [] }, flat);
+  const clipped = buildInlandWaterGeometry(
+    { rivers: [{ w: 15, pts: crossPts }], lakes: [lake] }, flat);
+
+  // Independent expectation: the builder resamples this 2,000 m line every
+  // 25 m, keeping both endpoints (81 samples).
+  const samples = [];
+  for (let x = -990; x <= 1010; x += 25) samples.push(x);
+  const kept = samples.filter((x) => !pointInPoly(x, 400, lake));
+  const dropped = samples.length - kept.length;
+  const runs = [];
+  let run = [];
+  for (const x of samples) {
+    if (pointInPoly(x, 400, lake)) {
+      if (run.length) { runs.push(run); run = []; }
+    } else {
+      run.push(x);
+    }
+  }
+  if (run.length) runs.push(run);
+  const expectedSegments = runs.reduce((n, r) => n + Math.max(0, r.length - 1), 0);
+
+  check(dropped === 40, `fixture clips 40 of ${samples.length} river samples (${dropped})`);
+  check(expectedSegments === 39 && runs.length === 2,
+    `fixture breaks the river into 2 strips of ${expectedSegments} segments`);
+  check(noLake.riverSegments === samples.length - 1,
+    `unclipped river spans every sample (${noLake.riverSegments})`);
+  check(clipped.riverSegments === expectedSegments,
+    `clipped riverSegments ${clipped.riverSegments} (want ${expectedSegments})`);
+  check(clipped.riverSegments < noLake.riverSegments,
+    'clipping removes river triangles that lay inside the lake');
+  check(clipped.lakeCount === 1, 'the lake polygon still builds alongside the clipped river');
+
+  const riverVerts = kept.length * 2;
+  check(clipped.positions.length / 3 === riverVerts + lake.length,
+    `only outside-lake river vertices emitted (${clipped.positions.length / 3} total)`);
+
+  // No river vertex may sit over the water sheet.
+  let floats = 0;
+  for (let i = 0; i < riverVerts; i++) {
+    const x = clipped.positions[i * 3];
+    const z = clipped.positions[i * 3 + 2];
+    if (pointInPoly(x, z, lake)) floats++;
+  }
+  check(floats === 0, `no river vertices inside the lake polygon (${floats} floating)`);
+
+  // River bank vertices stay at heightAt + 0.35; the lake sheet stays at +0.85
+  // above the shoreline, so the two never interleave.
+  const lakeLevel = expectedLakeLevel(lake, flat);
+  near(lakeLevel, 40.85, 1e-9, 'clipping fixture lake level');
+  for (let i = 0; i < riverVerts; i++) {
+    near(clipped.positions[i * 3 + 1], flat() + 0.35, 1e-3, `kept river vertex ${i} lift`);
+  }
+  for (let i = riverVerts; i < clipped.positions.length / 3; i++) {
+    near(clipped.positions[i * 3 + 1], lakeLevel, 1e-3, `lake vertex ${i} level`);
+  }
+
+  // River indices come first; every river triangle must lie clear of the lake
+  // and is pushed with +Y winding even across the clipped gap.
+  let insideTris = 0;
+  let downRiverTris = 0;
+  let riverTris = 0;
+  let maxIndex = 0;
+  for (let i = 0; i < clipped.riverSegments * 6; i += 3) {
+    const a = clipped.indices[i];
+    const b = clipped.indices[i + 1];
+    const c = clipped.indices[i + 2];
+    riverTris++;
+    maxIndex = Math.max(maxIndex, a, b, c);
+    const cx = (clipped.positions[a * 3] + clipped.positions[b * 3] + clipped.positions[c * 3]) / 3;
+    const cz = (clipped.positions[a * 3 + 2] + clipped.positions[b * 3 + 2] + clipped.positions[c * 3 + 2]) / 3;
+    if (pointInPoly(cx, cz, lake)) insideTris++;
+    if (normalY(clipped.positions, a, b, c) <= 0) downRiverTris++;
+  }
+  check(riverTris === clipped.riverSegments * 2, `clipped river emits ${riverTris} triangles`);
+  check(maxIndex < riverVerts, 'clipped river indices stay within its vertices');
+  check(insideTris === 0, `no river triangle covers the lake surface (${insideTris})`);
+  check(downRiverTris === 0, 'clipped river triangles still face +Y');
+
+  // Kept samples exist on both banks of the lake: the river resumes downstream.
+  let west = 0;
+  let east = 0;
+  for (let i = 0; i < riverVerts; i += 2) {
+    const midX = (clipped.positions[i * 3] + clipped.positions[i * 3 + 3]) / 2;
+    if (midX < 5) west++;
+    if (midX > 995) east++;
+  }
+  check(west > 0 && east > 0, `river survives on both sides of the lake (${west} west, ${east} east)`);
+
+  // A river entirely swallowed by a water polygon disappears, leaving the lake.
+  const swallowed = buildInlandWaterGeometry(
+    { rivers: [{ w: 15, pts: [[100, 400], [900, 400]] }], lakes: [lake] }, flat);
+  check(swallowed.riverSegments === 0, 'river fully inside the lake emits no ribbons');
+  check(swallowed.positions.length / 3 === lake.length,
+    'swallowed river emits no vertices, the lake sheet remains');
+  check(swallowed.lakeCount === 1, 'lake still triangulated for a swallowed river');
+
+  // A lake far from the centreline must not disturb the river at all.
+  const farLake = buildInlandWaterGeometry({
+    rivers: [{ w: 15, pts: crossPts }],
+    lakes: [[[5000, 5000], [6000, 5000], [6000, 5800], [5000, 5800]]],
+  }, flat);
+  check(farLake.riverSegments === noLake.riverSegments,
+    'a distant lake leaves the river untouched');
+}
+
+// ---------------------------------------------------------------------------
+// 5. Real baked dataset builds end to end
 // ---------------------------------------------------------------------------
 {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -342,7 +471,7 @@ check(highLevel !== null && highLevel > lowLevel + 1,
 }
 
 // ---------------------------------------------------------------------------
-// 5. InlandWaterSystem is headless-safe and clears cleanly
+// 6. InlandWaterSystem is headless-safe and clears cleanly
 // ---------------------------------------------------------------------------
 {
   const sys = new InlandWaterSystem(null);

@@ -162,6 +162,39 @@ function openPolygon(pts) {
   return out.length >= 3 ? out : null;
 }
 
+/**
+ * Standard even-odd ray-casting point-in-polygon test for an open [x, z]
+ * contour. Points exactly on an edge are not guaranteed either way, which is
+ * fine: river samples are resampled every 25 m and never land on a shoreline.
+ */
+function pointInPolygon2D(x, z, contour) {
+  let inside = false;
+  for (let i = 0, j = contour.length - 1; i < contour.length; j = i++) {
+    const xi = contour[i][0];
+    const zi = contour[i][1];
+    const xj = contour[j][0];
+    const zj = contour[j][1];
+    if ((zi > z) !== (zj > z) && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/**
+ * True when (x, z) lies inside any prepared lake/water polygon. AABB
+ * rejection keeps this cheap: OSM ships 351 water polygons and 1,124 rivers,
+ * so a naive all-polygon raycast per river sample would be ~8 M edge tests.
+ */
+function pointInLakePolygons(x, z, preparedLakes) {
+  for (let i = 0; i < preparedLakes.length; i++) {
+    const lake = preparedLakes[i];
+    if (x < lake.minX || x > lake.maxX || z < lake.minZ || z > lake.maxZ) continue;
+    if (pointInPolygon2D(x, z, lake.contour)) return true;
+  }
+  return false;
+}
+
 /** Signed area of a polygon in the (x, z) plane (positive = CCW). */
 function signedArea2D(pts) {
   let area = 0;
@@ -190,6 +223,32 @@ export function buildInlandWaterGeometry(data, heightAt) {
   const rivers = Array.isArray(data?.rivers) ? data.rivers : [];
   const lakes = Array.isArray(data?.lakes) ? data.lakes : [];
 
+  // -- Pre-collect water polygons & AABBs ------------------------------------
+  // OSM maps wide rivers (Soča, Vipava, Isonzo) and reservoirs as BOTH
+  // `natural=water` polygons and `waterway=river` centrelines, so 22% of the
+  // resampled river vertices land inside a water polygon. Collecting every
+  // valid polygon up front lets the river pass clip those samples instead of
+  // stacking a ribbon 0.35 m above the 0.85 m lake sheet.
+  const preparedLakes = [];
+  for (const raw of lakes) {
+    const contour = openPolygon(raw);
+    if (!contour) continue;
+    const level = lakeWaterLevel(contour, heightAt);
+    if (!Number.isFinite(level)) continue;
+
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (const [x, z] of contour) {
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (z < minZ) minZ = z;
+      if (z > maxZ) maxZ = z;
+    }
+    preparedLakes.push({ minX, maxX, minZ, maxZ, contour, level });
+  }
+
   // -- Rivers: ribbon strip, resampled evenly along the centreline ----------
   for (const river of rivers) {
     if (!river || !Array.isArray(river.pts)) continue;
@@ -200,6 +259,14 @@ export function buildInlandWaterGeometry(data, heightAt) {
     let prevPair = null; // [leftIdx, rightIdx] of the previous kept sample
     for (let i = 0; i < samples.length; i++) {
       const [x, z] = samples[i];
+
+      // The water polygon owns everything inside its shoreline: drop the
+      // ribbon sample and break the strip so no triangle spans the gap.
+      if (pointInLakePolygons(x, z, preparedLakes)) {
+        prevPair = null;
+        continue;
+      }
+
       const hCentre = heightAt(x, z);
       // The sea plane owns everything at/below sea level.
       if (!Number.isFinite(hCentre) || hCentre <= SEA_CUTOFF_M) {
@@ -244,11 +311,8 @@ export function buildInlandWaterGeometry(data, heightAt) {
   }
 
   // -- Lakes: one flat level per polygon, earcut triangulation -------------
-  for (const raw of lakes) {
-    const contour = openPolygon(raw);
-    if (!contour) continue;
-    const level = lakeWaterLevel(contour, heightAt);
-    if (!Number.isFinite(level)) continue;
+  for (const lake of preparedLakes) {
+    const { contour, level } = lake;
 
     // +Y faces need clockwise winding in the (x, z) plane; flip if CCW.
     const winding = contour.slice();

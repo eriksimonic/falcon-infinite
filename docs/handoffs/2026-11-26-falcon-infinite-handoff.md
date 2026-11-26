@@ -20,7 +20,7 @@
 ### Strict Role Split (IMPORTANT — Follow This Rule)
 - **AGY (Antigravity) = Coordinator ONLY**:
   - Plans architecture and feature breakdowns.
-  - Writes clear, disjoint, worker-ready spec documents in `docs/features/` (next number: **`36-...`**).
+  - Writes clear, disjoint, worker-ready spec documents in `docs/features/` (next number: **`37-...`**).
   - Dispatches parallel **Hermes** workers for **ALL implementation** AND **ALL validation**.
   - Reviews worker summaries, manages git commits/pushes/handoffs — **does NOT write feature implementation code directly**.
 - **Hermes (`/home/erik/.local/bin/hermes`) = Implementation & Validation Workers**:
@@ -30,7 +30,7 @@
 
 ---
 
-## 3. Completed Systems (Waves 1–14, Features 01–35)
+## 3. Completed Systems (Waves 1–14, Features 01–36)
 
 ### Core, Audio & MCP / AI WSO
 - `src/core/audio.js` — Layered procedural F-16 turbofan engine + atmospheric wind + radial-velocity **Doppler pitch shift** for flyby camera.
@@ -55,7 +55,7 @@
 - `src/world/terrain.js` + `src/world/airports.js` — `setCustomAirports()` flattens and renders real Vipava Valley runways: **Ajdovščina `LJAJ` (RWY 09/27, `090°` East–West, 1,800 m)**, `LJPO` Postojna, `LJDI` Divača, `LIPQ` Trieste Intl, `LJPZ` Portorož.
 - `public/media/vipava_osm.json` (`608 KB`) + `src/world/buildings.js` + `src/world/roadnet.js` — **7,770 real OSM buildings** across 11 cities (Ajdovščina, Vipava, Nova Gorica, Gorizia, Solkan, Tolmin, Trieste, Koper, Postojna, Sežana, Divača, Idrija, Monfalcone, Štanjel) with per-building distance streaming, plus **2,933 real OSM highways** (continuous terrain-conforming ribbons, `<= 10.5 m` carriageway cap, airport-pad clipped, `renderOrder: 1`).
 - `src/world/landmarks.js` — **12 iconic 3D landmarks** with `-4 m` foundation skirts & animated beacons: Sveta Gora Basilica, Solkan Stone Arch Bridge, Solkan Dam, Vogršček Dam, Nanos Broadcast Tower (Pleša), Gorizia Castle, Kostanjevica Monastery, Trieste Faro della Vittoria, Piran St. George Bell Tower, Predjama Castle, Štanjel, Vipava H4 Viaduct.
-- `src/world/water.js` + `public/media/vipava_water.json` (`917 KB`) — **1,124 real OSM rivers** (Vipava, Soča, Idrijca, Hubelj) and **351 inland lakes/reservoirs** (including **Vogršček Reservoir** and **Cerkniško jezero**, sea-level coastal lagoons filtered out, dammed reservoirs elevated via `max(medianPerimeterH, centerH) + 0.85`).
+- `src/world/water.js` + `public/media/vipava_water.json` (`917 KB`) — **1,124 real OSM rivers** (Vipava, Soča, Idrijca, Hubelj) and **351 inland lakes/reservoirs** (including **Vogršček Reservoir** and **Cerkniško jezero**, sea-level coastal lagoons filtered out, dammed reservoirs elevated via `max(medianPerimeterH, centerH) + 0.85`, and **river centerlines clipped cleanly against lake/wide-river polygons** so ribbons never stack or float over water sheets — eliminating 22,440 duplicate vertices).
 - `src/world/terrainview.js` — Realistic multi-scale terrain shader (`onBeforeCompile` on `MeshLambertMaterial`): `6/28/140 m` procedural world detail with analytical gradient micro-bump lighting, Karst limestone cliff strata (`8.2 m` period in Vipava), valley vineyard/agricultural patchwork, and coastal `WaterSurface` sunken `-0.45 m` (`polygonOffset: 4`) + distance-faded waves for flicker-free Monfalcone/Grado shorelines.
 
 ### Weapons, Dynamic Destruction, VFX & UI
