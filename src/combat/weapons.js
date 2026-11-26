@@ -260,8 +260,10 @@ export class WeaponSystem {
     const side = this._mk82Side;
     this._mk82Side = -this._mk82Side;
     const pylon = _tmp.set(side * 2.1, -0.55, 0).applyQuaternion(q).add(origin);
-    const v = velocity.clone();
-    v.y -= def.ejectSpeed;
+    // Ejection is along the aircraft's local -Y (belly), not world-down, so a
+    // banked or inverted release throws the bomb away from the airframe.
+    _eject.set(0, -def.ejectSpeed, 0).applyQuaternion(q);
+    const v = velocity.clone().add(_eject);
 
     this.ammo.MK82--;
     this._spawn({
@@ -515,7 +517,10 @@ export class WeaponSystem {
     const side = this._mk82Side;
     const pos = _tmp.set(side * 2.1, -0.55, 0).applyQuaternion(q).add(flight.position);
     const vel = (flight.velocity ? flight.velocity.clone() : new THREE.Vector3());
-    vel.y -= def.ejectSpeed;
+    // Identical local -Y ejection to `fire()` so the pipper predicts the bomb
+    // that is actually about to leave the pylon, bank angle included.
+    _eject.set(0, -def.ejectSpeed, 0).applyQuaternion(q);
+    vel.add(_eject);
 
     // 3D origin of the bomb fall line: 1.2 s ahead along the aircraft's true
     // flight path velocity, so the HUD line starts on the trajectory rather
@@ -529,8 +534,11 @@ export class WeaponSystem {
       this.ccipOrigin.valid = false;
     }
 
-    const step = 0.15;
-    const maxTime = 18;
+    // 45 s of fall covers a level release from ~9,000 m; 0.06 s steps keep the
+    // integrated line within a couple of metres of the real 0.02 s trajectory
+    // and cannot ridge-hop the way the old 0.15 s step could.
+    const step = 0.06;
+    const maxTime = 45;
     let t = 0;
     let crossed = false;
 
@@ -704,6 +712,9 @@ export class WeaponSystem {
       this._trail(p, events, h, 0.05, 0xffd9a0, 0.8);
     } else if (p.type === 'MK82') {
       ballisticStep(p.position, p.velocity, h, p.drag);
+      // Thin condensation/smoke trail: lets the player trace the fall line all
+      // the way to the CCIP impact point in external views.
+      this._trail(p, events, h, 0.08, 0xd8dfe6, 0.85);
     } else {
       // GUN tracer: gravity, no meaningful drag.
       ballisticStep(p.position, p.velocity, h, 0);
@@ -852,6 +863,28 @@ export class WeaponSystem {
 
   // ------------------------------------------------------------------ visuals
   _makeMesh(type, position) {
+    // Mk-82 is a two-part group (olive body + amber nose band) so the fall line
+    // reads clearly from the chase cam. Its long axis lies along local +Z,
+    // which is the axis `_orientMesh` aligns to the velocity vector.
+    if (type === 'MK82') {
+      const bodyGeo = new THREE.CapsuleGeometry(0.24, 1.72, 4, 8); // ≈ 2.2 m long
+      bodyGeo.rotateX(Math.PI / 2);
+      const body = new THREE.Mesh(bodyGeo, new THREE.MeshBasicMaterial({ color: 0x4a5238 }));
+
+      const bandGeo = new THREE.CylinderGeometry(0.246, 0.246, 0.18, 10);
+      bandGeo.rotateX(Math.PI / 2);
+      const band = new THREE.Mesh(bandGeo, new THREE.MeshBasicMaterial({ color: 0xd9a13a }));
+      band.position.z = 0.75;
+
+      const group = new THREE.Group();
+      group.add(body, band);
+      group.position.copy(position);
+      group.frustumCulled = false;
+      for (const child of group.children) child.frustumCulled = false;
+      this.scene.add(group);
+      return group;
+    }
+
     let geometry;
     let material;
     if (type === 'GUN') {
@@ -861,9 +894,6 @@ export class WeaponSystem {
       geometry = new THREE.CylinderGeometry(0.06, 0.06, 2.9, 6);
       geometry.rotateX(Math.PI / 2);
       material = new THREE.MeshBasicMaterial({ color: 0xe6ebef });
-    } else if (type === 'MK82') {
-      geometry = new THREE.CapsuleGeometry(0.22, 1.7, 4, 8);
-      material = new THREE.MeshBasicMaterial({ color: 0x53603f });
     } else {
       geometry = new THREE.SphereGeometry(0.35, 6, 5);
       material = new THREE.MeshBasicMaterial({ color: 0xff7a1a });
@@ -884,7 +914,12 @@ export class WeaponSystem {
   _disposeMesh(mesh) {
     if (!mesh) return;
     if (mesh.parent) mesh.parent.remove(mesh);
-    if (mesh.geometry) mesh.geometry.dispose();
-    if (mesh.material) mesh.material.dispose();
+    // Geometries/materials may be nested (the Mk-82 is a group).
+    mesh.traverse((obj) => {
+      if (obj.geometry) obj.geometry.dispose();
+      const mat = obj.material;
+      if (Array.isArray(mat)) for (const m of mat) m.dispose();
+      else if (mat) mat.dispose();
+    });
   }
 }

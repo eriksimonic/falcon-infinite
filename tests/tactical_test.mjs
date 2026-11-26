@@ -572,6 +572,18 @@ function makeAudioHarness() {
   ok(nearPeak > 0.2, 'near explosion has audible peak', nearPeak.toFixed(3));
   ok(farPeak < nearPeak * 0.35, 'far explosion is attenuated', 'near=' + nearPeak.toFixed(3) + ' far=' + farPeak.toFixed(3));
 
+  // 13B: a Mk-82 hitting 3.5 km behind the jet must still be clearly audible,
+  // while remaining quieter than a point-blank detonation.
+  const gainsBeforeMid = rec.gains.length;
+  audio.explosion(3500);
+  const midPeak = peak(rec.gains.slice(gainsBeforeMid));
+  const gainsBeforeClose = rec.gains.length;
+  audio.explosion(50);
+  const closePeak = peak(rec.gains.slice(gainsBeforeClose));
+  ok(midPeak > 0.15, '13B: 3.5 km explosion is clearly audible', midPeak.toFixed(3));
+  ok(midPeak < closePeak, '13B: 3.5 km explosion stays quieter than a close hit',
+    'mid=' + midPeak.toFixed(3) + ' close=' + closePeak.toFixed(3));
+
   // Sanitising hostile inputs.
   let hostileThrew = null;
   try {
@@ -700,6 +712,53 @@ function makeAudioHarness() {
   });
   const aim9Hit = g3.arcs.some((a) => Math.hypot(a.x - pBore.x, a.y - pBore.y) < 2.0);
   ok(aim9Hit, '12B: AIM-9 seeker ring renders at projected 3D boresightPoint');
+
+  // 13B: when the CCIP impact point projects below the bottom of the screen
+  // (level flight), the overlay must clamp a Delayed-CCIP bar onto the bottom
+  // edge instead of dropping the pipper entirely.
+  {
+    const camLow = new PerspectiveCamera(50, W / H, 0.1, 60000);
+    camLow.position.set(0, 400, 0);
+    camLow.lookAt(0, 400, -3000);
+    camLow.updateProjectionMatrix();
+    camLow.updateMatrixWorld(true);
+
+    const ccipBelow = { x: 0, y: 0, z: -400 }; // ~45 deg depression -> below HUD
+    camLow.updateMatrixWorld(true);
+    const vBelow = new Vector3(ccipBelow.x, ccipBelow.y, ccipBelow.z).project(camLow);
+    const projBelow = { x: (vBelow.x * 0.5 + 0.5) * W, y: (-vBelow.y * 0.5 + 0.5) * H };
+    ok(projBelow.y > H, '13B: test ccip actually projects below the screen', 'y=' + projBelow.y.toFixed(1));
+
+    const g4 = makeGeoCtx();
+    let lowThrew = null;
+    try {
+      overlay.draw(g4.ctx, W, H, {
+        telemetry: { mode: 'cockpit', heading: 0, pitch: 0, roll: 0, position: new Vector3(0, 400, 0) },
+        camera: camLow,
+        weapons: {
+          selected: 'MK82',
+          ammo: { GUN: 0, AIM9: 0, MK82: 4, FLARE: 0 },
+          ccipOrigin: { valid: true, x: 0, y: 380, z: -600 },
+          ccip: { valid: true, ...ccipBelow, timeToImpact: 1.8 },
+        },
+      });
+    } catch (err) {
+      lowThrew = err;
+    }
+    ok(!lowThrew, '13B: delayed-CCIP draw is safe', lowThrew && lowThrew.message);
+
+    const sLow = Math.min(W / 1600, H / 900);
+    const barY = H - 18 * sLow;
+    const barDrawn = g4.lines.some((l) =>
+      Math.abs(l.y0 - barY) < 1.5 && Math.abs(l.y1 - barY) < 1.5 && Math.abs(l.x1 - l.x0) > 20 * sLow);
+    ok(barDrawn, '13B: horizontal delayed-CCIP bar clamped to the HUD bottom edge');
+
+    const lowTexts = g4.ctx.__state.texts;
+    ok(lowTexts.some((t) => t.includes('MK-82') && t.includes('1.8s')),
+      '13B: delayed-CCIP time-to-impact label rendered', lowTexts.join('|'));
+    const fallLineToCue = g4.lines.some((l) => Math.abs(l.y1 - barY) < 1.5 && Math.abs(l.x1 - 640) < 2.0);
+    ok(fallLineToCue, '13B: fall line still runs from the origin down to the clamped cue');
+  }
 }
 
 // ===========================================================================

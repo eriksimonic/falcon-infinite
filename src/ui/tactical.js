@@ -445,7 +445,7 @@ export class TacticalOverlay {
     const ccip = weapons.ccip;
     if (selected === 'MK82' && ccip && ccip.valid) {
       const p = this._project(ccip, camera, w, h);
-      if (p && !p.behind && p.x > 0 && p.x < w && p.y > 0 && p.y < h) {
+      if (p && !p.behind) {
         // The Bomb Fall Line starts on the aircraft's true 3D flight path
         // (ccipOrigin), then the nose boresight, then the legacy centre.
         let origin = null;
@@ -457,43 +457,90 @@ export class TacticalOverlay {
         if (!origin && boreVisible) origin = boreProj;
         const ox = origin ? origin.x : cx;
         const oy = origin ? origin.y : cy;
-
-        ctx.save();
-        ctx.strokeStyle = 'rgba(157,255,192,0.72)';
-        ctx.lineWidth = 1.2;
-        if (typeof ctx.setLineDash === 'function') ctx.setLineDash([6 * s, 6 * s]);
-        ctx.beginPath();
-        ctx.moveTo(ox, oy);
-        ctx.lineTo(p.x, p.y);
-        ctx.stroke();
-        if (typeof ctx.setLineDash === 'function') ctx.setLineDash([]);
-
-        const rr = (isExternal ? 11 : 13) * s;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, rr, 0, TAU);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 2.4 * s, 0, TAU);
-        ctx.fillStyle = GREEN;
-        ctx.fill();
-
-        ctx.beginPath();
-        ctx.moveTo(p.x - rr - 4 * s, p.y);
-        ctx.lineTo(p.x - rr + 3 * s, p.y);
-        ctx.moveTo(p.x + rr - 3 * s, p.y);
-        ctx.lineTo(p.x + rr + 4 * s, p.y);
-        ctx.moveTo(p.x, p.y - rr - 4 * s);
-        ctx.lineTo(p.x, p.y - rr + 3 * s);
-        ctx.moveTo(p.x, p.y + rr - 3 * s);
-        ctx.lineTo(p.x, p.y + rr + 4 * s);
-        ctx.stroke();
-
         const tti = Math.max(0, num(ccip.timeToImpact, 0));
-        ctx.font = `700 ${Math.round(9.5 * s)}px ${MONO}`;
-        ctx.textAlign = 'left';
-        ctx.fillStyle = GREEN;
-        ctx.fillText('MK-82  ' + tti.toFixed(1) + 's', clamp(p.x + rr + 8 * s, 4, w - 70 * s), clamp(p.y + rr + 8 * s, 12 * s, h - 12 * s));
-        ctx.restore();
+
+        // Delayed-CCIP: in level flight the impact point projects below the
+        // bottom of the HUD, so an unclamped pipper would simply vanish. Clamp
+        // it onto the bottom edge along the ox,oy -> p.x,p.y line and draw a
+        // horizontal bomb-line bar so the pilot always sees the bomb line.
+        const bottomEdge = h - 18 * s;
+        if (p.y >= bottomEdge) {
+          const dy = p.y - oy;
+          const t = Math.abs(dy) > 0.0001 ? clamp((bottomEdge - oy) / dy, 0, 1) : 0;
+          const qx = clamp(ox + (p.x - ox) * t, 24 * s, w - 24 * s);
+          const qy = bottomEdge;
+          const halfBar = (isExternal ? 22 : 26) * s;
+
+          ctx.save();
+          ctx.strokeStyle = 'rgba(157,255,192,0.72)';
+          ctx.lineWidth = 1.2;
+          if (typeof ctx.setLineDash === 'function') ctx.setLineDash([6 * s, 6 * s]);
+          ctx.beginPath();
+          ctx.moveTo(ox, oy);
+          ctx.lineTo(qx, qy);
+          ctx.stroke();
+          if (typeof ctx.setLineDash === 'function') ctx.setLineDash([]);
+
+          // Horizontal delayed-CCIP bar across the fall line (bomb-line cue).
+          ctx.strokeStyle = AMBER;
+          ctx.beginPath();
+          ctx.moveTo(qx - halfBar, qy);
+          ctx.lineTo(qx + halfBar, qy);
+          ctx.stroke();
+
+          // Solid end caps plus a short beak pointing down at the impact point.
+          ctx.beginPath();
+          ctx.moveTo(qx - halfBar, qy - 5 * s);
+          ctx.lineTo(qx - halfBar, qy + 5 * s);
+          ctx.moveTo(qx + halfBar, qy - 5 * s);
+          ctx.lineTo(qx + halfBar, qy + 5 * s);
+          ctx.moveTo(qx - 4.5 * s, qy);
+          ctx.lineTo(qx, qy + 7 * s);
+          ctx.lineTo(qx + 4.5 * s, qy);
+          ctx.stroke();
+
+          ctx.font = `700 ${Math.round(9.5 * s)}px ${MONO}`;
+          ctx.textAlign = 'center';
+          ctx.fillStyle = AMBER;
+          ctx.fillText('MK-82  ' + tti.toFixed(1) + 's', qx, clamp(qy - 12 * s, 12 * s, h - 12 * s));
+          ctx.restore();
+        } else if (p.x > 0 && p.x < w && p.y > 0 && p.y < h) {
+          ctx.save();
+          ctx.strokeStyle = 'rgba(157,255,192,0.72)';
+          ctx.lineWidth = 1.2;
+          if (typeof ctx.setLineDash === 'function') ctx.setLineDash([6 * s, 6 * s]);
+          ctx.beginPath();
+          ctx.moveTo(ox, oy);
+          ctx.lineTo(p.x, p.y);
+          ctx.stroke();
+          if (typeof ctx.setLineDash === 'function') ctx.setLineDash([]);
+
+          const rr = (isExternal ? 11 : 13) * s;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, rr, 0, TAU);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 2.4 * s, 0, TAU);
+          ctx.fillStyle = GREEN;
+          ctx.fill();
+
+          ctx.beginPath();
+          ctx.moveTo(p.x - rr - 4 * s, p.y);
+          ctx.lineTo(p.x - rr + 3 * s, p.y);
+          ctx.moveTo(p.x + rr - 3 * s, p.y);
+          ctx.lineTo(p.x + rr + 4 * s, p.y);
+          ctx.moveTo(p.x, p.y - rr - 4 * s);
+          ctx.lineTo(p.x, p.y - rr + 3 * s);
+          ctx.moveTo(p.x, p.y + rr - 3 * s);
+          ctx.lineTo(p.x, p.y + rr + 4 * s);
+          ctx.stroke();
+
+          ctx.font = `700 ${Math.round(9.5 * s)}px ${MONO}`;
+          ctx.textAlign = 'left';
+          ctx.fillStyle = GREEN;
+          ctx.fillText('MK-82  ' + tti.toFixed(1) + 's', clamp(p.x + rr + 8 * s, 4, w - 70 * s), clamp(p.y + rr + 8 * s, 12 * s, h - 12 * s));
+          ctx.restore();
+        }
       }
     }
 

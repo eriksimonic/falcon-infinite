@@ -13,15 +13,21 @@
 
 ---
 
-## 2. How We Develop: Parallel Subagent Workflow with Hermes (`deepseek-v4.1-flash-1017`)
+## 2. How We Develop: Coordinator + Hermes Subagent Workflow (`deepseek-v4.1-flash-1017`)
 
-### Why Hermes instead of `pi`
-- `pi` (`/home/erik/.local/bin/pi`) currently has an expired/invalid Alibaba Cloud API key (`401 invalid_api_key`).
-- **Hermes** (`/home/erik/.local/bin/hermes`) is configured, authenticated, and works reliably with **`deepseek-v4.1-flash-1017`**!
+### Strict Role Split (IMPORTANT — Follow This Rule)
+- **AGY (Antigravity) = Coordinator ONLY**:
+  - Plans architecture and feature breakdowns.
+  - Writes clear, disjoint, worker-ready spec documents in `docs/features/`.
+  - Dispatches parallel **Hermes** workers for **ALL implementation** AND **ALL validation**.
+  - Reviews worker summaries, manages git commits/handoffs, and coordinates wave ordering — **does NOT write feature implementation code directly**.
+- **Hermes (`/home/erik/.local/bin/hermes`) = Implementation & Validation Workers**:
+  - `pi` (`/home/erik/.local/bin/pi`) currently has an invalid Alibaba API key (`401 invalid_api_key`).
+  - **Hermes** is configured, authenticated, and works reliably with **`deepseek-v4.1-flash-1017`**.
 
-### Exact Worker Invocation Command
-Launch independent workers in parallel using `run_command` (`WaitMsBeforeAsync: 500`, `NotificationTimeoutSeconds: 300`, no polling — wait reactively for completion notifications):
+### Exact Worker Invocation Commands
 
+**1. Implementation Worker (parallelizable when file ownership is disjoint):**
 ```bash
 hermes chat -Q --oneshot --yolo \
   --in /home/erik/Documents/testflight \
@@ -30,17 +36,27 @@ hermes chat -Q --oneshot --yolo \
   -q "Read ARCHITECTURE.md and docs/features/<spec>.md thoroughly. Implement Feature <N> strictly following the module contract and file ownership rules: create/modify ONLY <owned files>. Do not touch any other files. Run 'node tests/<suite>_test.mjs' until all checks pass with exit code 0. Finish with a brief summary."
 ```
 
-> **Tip**: Use `--max-turns 30` (or `35`) for complex features with large test files; `--max-turns 25` was occasionally just 1–2 turns short when workers wrote extensive probe/verification tests.
+**2. Validation Worker (run with `--reasoning high` after implementation/integration):**
+```bash
+hermes chat -Q --oneshot --yolo \
+  --in /home/erik/Documents/testflight \
+  -m deepseek-v4.1-flash-1017 \
+  --reasoning high \
+  --max-turns 30 \
+  -q "Validate Feature <N> against docs/features/<spec>.md and ARCHITECTURE.md. Run 'npm test' and 'npm run build', audit edge cases, verify contracts and integration behavior, and report any defects or confirm all checks pass."
+```
+
+> **Tip**: Always use `run_command` with `WaitMsBeforeAsync: 500` and `NotificationTimeoutSeconds: 300` (no polling — wait reactively for completion notifications). Use `--max-turns 30` (or `35`) for complex features with large test suites.
 
 ### Wave-Based Parallel Execution Rules (Zero Collisions)
-1. **Write per-feature spec docs first** in `docs/features/<NN>-<slug>.md` with:
-   - Exact **strict file ownership** (disjoint files for every parallel worker in a wave!)
-   - Exact **exported classes/methods & data shapes** (so modules snap together cleanly)
+1. **Coordinator** writes per-feature spec docs in `docs/features/<NN>-<slug>.md` with:
+   - Exact **strict file ownership** (100% disjoint files for every parallel worker in a wave!)
+   - Exact **exported classes/methods & data shapes**
    - **Headless-safe requirement** (`scene = null`, no DOM/browser globals at import time)
    - **Dedicated unit test** (`tests/<feature>_test.mjs`)
-2. **Run Wave N workers in parallel** — because file ownership is 100% disjoint, 2–5 Hermes workers can run simultaneously with zero merge conflicts.
-3. **Commit verified wave modules** once each worker's `node tests/<feature>_test.mjs` exits 0.
-4. **Run Integration sequentially** in the coordinator agent (wiring into shared files: `src/main.js`, `src/ui/hud.js`, `src/ui/menu.js`, `index.html`, `package.json`), then run `npm test && npm run build` and commit.
+2. **Parallel Implementation Wave (Hermes)**: launch all disjoint workers simultaneously.
+3. **Integration Wave (Hermes)**: when shared files (`main.js`, `hud.js`, `menu.js`, `index.html`, `package.json`) need wiring, delegate that to a dedicated sequential Hermes worker with its own integration spec.
+4. **High-Reasoning Validation (Hermes `--reasoning high`)**: dispatch a Hermes validator at `--reasoning high` to run `npm test`, `npm run build`, and audit physics/audio/UI contracts before the Coordinator commits.
 
 ---
 

@@ -116,6 +116,18 @@ export class SimAudio {
     const ctx = new AC();
     this.ctx = ctx;
 
+    // Browsers hand back a freshly constructed context in the 'suspended' state
+    // until a user gesture unlocks it. Wake it here so the very first frame of
+    // engine audio is not silently dropped.
+    if (ctx.state === 'suspended') {
+      try {
+        const waking = ctx.resume();
+        if (waking && typeof waking.catch === 'function') waking.catch(() => {});
+      } catch (err) {
+        /* context may already be resuming / unsupported — ignore */
+      }
+    }
+
     // Master chain with smooth dynamics compressor (preserves deep sub-bass weight).
     const compressor = ctx.createDynamicsCompressor();
     compressor.threshold.value = -14;
@@ -135,7 +147,17 @@ export class SimAudio {
 
     const sfxBus = ctx.createGain();
     sfxBus.gain.value = 1;
-    sfxBus.connect(compressor);
+    // Weapon / explosion SFX get their own soft limiter, wired straight into
+    // the master. Routing sfxBus through the simBus compressor meant the loud
+    // continuous jet engine rode the shared gain reduction and ducked every
+    // cannon burst, bomb release and explosion into near silence.
+    const sfxCompressor = ctx.createDynamicsCompressor();
+    sfxCompressor.threshold.value = -6;
+    sfxCompressor.knee.value = 12;
+    sfxCompressor.ratio.value = 4;
+    sfxCompressor.attack.value = 0.003;
+    sfxCompressor.release.value = 0.15;
+    sfxBus.connect(sfxCompressor).connect(this.master);
 
     const engineBus = ctx.createGain();
     engineBus.gain.value = 1;
@@ -417,7 +439,7 @@ export class SimAudio {
     stallOsc2.start();
 
     this.nodes = {
-      compressor, simBus, sfxBus, engineBus,
+      compressor, sfxCompressor, simBus, sfxBus, engineBus,
       pinkBuf, whiteBuf, pinkSrc, whiteSrc,
       exhaustEq, exhaustFilter, exhaustGain, depthGain,
       subLP1, subLP2, subShelf, subGain,

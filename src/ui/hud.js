@@ -29,7 +29,6 @@ export class HUD {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     this.visible = true;
-    this._acc = 0;
     this._t = 0;
     this._lastMode = null;
     this.w = 0;
@@ -59,11 +58,10 @@ export class HUD {
   update(dt, t, tactical = null) {
     if (!this.visible || !t) return;
     this._t += dt;
-    this._acc += dt;
-    const modeChanged = t.mode !== this._lastMode;
-    if (!modeChanged && this._acc < 1 / 30) return;
-    this._acc = 0;
     this._lastMode = t.mode;
+    // Redraw every animation frame: at 60+ FPS a 30 FPS throttle left the 2D
+    // CCIP/gun pippers one or two WebGL frames behind the scene during
+    // manoeuvres.
     this.draw(t, tactical);
   }
 

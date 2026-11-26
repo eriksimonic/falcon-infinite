@@ -356,6 +356,91 @@ function strafeBurst(world, pos, diveDeg, speed, shots = 10) {
   ok(wb.ccipOrigin.valid && wb.ccipOrigin.z < -200, '12A: ccipOrigin valid along flight velocity');
 }
 
+// ------------------------------------ 7. Feature 13A high-altitude CCIP
+// Deterministic hills (±~60 m) so banked diving releases cross real ridges.
+function hillyWorld() {
+  return {
+    heightAt: (x, z) =>
+      20 + 30 * Math.sin(x / 260) + 25 * Math.cos(z / 320) + 12 * Math.sin((x + z) / 150),
+  };
+}
+
+// Release an Mk-82 and compare the real impact against the predicted pipper.
+function mk82Drop({
+  world, pos, speed, diveDeg = 0, bankDeg = 0, headingDeg = 0, maxSeconds = 45,
+}) {
+  const ws = new WeaponSystem(null);
+  ws.selectWeapon('MK82');
+  const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(
+    (-diveDeg * Math.PI) / 180,
+    (-headingDeg * Math.PI) / 180,
+    (bankDeg * Math.PI) / 180,
+    'YXZ',
+  ));
+  const velocity = new THREE.Vector3(0, 0, -1).applyQuaternion(q).multiplyScalar(speed);
+  const flight = { position: new THREE.Vector3(...pos), velocity, quaternion: q };
+
+  const sol = ws.computeCCIP(flight, world);
+  const predicted = { x: sol.x, y: sol.y, z: sol.z, valid: sol.valid, tof: sol.timeToImpact };
+
+  const fired = ws.fire(flight);
+  ok(fired.fired === true, '13A: MK82 releases for drop check');
+
+  let impact = null;
+  let trails = 0;
+  const steps = Math.ceil(maxSeconds * 60);
+  for (let i = 0; i < steps && !impact; i++) {
+    for (const e of ws.update(1 / 60, flight, world)) {
+      if (e.kind === 'trail') trails++;
+      else if (e.kind === 'impact' && e.weapon === 'MK82') impact = e;
+    }
+  }
+
+  const miss = impact
+    ? Math.hypot(
+      impact.position.x - predicted.x,
+      impact.position.y - predicted.y,
+      impact.position.z - predicted.z,
+    )
+    : Infinity;
+  return { ws, impact, predicted, miss, trails };
+}
+
+{
+  const hi2200 = mk82Drop({ world: flatWorld, pos: [0, 2200, 0], speed: 250 });
+  ok(hi2200.predicted.valid === true, '13A: CCIP valid for 2200 m level release');
+  ok(!!hi2200.impact, '13A: 2200 m level release impacts the ground');
+  ok(hi2200.miss < 2.0, '13A: 2200 m level release lands within 2 m of CCIP',
+    hi2200.miss.toFixed(2) + ' m');
+
+  const hi4500 = mk82Drop({ world: flatWorld, pos: [0, 4500, 0], speed: 260 });
+  ok(hi4500.predicted.valid === true, '13A: CCIP valid for 4500 m level release');
+  ok(!!hi4500.impact, '13A: 4500 m level release impacts the ground');
+  ok(hi4500.miss < 2.0, '13A: 4500 m level release lands within 2 m of CCIP',
+    hi4500.miss.toFixed(2) + ' m');
+
+  const hills = hillyWorld();
+  const bankRight = mk82Drop({
+    world: hills, pos: [0, 2500, 0], speed: 300, diveDeg: 35, bankDeg: 45,
+  });
+  ok(bankRight.predicted.valid === true, '13A: CCIP valid for 45° banked dive over hills');
+  ok(!!bankRight.impact, '13A: banked dive impacts hilly terrain');
+  ok(bankRight.miss < 2.0, '13A: 45° right bank dive within 2 m of CCIP over hills',
+    bankRight.miss.toFixed(2) + ' m');
+
+  const bankLeft = mk82Drop({
+    world: hills, pos: [400, 2600, 400], speed: 280, diveDeg: 25, bankDeg: -45, headingDeg: 120,
+  });
+  ok(bankLeft.predicted.valid === true, '13A: CCIP valid for opposite bank direction');
+  ok(!!bankLeft.impact, '13A: opposite-bank dive impacts hilly terrain');
+  ok(bankLeft.miss < 2.0, '13A: 45° left bank dive within 2 m of CCIP over hills',
+    bankLeft.miss.toFixed(2) + ' m');
+
+  ok(hi2200.trails > 5, '13A: falling Mk-82 emits trail events', String(hi2200.trails));
+  ok(hi4500.trails > hi2200.trails, '13A: longer fall emits more trail events',
+    hi4500.trails + ' vs ' + hi2200.trails);
+}
+
 // ------------------------------------------------------------ summary
 console.log(`weapons checks: ${checks}, failures: ${failures.length}`);
 for (const f of failures) console.log('  FAIL ' + f);

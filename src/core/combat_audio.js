@@ -370,7 +370,7 @@ export class CombatAudio {
   // -------------------------------------------------------------------------
   cannonShot() {
     if (!this._ready()) return;
-    if (this._playSample('vulcan', { gain: 0.48, rate: 1.0, jitter: 0.055 })) return;
+    if (this._playSample('vulcan', { gain: 0.68, rate: 1.0, jitter: 0.055 })) return;
     const t0 = this._now();
 
     // Low-mid bark.
@@ -406,8 +406,8 @@ export class CombatAudio {
 
   missileLaunch() {
     if (!this._ready()) return;
-    const playedMain = this._playSample('missile_launch', { gain: 0.64, rate: 1.0, jitter: 0.04, duration: 2.2 });
-    const playedPop = this._playSample('aim_launch_pop', { gain: 0.45, rate: 1.0, jitter: 0.04 });
+    const playedMain = this._playSample('missile_launch', { gain: 0.92, rate: 1.0, jitter: 0.04, duration: 2.2 });
+    const playedPop = this._playSample('aim_launch_pop', { gain: 0.72, rate: 1.0, jitter: 0.04 });
     if (playedMain || playedPop) return;
     const t0 = this._now();
 
@@ -443,7 +443,7 @@ export class CombatAudio {
 
   bombRelease() {
     if (!this._ready()) return;
-    if (this._playSample('bomb_release', { gain: 0.62, rate: 1.0, jitter: 0.04 })) return;
+    if (this._playSample('bomb_release', { gain: 1.05, rate: 1.0, jitter: 0.04 })) return;
     const t0 = this._now();
 
     const clunk = this._osc('sine', 108);
@@ -475,7 +475,7 @@ export class CombatAudio {
 
   flarePop() {
     if (!this._ready()) return;
-    if (this._playSample('flare_pop', { gain: 0.56, rate: 1.0, jitter: 0.06 })) return;
+    if (this._playSample('flare_pop', { gain: 1.15, rate: 1.0, jitter: 0.06 })) return;
     const t0 = this._now();
 
     const pop = this._noiseSrc(false);
@@ -510,35 +510,44 @@ export class CombatAudio {
     if (!this._ready()) return;
     const t0 = this._now();
     const d = Math.max(0, fin(distanceM, 0));
-    const att = clamp(1 / (1 + d / 240), 0.04, 1);
-    const lpHz = clamp(14000 / (1 + d / 320), 420, 14000);
+    // Gentle 1/(1+d/1400) roll-off with a hard 0.20 floor: an ordnance hit
+    // 3-4 km behind the jet must still land as a deep boom instead of the old
+    // 1/(1+d/240) law that faded it to 0.05 and made it inaudible.
+    const att = clamp(1 / (1 + d / 1400), 0.20, 1.0);
+    // Air absorption peels the crack off distant detonations; only rumble
+    // survives the trip.
+    const lpHz = clamp(12000 / (1 + d / 750), 340, 12000);
     this._expToggle = 1 - this._expToggle;
     const key = this._expToggle === 0 && this._samples.has('explosion_heavy') ? 'explosion_heavy' : 'explosion';
-    if (this._playSample(key, { gain: 0.85 * att, rate: 0.96, jitter: 0.08, lowpassHz: lpHz })) return;
+    const sampled = this._playSample(key, { gain: 1.05 * att, rate: 0.96, jitter: 0.08, lowpassHz: lpHz });
 
-    const boom = this._noiseSrc(false);
-    if (boom) {
-      const lp = this._filter('lowpass', 480, 0.85);
-      this._sweep(lp.frequency, 520, 65, t0, 1.45);
-      const g = this._gainNode(0);
-      const end = this._env(g.gain, 0.80 * att, 0.012, 0.04, 1.44, t0);
-      boom.connect(lp).connect(g).connect(this._bus);
-      this._playNoise(boom, t0, end, 1.62);
+    if (!sampled) {
+      const boom = this._noiseSrc(false);
+      if (boom) {
+        const lp = this._filter('lowpass', 480, 0.85);
+        this._sweep(lp.frequency, 520, 65, t0, 1.45);
+        const g = this._gainNode(0);
+        const end = this._env(g.gain, 0.80 * att, 0.012, 0.04, 1.44, t0);
+        boom.connect(lp).connect(g).connect(this._bus);
+        this._playNoise(boom, t0, end, 1.62);
+      }
+
+      const rumble = this._noiseSrc(false);
+      if (rumble) {
+        const bp = this._filter('bandpass', 130, 0.7);
+        const g = this._gainNode(0);
+        const end = this._env(g.gain, 0.38 * att, 0.03, 0.08, 1.35, t0);
+        rumble.connect(bp).connect(g).connect(this._bus);
+        this._playNoise(rumble, t0, end, 1.55);
+      }
     }
 
-    const rumble = this._noiseSrc(false);
-    if (rumble) {
-      const bp = this._filter('bandpass', 130, 0.7);
-      const g = this._gainNode(0);
-      const end = this._env(g.gain, 0.38 * att, 0.03, 0.08, 1.35, t0);
-      rumble.connect(bp).connect(g).connect(this._bus);
-      this._playNoise(rumble, t0, end, 1.55);
-    }
-
+    // Low-frequency sub-thump layered under the sample (and the synth) so the
+    // detonation is felt as well as heard at long range.
     const sub = this._osc('sine', 52);
     const sg = this._gainNode(0);
-    const send = this._env(sg.gain, 0.45 * att, 0.015, 0.05, 1.1, t0);
-    this._sweep(sub.frequency, 54, 22, t0, 1.15);
+    const send = this._env(sg.gain, 0.30 * att, 0.015, 0.05, 1.1, t0);
+    this._sweep(sub.frequency, 52, 24, t0, 1.15);
     sub.connect(sg).connect(this._bus);
     this._start(sub, t0);
     this._stop(sub, send + 0.02);
@@ -546,7 +555,7 @@ export class CombatAudio {
 
   sonicBoom() {
     if (!this._ready()) return;
-    if (this._playSample('sonic_boom', { gain: 0.78, rate: 1.0, jitter: 0.03 })) return;
+    if (this._playSample('sonic_boom', { gain: 0.95, rate: 1.0, jitter: 0.03 })) return;
     const t0 = this._now();
 
     // Double N-wave pressure crack.
@@ -627,7 +636,22 @@ export class CombatAudio {
   // Node / param helpers
   // -------------------------------------------------------------------------
   _ready() {
-    return !!(this.ready && this.ctx && this._bus);
+    const ok = !!(this.ready && this.ctx && this._bus);
+    if (ok) this._wake();
+    return ok;
+  }
+
+  // A context suspended by the browser autoplay policy would swallow every
+  // trigger pull, so wake it the moment a cue (or the update loop) fires.
+  _wake() {
+    const ctx = this.ctx;
+    if (!ctx || ctx.state !== 'suspended' || typeof ctx.resume !== 'function') return;
+    try {
+      const waking = ctx.resume();
+      if (waking && typeof waking.catch === 'function') waking.catch(() => {});
+    } catch (err) {
+      /* already resuming / resume unsupported — ignore */
+    }
   }
 
   _now() {
