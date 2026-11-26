@@ -79,6 +79,9 @@ export class HUD {
     if (tactical && tactical.overlay) {
       tactical.overlay.draw(ctx, this.w, this.h, tactical);
     }
+    if (tactical && tactical.kneeboard && tactical.kneeboard.visible && tactical.kneeboardState) {
+      tactical.kneeboard.draw(ctx, this.w, this.h, tactical.kneeboardState);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -345,9 +348,12 @@ export class HUD {
     ctx.stroke();
 
     ctx.textAlign = 'left';
-    ctx.fillStyle = MUTED;
+    ctx.fillStyle = t.refueling ? '#6fe3ff' : (t.fuelLb != null && t.fuelLb <= 1500 ? AMBER : MUTED);
     ctx.font = `${Math.round(8.5 * s)}px ${mono}`;
-    ctx.fillText(t.onGround ? 'GROUND' : (t.afterburner ? 'AFTERBURNER' : 'DRY THRUST'), thrX, dockY + 47 * s);
+    const fuelStr = t.fuelLb != null ? ` · ${Math.round(t.fuelLb)}LB` : '';
+    const apStr = t.autopilot && t.autopilot !== 'OFF' ? ` · AP ${t.autopilot === 'ALT_HDG' ? 'ALT' : 'ATT'}` : '';
+    const baseThrLabel = t.refueling ? 'REFUELING' : (t.onGround ? 'GROUND' : (t.afterburner ? 'AB' : 'DRY'));
+    ctx.fillText(baseThrLabel + fuelStr + apStr, thrX, dockY + 47 * s);
 
     // (c) Compact Mini Attitude Indicator (Horizon Ball)
     const attR = 20 * s;

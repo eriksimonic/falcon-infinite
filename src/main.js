@@ -1,21 +1,29 @@
 import './ui/style.css';
 import * as THREE from 'three';
 import { CONFIG, QUALITY, WEATHER, WIND, THEATERS } from './config.js';
+import { on } from './core/events.js';
 import { Input } from './core/input.js';
 import { SimAudio } from './core/audio.js';
 import { CombatAudio } from './core/combat_audio.js';
+import { BitchingBetty } from './core/betty.js';
+import { attachMcpBridge } from './core/mcp_bridge.js';
 import { World } from './world/world.js';
 import { TimeSystem } from './sim/time.js';
 import { WeatherSystem } from './sim/weather.js';
 import { SkySystem } from './sim/sky.js';
 import { CloudSystem } from './sim/clouds.js';
 import { CombatVFX } from './sim/vfx.js';
+import { FuelSystem, TankerSystem } from './sim/fuel.js';
+import { AirTrafficSystem } from './sim/traffic.js';
 import { Aircraft } from './aircraft/aircraft.js';
+import { AutopilotSystem, ILSComputer } from './aircraft/autopilot.js';
+import { EjectionSystem } from './aircraft/ejection.js';
 import { WeaponSystem } from './combat/weapons.js';
 import { TargetSystem } from './combat/targets.js';
 import { MissionDirector, MISSIONS } from './combat/missions.js';
 import { HUD } from './ui/hud.js';
 import { TacticalOverlay } from './ui/tactical.js';
+import { KneeboardMap } from './ui/kneeboard.js';
 import { UI } from './ui/menu.js';
 import { spawnPoint, airportNear, airportsNear } from './world/terrain.js';
 import { settlementsNear } from './world/settlements.js';
@@ -62,11 +70,22 @@ class App {
     this.input.captured = this.canvas;
     this.audio = new SimAudio();
     this.combatAudio = new CombatAudio();
+    this.betty = new BitchingBetty({ onChime: () => this.audio.click() });
     this._playerHits = 0;
     this._lastRadioCount = 0;
     this._lockedTarget = null;
     this._rwrContacts = [];
     this._missionSnap = null;
+    this._fuelState = null;
+    this._tankerState = null;
+    this._ilsState = null;
+    this._flameoutNotified = false;
+    on('ils:callout', (ev) => {
+      if (this.mode === 'fly' && ev && ev.text) {
+        this.betty.announce(ev.text);
+        this.ui.toast('ILS · ' + ev.text.toUpperCase());
+      }
+    });
 
     this.ui = new UI({
       onStart: () => this.startFlight(),
@@ -114,11 +133,31 @@ class App {
     this.targets = new TargetSystem(this.scene);
     this.missions = new MissionDirector();
     this.tactical = new TacticalOverlay();
+    this.autopilot = new AutopilotSystem();
+    this.ils = new ILSComputer();
+    this.fuel = new FuelSystem();
+    this.tanker = new TankerSystem(this.scene);
+    this.ejection = new EjectionSystem(this.scene);
+    this.traffic = new AirTrafficSystem(this.scene);
+    this.kneeboard = new KneeboardMap();
     this.hud = new HUD(document.getElementById('hud'));
     this.hud.setVisible(false);
 
     window.addEventListener('resize', () => this.resize());
     window.addEventListener('keydown', (e) => this.onKey(e));
+    window.addEventListener('mousedown', (e) => {
+      if (this.mode === 'fly' && this.kneeboard.visible && e.button === 0) {
+        const f = this.aircraft.flight;
+        const picked = this.kneeboard.pickAirportAt(
+          e.clientX, e.clientY, window.innerWidth, window.innerHeight,
+          f, this.world.airportsNear(f.position.x, f.position.z, 3),
+        );
+        if (picked) {
+          this.audio.click();
+          this.ui.toast(`DIVERT · ${picked.code} ${picked.name.toUpperCase()}`);
+        }
+      }
+    });
 
     this.loop = this.loop.bind(this);
     this.init();
@@ -217,7 +256,14 @@ class App {
     this.weapons.reset();
     this.vfx.reset();
     this.targets.clear();
+    this.autopilot.disengage();
+    this.fuel.reset();
+    this.tanker.reset(spawn);
+    this.ejection.reset();
+    this.traffic.reset(this.aircraft.flight);
+    this.kneeboard.clearTrack();
     this._playerHits = 0;
+    this._flameoutNotified = false;
     this._lockedTarget = null;
     this._rwrContacts = [];
     const specs = this.missions.startMission(this.ui.mission || 'free', spawn, this.world);
@@ -255,6 +301,7 @@ class App {
     if (code === 'KeyM') {
       this.muted = !this.muted;
       this.audio.setMuted(this.muted);
+      this.betty.setMuted(this.muted);
       this.ui.toast(this.muted ? 'AUDIO MUTED' : 'AUDIO ON');
       return;
     }
@@ -480,6 +527,34 @@ class App {
       this.audio.click();
       this.ui.toast(on ? 'NVG · ON' : 'NVG · OFF');
     }
+    if (i.wasPressed('KeyZ')) {
+      const apMode = this.autopilot.cycleMode(f);
+      this.audio.click();
+      this.ui.toast('AUTOPILOT · ' + apMode);
+    }
+    if (i.wasPressed('KeyK')) {
+      const vis = this.kneeboard.toggle();
+      this.audio.click();
+      if (vis) this.input.releasePointerLock();
+      this.ui.toast(vis ? 'KNEEBOARD · ON (O = ZOOM, CLICK AIRPORT)' : 'KNEEBOARD · OFF');
+    }
+    if (i.wasPressed('KeyO') && this.kneeboard.visible) {
+      const rng = this.kneeboard.cycleZoom();
+      this.audio.click();
+      this.ui.toast('MAP RANGE · ' + Math.round(rng / 1000) + ' KM');
+    }
+    if (i.wasPressed('KeyL')) {
+      const wOn = this.traffic.toggleWingman();
+      this.audio.click();
+      this.ui.toast(wOn ? 'WINGMAN · VIPER 1-2 JOINING' : 'WINGMAN · STAND DOWN');
+    }
+    if (i.wasPressed('KeyJ') && !f.crashed && !this.ejection.active) {
+      if (this.ejection.trigger(f)) {
+        this.autopilot.disengage();
+        this.combatAudio.missileLaunch();
+        this.ui.toast('EJECTION · ACES II — PRESS R TO RESET');
+      }
+    }
   }
 
   update(dt) {
@@ -494,8 +569,14 @@ class App {
 
     let cmd = NEUTRAL_CMD;
     if (fly) {
-      cmd = this.buildCommand();
+      cmd = this.ejection.active ? NEUTRAL_CMD : this.buildCommand();
       this.handleFlightKeys(cmd);
+      if (!this.ejection.active) {
+        cmd = this.autopilot.computeCommand(this.aircraft.flight, cmd);
+      }
+      if (this._fuelState && this._fuelState.empty) {
+        this.aircraft.flight.targetThrottle = 0;
+      }
     }
 
     if (fly) {
@@ -504,9 +585,18 @@ class App {
       const f = this.aircraft.flight;
       if (f.touchdown > 0.2) {
         this.audio.thump(clamp(f.touchdown / 5, 0.15, 1));
-        this.ui.toast('TOUCHDOWN');
+        const g = this.ils.gradeTouchdown(f.touchdown, f.rollDeg);
+        this.ui.toast(`TOUCHDOWN · ${g.grade} (${Math.round(g.fpm)} FPM)`);
       }
-      if (f.crashed && this.mode === 'fly') this.onCrash();
+      if (this.ejection.active) {
+        const ej = this.ejection.update(simDt, this.world, this.weather);
+        if (ej && ej.cameraPos && ej.lookAt) {
+          this.camera.position.copy(ej.cameraPos);
+          this.camera.up.set(0, 1, 0);
+          this.camera.lookAt(ej.lookAt);
+        }
+      }
+      if (f.crashed && this.mode === 'fly' && !this.ejection.active) this.onCrash();
     } else if (menu) {
       this.aircraft.update(simDt, NEUTRAL_CMD, this.weather, this.input, false);
     } else if (this.mode === 'crash') {
@@ -602,6 +692,19 @@ class App {
 
       const glocState = this.tactical.update(simDt, f);
 
+      // Wave 3 systems: Tanker, Fuel, Traffic/Wingman, ILS, Kneeboard & Bitching Betty
+      this._tankerState = this.tanker.update(simDt, f);
+      this._fuelState = this.fuel.update(simDt, f, !!this._tankerState?.contact);
+      if (this._fuelState.bingoTriggered) {
+        this.ui.toast('BINGO FUEL · ' + Math.round(this._fuelState.fuelLb) + ' LB');
+      }
+      if (this._fuelState.empty && !this._flameoutNotified) {
+        this._flameoutNotified = true;
+        this.ui.toast('FLAMEOUT · OUT OF FUEL');
+      }
+      this.traffic.update(simDt, f, this.weather);
+      this.kneeboard.recordPosition(f.position.x, f.position.z);
+
       let rwrHighest = 'NONE';
       const rank = { NONE: 0, SEARCH: 1, LOCK: 2, LAUNCH: 3 };
       for (const c of this._rwrContacts) {
@@ -617,12 +720,41 @@ class App {
       });
 
       const t = this.aircraft.telemetry(this.weather, this.time, this.sky);
+      this._ilsState = this.ils.update(simDt, f, t.airport);
+      this.betty.update(simDt, {
+        onGround: f.onGround,
+        crashed: f.crashed,
+        aglFt: t.aglFt,
+        vsFpm: t.vsFpm,
+        stall: f.stall,
+        kts: t.kts,
+        bingoFuel: !!this._fuelState?.bingo,
+        missileLaunch: rwrHighest === 'LAUNCH',
+      });
+
       t.timeScale = this.time.scale;
       t.weather = WEATHER[this.weather.presetName].label;
       t.clock = this.time.clock;
       t.sideSlip = this.aircraft.flight.beta;
+      t.fuelLb = this._fuelState?.fuelLb ?? 7000;
+      t.fuelFraction = this._fuelState?.fraction ?? 1;
+      t.refueling = !!this._fuelState?.refueling;
+      t.autopilot = this.autopilot.mode;
+      t.ils = this._ilsState;
       this.hud.update(simDt, t, {
         overlay: this.tactical,
+        kneeboard: this.kneeboard,
+        kneeboardState: this.kneeboard.visible ? {
+          flight: f,
+          heading: t.heading,
+          heightAt: (x, z) => this.world.heightAt(x, z),
+          airports: this.world.airportsNear(f.position.x, f.position.z, 3),
+          targets: this.targets.targets,
+          tanker: this._tankerState,
+          steerpoint: this._missionSnap?.steerpoint || null,
+          windDir: t.windDir,
+          windKts: t.windKts,
+        } : null,
         telemetry: t,
         camera: this.camera,
         weapons: this.weapons,
@@ -721,4 +853,5 @@ class App {
 window.addEventListener('DOMContentLoaded', () => {
   const app = new App();
   window.__falcon = app;
+  attachMcpBridge(app);
 });
