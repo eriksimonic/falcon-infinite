@@ -3,16 +3,28 @@
 import * as THREE from 'three';
 import { mulberry32 } from '../world/noise.js';
 
+// Headless-safe canvas factory: Node (tests) has no DOM, so texture builders
+// return null and materials fall back to their plain base colours.
+const HAS_DOM = typeof document !== 'undefined' && typeof document.createElement === 'function';
+
+function createCanvas(w, h) {
+  if (!HAS_DOM) return null;
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  return c;
+}
+
 // ---------------------------------------------------------------------------
 // Deterministic procedural textures (no Math.random)
 // ---------------------------------------------------------------------------
 function createAirframeTexture() {
   const W = 1024;
   const H = 512;
-  const c = document.createElement('canvas');
-  c.width = W;
-  c.height = H;
+  const c = createCanvas(W, H);
+  if (!c) return null;
   const ctx = c.getContext('2d');
+  if (!ctx) return null;
   const rng = mulberry32(160050);
 
   // Two-tone USAF Compass Ghost Grey base (uv.x wraps around fuselage circumference:
@@ -113,10 +125,10 @@ function createAirframeTexture() {
 function createWingTexture() {
   const W = 512;
   const H = 512;
-  const c = document.createElement('canvas');
-  c.width = W;
-  c.height = H;
+  const c = createCanvas(W, H);
+  if (!c) return null;
   const ctx = c.getContext('2d');
+  if (!ctx) return null;
   const rng = mulberry32(160088);
 
   ctx.fillStyle = '#929ca4';
@@ -159,9 +171,10 @@ function createWingTexture() {
 
 function glowTexture() {
   const s = 64;
-  const c = document.createElement('canvas');
-  c.width = c.height = s;
+  const c = createCanvas(s, s);
+  if (!c) return null;
   const ctx = c.getContext('2d');
+  if (!ctx) return null;
   const g = ctx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
   g.addColorStop(0, 'rgba(255,255,255,1)');
   g.addColorStop(0.25, 'rgba(255,255,255,0.75)');

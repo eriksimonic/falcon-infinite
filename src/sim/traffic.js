@@ -7,6 +7,7 @@
 // when a scene is supplied.
 import * as THREE from 'three';
 import { clamp, mulberry32, SEED } from '../world/noise.js';
+import { createF16, updateF16Visual } from '../aircraft/f16.js';
 
 const AIRLINER_COUNT = 4;
 const RANGE = 45000;          // m — recycle radius around the player
@@ -39,6 +40,17 @@ export class AirTrafficSystem {
 
     this._group = null;
     this._wingmanMesh = null;
+    // Lightweight telemetry object fed to updateF16Visual() for the wingman.
+    this._wingmanVisualFlight = {
+      gearPos: 0,
+      onGround: false,
+      speed: 0,
+      throttle: 0.55,
+      afterburner: false,
+      flapPos: 0,
+      brake: false,
+      controls: { pitch: 0, roll: 0, yaw: 0 },
+    };
 
     if (this.scene) {
       this._group = new THREE.Group();
@@ -332,6 +344,32 @@ export class AirTrafficSystem {
     }
 
     this._syncWingman();
+
+    if (this._wingmanMesh && this._wingmanMesh.visible) {
+      this._syncWingmanVisual(dt, flight);
+    }
+  }
+
+  /**
+   * Drive the wingman's F-16C exterior from the player's telemetry: gear
+   * retracted, control surfaces and flaps mirrored, live throttle/afterburner.
+   */
+  _syncWingmanVisual(dt, flight) {
+    const vf = this._wingmanVisualFlight;
+    const ctl = flight.controls || null;
+
+    vf.gearPos = 0;             // clean configuration — gear up
+    vf.onGround = false;
+    vf.speed = Number.isFinite(flight.speed) ? flight.speed : 0;
+    vf.throttle = Number.isFinite(flight.throttle) ? flight.throttle : 0.55;
+    vf.afterburner = !!flight.afterburner;
+    vf.flapPos = Number.isFinite(flight.flapPos) ? flight.flapPos : 0;
+    vf.brake = !!flight.brake;
+    vf.controls.pitch = ctl && Number.isFinite(ctl.pitch) ? ctl.pitch : 0;
+    vf.controls.roll = ctl && Number.isFinite(ctl.roll) ? ctl.roll : 0;
+    vf.controls.yaw = ctl && Number.isFinite(ctl.yaw) ? ctl.yaw : 0;
+
+    updateF16Visual(this._wingmanMesh, vf, dt, 'chase', true);
   }
 
   _syncWingman() {
@@ -341,61 +379,12 @@ export class AirTrafficSystem {
   }
 
   _buildWingman() {
-    if (!this._group) return;
+    // The real F-16C exterior is heavy (lofted airframe + procedural textures),
+    // so build it only for a live scene. Headless tests stay kinematic.
+    if (!this._group || !this.scene) return;
 
-    const mat = new THREE.MeshStandardMaterial({
-      color: 0x7d8a99, roughness: 0.5, metalness: 0.4,
-    });
-    const dark = new THREE.MeshStandardMaterial({
-      color: 0x3a4148, roughness: 0.6, metalness: 0.3,
-    });
-    const glass = new THREE.MeshStandardMaterial({
-      color: 0x9fd8ff, roughness: 0.15, metalness: 0.2,
-      transparent: true, opacity: 0.55,
-    });
-
-    const g = new THREE.Group();
+    const g = createF16();
     g.name = 'viper-1-2';
-
-    const bodyGeo = new THREE.CylinderGeometry(0.62, 0.5, 11, 10);
-    bodyGeo.rotateX(Math.PI / 2);
-    g.add(new THREE.Mesh(bodyGeo, mat));
-
-    const noseGeo = new THREE.ConeGeometry(0.62, 3.6, 10);
-    noseGeo.rotateX(-Math.PI / 2);
-    const nose = new THREE.Mesh(noseGeo, mat);
-    nose.position.z = -7.3;
-    g.add(nose);
-
-    const canopyGeo = new THREE.SphereGeometry(0.5, 10, 8, 0, Math.PI * 2, 0, Math.PI * 0.5);
-    canopyGeo.scale(1, 0.9, 2.2);
-    const canopy = new THREE.Mesh(canopyGeo, glass);
-    canopy.position.set(0, 0.4, -2.8);
-    g.add(canopy);
-
-    for (const s of [-1, 1]) {
-      const wing = new THREE.Mesh(new THREE.BoxGeometry(4.4, 0.16, 2.7), mat);
-      wing.position.set(s * 2.4, -0.05, 1.15);
-      wing.rotation.y = -s * 0.5;
-      g.add(wing);
-
-      const stab = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.12, 1.3), mat);
-      stab.position.set(s * 1.2, -0.02, 5.1);
-      stab.rotation.y = -s * 0.35;
-      g.add(stab);
-    }
-
-    const nozzleGeo = new THREE.CylinderGeometry(0.5, 0.42, 1.2, 10);
-    nozzleGeo.rotateX(Math.PI / 2);
-    const nozzle = new THREE.Mesh(nozzleGeo, dark);
-    nozzle.position.set(0, 0, 6.2);
-    g.add(nozzle);
-
-    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.16, 2.1, 2.0), mat);
-    fin.position.set(0, 1.1, 5.2);
-    fin.rotation.x = 0.18;
-    g.add(fin);
-
     g.visible = false;
     this._wingmanMesh = g;
     this._group.add(g);
