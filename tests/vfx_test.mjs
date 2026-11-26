@@ -441,6 +441,209 @@ function run(vfx, seconds, flight, wx, camera = null, dt = 1 / 60) {
   ok(finitePuffs, '24: spawnFirePuff never writes NaN positions');
 }
 
+// --------- 4d. Feature 25: multi-lobe blasts, flash light, 3D debris
+{
+  const wx = weather(0, 0, 0.1);
+  const zero = makeFlight({ speed: 0, onGround: true });
+
+  // -- pool shape: everything preallocated in the constructor.
+  const vfx = new CombatVFX(null);
+  const kids = vfx.group.children.length;
+  ok(vfx._blastLight instanceof THREE.PointLight, '25: preallocated blast PointLight');
+  ok(vfx._blastLight.color.getHex() === 0xff9b42,
+    '25: blast light is warm orange 0xff9b42',
+    '0x' + vfx._blastLight.color.getHex().toString(16));
+  ok(vfx._blastLight.decay === 1.5, '25: blast light uses 1.5 decay',
+    String(vfx._blastLight.decay));
+  ok(vfx._blastLight.intensity === 0, '25: blast light starts dark');
+  ok(vfx.debris.mesh instanceof THREE.InstancedMesh, '25: debris pool is an InstancedMesh');
+  ok(vfx.debris.capacity === 160 && vfx.debris.mesh.count === 0,
+    '25: debris pool holds 160 chunks and starts empty',
+    `${vfx.debris.capacity}/${vfx.debris.mesh.count}`);
+  ok(vfx.debris.mesh.frustumCulled === false, '25: debris mesh is never frustum culled');
+  ok(vfx.activeDebris === 0, '25: activeDebris starts at 0');
+
+  const arrays = ['px', 'py', 'pz', 'vx', 'vy', 'vz', 'rx', 'ry', 'rz',
+    'avx', 'avy', 'avz', 'sx', 'sy', 'sz', 'life', 'maxLife', 'floorY',
+    'active', 'bounced'];
+  ok(arrays.every((k) => vfx.debris[k] && vfx.debris[k].length === 160),
+    '25: debris state lives in fixed 160-length typed arrays',
+    arrays.filter((k) => !vfx.debris[k] || vfx.debris[k].length !== 160).join(','));
+
+  // -- per-ordnance chunk counts: GUN 4, AIM9 12, MK82 22, BFFG 44.
+  for (const [scale, expected] of [[1, 4], [2, 12], [4.5, 22], [14, 44]]) {
+    const v = new CombatVFX(null);
+    v.spawnExplosion({ x: 0, y: 0, z: 0 }, scale);
+    const r = v.update(1 / 60, zero, wx, null);
+    ok(r.activeDebris === expected,
+      `25: scale ${scale} launches ${expected} debris chunks`,
+      String(r.activeDebris));
+    ok(v.debris.mesh.count === expected, `25: scale ${scale} renders every chunk`,
+      String(v.debris.mesh.count));
+  }
+
+  // -- multi-lobe fireball cluster.
+  const slot = vfx.spawnExplosion(new THREE.Vector3(10, 0, 20), 4.5);
+  ok(slot.lobes && slot.lobes.length === 4, '25: each blast owns 4 extra fireball lobes',
+    String(slot.lobes && slot.lobes.length));
+  ok(slot.lobes.every((l) => l.geometry === vfx._coreGeo),
+    '25: lobes share the pooled core geometry');
+  ok(slot.lobes.every((l) => l.material !== slot.fireballMat),
+    '25: each lobe owns its own material');
+  const lobeHex = slot.lobes.map((l) => l.material.color.getHex()).join(',');
+  ok(lobeHex === [0xff6e1a, 0xff4410, 0xff9926, 0x3a241a].join(','),
+    '25: lobes use the fiery shade palette', lobeHex);
+
+  const first = vfx.update(1 / 60, zero, wx, null);
+  ok(first.activeDebris >= 18, '25: Mk-82 blast spawns >= 18 tumbling chunks',
+    String(first.activeDebris));
+  ok(slot.lobes.every((l) => l.visible), '25: all four lobes are visible while burning');
+  ok(slot.lobes.some((l) => l.material.opacity > 0), '25: lobes fade in with opacity');
+  const offsets = new Set(slot.lobes.map((l) => `${l.position.x.toFixed(2)},${l.position.z.toFixed(2)}`));
+  ok(offsets.size === 4, '25: lobes occupy distinct radial offsets', String(offsets.size));
+  ok(slot.lobes.every((l) => l.position.y >= slot.pos.y - 0.001),
+    '25: lobes rise from the blast centre, never sink');
+  ok(slot.lobes.every((l) => Number.isFinite(l.position.x) && Number.isFinite(l.position.z)),
+    '25: lobe positions are finite');
+
+  const lobe0 = slot.lobes[0];
+  const yLow = lobe0.position.y;
+  run(vfx, 0.5, zero, wx);
+  ok(lobe0.position.y > yLow, '25: lobes billow upward over time',
+    `${yLow.toFixed(2)} -> ${lobe0.position.y.toFixed(2)}`);
+  ok(slot.lobes.some((l) => l.scale.x > 4.5), '25: lobes scale organically outward',
+    slot.lobes.map((l) => l.scale.x.toFixed(1)).join('/'));
+
+  // ... and dissolve into the smoke once the fireball phase is over.
+  run(vfx, 2.4, zero, wx);
+  ok(slot.lobes.every((l) => !l.visible && l.material.opacity === 0),
+    '25: lobes fade out into the smoke column');
+  ok(vfx.explosions.every((e) => (e.active ? e.lobes.length === 4 : e.lobes.every((l) => !l.visible))),
+    '25: idle blast slots keep their lobes stood down');
+
+  // -- dynamic blast flash.
+  const fl = new CombatVFX(null);
+  fl.spawnExplosion(new THREE.Vector3(5, 100, -8), 14);
+  const peak = fl._blastLight.intensity;
+  ok(peak === 252, '25: mega flash peak intensity is clamp(scale*18, 12, 260)',
+    String(peak));
+  ok(fl._blastLight.distance === 630, '25: mega flash range is clamp(scale*45, 90, 900)',
+    String(fl._blastLight.distance));
+  ok(fl._blastLight.position.y === 100 + 28,
+    '25: flash light sits above the blast point', String(fl._blastLight.position.y));
+  ok(fl._blastLight.position.x === 5 && fl._blastLight.position.z === -8,
+    '25: flash light tracks the blast position');
+
+  fl.update(0.3, zero, wx, null);
+  const mid = fl._blastLight.intensity;
+  ok(mid > 0 && mid < peak, '25: flash decays smoothly from its peak',
+    `${peak} -> ${mid.toFixed(1)}`);
+  run(fl, 1.3, zero, wx);
+  ok(fl._blastLight.intensity === 0, '25: flash is fully dark within 1.4 s',
+    String(fl._blastLight.intensity));
+
+  const small = new CombatVFX(null);
+  small.spawnExplosion({ x: 0, y: 0, z: 0 }, 0.5);
+  ok(small._blastLight.intensity === 12, '25: even a gun hit flashes at the 12 intensity floor',
+    String(small._blastLight.intensity));
+  ok(small._blastLight.distance === 90, '25: gun flash range floors at 90 m',
+    String(small._blastLight.distance));
+
+  // -- ballistics: gravity, flight, tumble, matrices.
+  const b = new CombatVFX(null);
+  b.spawnExplosion(new THREE.Vector3(0, 40, 0), 2);
+  const db = b.debris;
+  const r0 = b.update(1 / 60, zero, wx, null);
+  ok(r0.activeDebris === 12, '25: AIM-9 kill spawns 12 shrapnel chunks',
+    String(r0.activeDebris));
+  let ci = -1;
+  for (let i = 0; i < db.capacity; i++) if (db.active[i]) { ci = i; break; }
+  ok(ci >= 0, '25: a debris chunk is allocated');
+  const x0 = db.px[ci];
+  const z0 = db.pz[ci];
+  const vy0 = db.vy[ci];
+  const rx0 = db.rx[ci];
+  b.update(0.1, zero, wx, null);
+  ok(db.vy[ci] < vy0, '25: gravity decelerates launched chunks',
+    `${vy0.toFixed(2)} -> ${db.vy[ci].toFixed(2)}`);
+  ok(Math.abs(db.px[ci] - x0) > 1e-3 || Math.abs(db.pz[ci] - z0) > 1e-3,
+    '25: chunks fly outward ballistically');
+  ok(db.rx[ci] !== rx0 && Number.isFinite(db.ry[ci]),
+    '25: chunks tumble in 3D');
+  let finiteMatrices = true;
+  for (let i = 0; i < db.mesh.count * 16; i++) {
+    if (!Number.isFinite(db.mesh.instanceMatrix.array[i])) finiteMatrices = false;
+  }
+  ok(finiteMatrices, '25: instanced debris matrices are finite');
+
+  // -- bounce: a chunk driven into its floor flips vy at 0.35 damping.
+  db.py[ci] = db.floorY[ci] + 0.02;
+  db.vy[ci] = -40;
+  db.vx[ci] = 6;
+  db.vz[ci] = -6;
+  db.bounced[ci] = 0;
+  b.update(1 / 30, zero, wx, null);
+  ok(Math.abs(db.py[ci] - db.floorY[ci]) < 1e-4,
+    '25: chunks never sink below their floor', String(db.py[ci]));
+  ok(db.vy[ci] > 13.9 && db.vy[ci] < 14.4,
+    '25: first bounce reverses vy at 0.35 damping', db.vy[ci].toFixed(3));
+  ok(Math.abs(db.vx[ci] - 3.3) < 1e-6 && Math.abs(db.vz[ci] + 3.3) < 1e-6,
+    '25: first bounce damps horizontal velocity to 0.55',
+    `${db.vx[ci].toFixed(3)}/${db.vz[ci].toFixed(3)}`);
+
+  // -- settle: a second contact kills vertical motion and scrubs the slide.
+  db.py[ci] = db.floorY[ci] - 0.1;
+  db.vy[ci] = -2;
+  const vxBefore = db.vx[ci];
+  b.update(1 / 60, zero, wx, null);
+  ok(db.vy[ci] === 0, '25: settled chunks stop bouncing', String(db.vy[ci]));
+  ok(db.py[ci] === db.floorY[ci], '25: settled chunks rest on the floor');
+  ok(Math.abs(db.vx[ci]) < Math.abs(vxBefore),
+    '25: settled chunks scrub their slide');
+
+  // -- expiry: chunks die cleanly and the instance buffer empties.
+  run(b, 12, zero, wx, null, 1 / 30);
+  ok(b.activeDebris === 0, '25: debris expires cleanly', String(b.activeDebris));
+  ok(db.mesh.count === 0 && db.active.every((a) => a === 0),
+    '25: no debris instances left after expiry');
+
+  // -- no allocation: heavy spawning must not grow the pools or the group.
+  const lenBefore = db.px.length;
+  for (let i = 0; i < 200; i++) b.spawnExplosion({ x: i, y: 0, z: 0 }, 14);
+  b.update(1 / 60, zero, wx, null);
+  ok(db.px.length === lenBefore && db.mesh.count <= 160,
+    '25: debris pool stays fixed-size under heavy spawning',
+    `${db.px.length}/${db.mesh.count}`);
+  ok(b.group.children.length === kids, '25: debris/lobes are pooled, not created per blast',
+    `${kids} -> ${b.group.children.length}`);
+
+  // -- reset clears debris, lobes and the flash.
+  const rr = new CombatVFX(null);
+  const mega = rr.spawnExplosion(new THREE.Vector3(0, 20, 0), 14);
+  const rf = rr.update(1 / 60, zero, wx, null);
+  ok(rf.activeDebris === 44, '25: BFFG mega-blast launches 44 tumbling slabs',
+    String(rf.activeDebris));
+  ok(rr._blastLight.intensity > 0, '25: BFFG detonation boosts _blastLight.intensity',
+    String(rr._blastLight.intensity));
+  ok(rf.activeDebris === rr.debris.activeDebris && rf.activeDebris === rr.activeDebris,
+    '25: activeDebris is exposed on the instance and in update() stats');
+
+  rr.reset();
+  ok(rr.activeDebris === 0 && rr.debris.activeDebris === 0,
+    '25: reset zeroes activeDebris');
+  ok(rr.debris.mesh.count === 0 && rr.debris.active.every((a) => a === 0),
+    '25: reset empties the debris pool');
+  ok(rr._blastLight.intensity === 0, '25: reset zeroes _blastLight.intensity',
+    String(rr._blastLight.intensity));
+  ok(rr.explosions.every((e) => e.lobes.every((l) => !l.visible && l.material.opacity === 0)),
+    '25: reset hides every fireball lobe');
+  ok(mega.lobes.length === 4, '25: reset keeps the lobe pools intact');
+
+  const afterReset = rr.update(1 / 60, null, null, null);
+  ok(afterReset.activeDebris === 0 && rr._blastLight.intensity === 0,
+    '25: no debris or flash survives reset');
+}
+
 // --------------------------------------------------------------- 5. reset()
 {
   const vfx = new CombatVFX(null);

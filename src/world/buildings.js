@@ -25,6 +25,25 @@ const STREET_REBUILD_DIST = 1200; // rebuild the ribbon mesh after this much tra
 const COLLAPSE_MIN = 2.4; // seconds
 const COLLAPSE_SPAN = 1.4; // extra seconds, hashed per building (2.4..3.8 s)
 
+const RUIN_FIRE_LIFE = 75; // seconds a collapsed building keeps smouldering
+const RUIN_FIRE_CAP = 24; // active ember plumes keep the VFX pool bounded
+
+// Real-world (baked OSM) city: one virtual settlement carries every baked
+// building so the same grounding / damage / ruin pipeline applies unchanged.
+const CUSTOM_SETTLEMENT_ID = 'vipava-osm';
+const CUSTOM_SETTLEMENT_RADIUS = 22000; // covers the whole 100 km DEM valley core
+const DEM_HALF = 50000; // the baked DEM owns +-50 km; procedural cities outside it stay
+const CUSTOM_KINDS = ['house', 'apartment', 'industrial', 'tower'];
+
+// Roof/wall palettes matching settlements.js, so baked buildings read as the
+// same architecture as their procedural neighbours.
+const CUSTOM_PALETTE = {
+  house: [0xd9cdb6, 0xcfc0a6, 0xe3d9c8, 0xc4b49a, 0xb9a88c, 0xd6c1a3],
+  apartment: [0xa9a49a, 0xb8b2a6, 0x9b9a93, 0xc0b6a8, 0x8f9095],
+  industrial: [0x8e918c, 0x9c978b, 0x82857f, 0xa39a86],
+  tower: [0x8fa6ba, 0x7d93a8, 0xa6b8c6, 0x93a3b3, 0x8298a8, 0xb3c2cc],
+};
+
 const _c = new THREE.Color();
 const _m = new THREE.Matrix4();
 const _q = new THREE.Quaternion();
@@ -52,12 +71,24 @@ function makeBuildingMaterial() {
     vertexShader: /* glsl */`
       varying vec3 vWorld;
       varying vec3 vN;
+      varying vec3 vLocalN;
+      varying vec3 vLocal;
+      varying vec3 vScale;
       varying vec3 vCol;
       #include <fog_pars_vertex>
       void main() {
         vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0);
         vWorld = wp.xyz;
         vN = normalize(mat3(instanceMatrix) * normal);
+        vLocalN = normal;
+        vLocal = position;
+        // Instance scale in metres, extracted from the matrix columns, lets the
+        // fragment shader recover true wall metres per facade axis.
+        vScale = vec3(
+          length(instanceMatrix[0].xyz),
+          length(instanceMatrix[1].xyz),
+          length(instanceMatrix[2].xyz)
+        );
         #ifdef USE_INSTANCING_COLOR
           vCol = instanceColor;
         #else
@@ -73,6 +104,9 @@ function makeBuildingMaterial() {
       uniform float uNight;
       varying vec3 vWorld;
       varying vec3 vN;
+      varying vec3 vLocalN;
+      varying vec3 vLocal;
+      varying vec3 vScale;
       varying vec3 vCol;
       #include <common>
       #include <fog_pars_fragment>
@@ -85,25 +119,51 @@ function makeBuildingMaterial() {
 
       void main() {
         vec3 n = normalize(vN);
+        vec3 ln = normalize(vLocalN);
         float ndl = max(dot(n, uSunDir), 0.0);
         float wrap = max(dot(n, uSunDir) * 0.5 + 0.5, 0.0);
         vec3 col = vCol * (uAmbient + uSunColor * (ndl * 0.9 + wrap * 0.14)) + vCol * 0.06;
 
-        float vertical = 1.0 - smoothstep(0.55, 0.85, abs(n.y));
-        vec2 wuv = vec2((vWorld.x + vWorld.z) * 0.30, vWorld.y / 3.4);
-        vec2 g = fract(wuv);
-        float win = step(0.22, g.x) * step(g.x, 0.80) * step(0.30, g.y) * step(g.y, 0.82);
-        vec2 cell = floor(wuv);
+        // Wall-aligned facade coordinates. The axis that runs *across* each
+        // wall (local z for the ±X walls, local x for the ±Z walls) is taken in
+        // real metres via the instance scale, so window columns stay crisp and
+        // vertical on rotated buildings instead of smearing diagonally.
+        float xFace = step(0.5, abs(ln.x));
+        float wallSpan = mix(vLocal.x * vScale.x, vLocal.z * vScale.z, xFace);
+        float u = wallSpan / 3.8;              // ~3.8 m wide window bays
+        float v = (vLocal.y * vScale.y) / 3.4; // ~3.4 m floor pitch
+        vec2 g = fract(vec2(u, v));
+        float win = step(0.18, g.x) * step(g.x, 0.82) * step(0.30, g.y) * step(g.y, 0.86);
+        vec2 cell = floor(vec2(u, v));
         float rnd = h21(cell + floor(vCol.xy * 97.0));
-        float lit = step(0.55, rnd) * win * vertical;
+        float wall = 1.0 - smoothstep(0.55, 0.85, abs(ln.y));
+        float glass = win * wall;
 
-        vec3 warm = vec3(1.0, 0.66, 0.30);
-        col += warm * lit * uNight * 2.6;
-        col += vec3(0.10, 0.13, 0.16) * win * vertical * (1.0 - uNight) * 0.7;
+        // Crisp horizontal floor spandrel band under every row of windows.
+        float spandrel = wall * step(0.04, g.y) * step(g.y, 0.19);
+        col *= 1.0 - spandrel * 0.22;
 
-        // roofs get a dusty tone
-        float roof = smoothstep(0.65, 0.95, abs(n.y));
-        col = mix(col, col * vec3(0.72, 0.70, 0.66), roof);
+        float day = 1.0 - uNight;
+
+        // Daylight: dark, sky-tinted reflective glass with a subtle sheen.
+        vec3 skyGlass = mix(vec3(0.14, 0.20, 0.28), vec3(0.46, 0.58, 0.73),
+                            clamp(wrap, 0.0, 1.0));
+        col = mix(col, skyGlass, glass * 0.62 * day);
+
+        // Night: unlit glass reads as a dark hole, lit offices glow warm.
+        col *= 1.0 - glass * 0.55 * uNight;
+        float lit = step(0.55, rnd) * glass;
+        col += vec3(1.0, 0.66, 0.30) * lit * uNight * 2.6;
+
+        // Subtle base ambient occlusion over the bottom 15% of each block.
+        col *= mix(0.72, 1.0, smoothstep(0.0, 0.15, vLocal.y));
+
+        // Textured, darker rooftops with a mottled gravel/tar tone.
+        float roof = smoothstep(0.65, 0.95, abs(ln.y));
+        vec2 rp = vec2(vLocal.x * vScale.x, vLocal.z * vScale.z) * 0.4;
+        float mottle = h21(floor(rp) + floor(vCol.yz * 131.0));
+        vec3 roofCol = col * mix(vec3(0.62, 0.60, 0.56), vec3(0.86, 0.84, 0.80), mottle);
+        col = mix(col, roofCol, roof);
 
         gl_FragColor = vec4(col, 1.0);
         #include <fog_fragment>
@@ -164,10 +224,13 @@ function makeUrbanTexture() {
     ctx.fillStyle = `rgba(${v},${v + 2},${v - 2},${0.1 + rng() * 0.35})`;
     ctx.fillRect(rng() * S, rng() * S, 2 + rng() * 14, 2 + rng() * 10);
   }
-  // fade the edge so the patch blends into terrain
-  const g = ctx.createRadialGradient(S / 2, S / 2, S * 0.18, S / 2, S / 2, S * 0.5);
-  g.addColorStop(0, 'rgba(255,255,255,1)');
-  g.addColorStop(0.72, 'rgba(255,255,255,0.9)');
+  // Fade the edge broadly so the patch melts into the terrain instead of
+  // stamping a hard grey circle on the landscape.
+  const g = ctx.createRadialGradient(S / 2, S / 2, S * 0.12, S / 2, S / 2, S * 0.5);
+  g.addColorStop(0, 'rgba(255,255,255,0.96)');
+  g.addColorStop(0.45, 'rgba(255,255,255,0.82)');
+  g.addColorStop(0.74, 'rgba(255,255,255,0.42)');
+  g.addColorStop(0.9, 'rgba(255,255,255,0.16)');
   g.addColorStop(1, 'rgba(255,255,255,0)');
   ctx.globalCompositeOperation = 'destination-in';
   ctx.fillStyle = g;
@@ -175,6 +238,86 @@ function makeUrbanTexture() {
   ctx.globalCompositeOperation = 'source-over';
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  return t;
+}
+
+// Charred crater decal: crisp dark bowl, radial blast rays, a raised dusty
+// earth rim and a cooling ember ring. Drawn once; the crater mesh maps it onto
+// every disc (UVs are radial, so one texture serves 4 m scorches and 160 m
+// wastelands alike).
+function makeCraterTexture() {
+  if (!HAS_DOM) return null;
+  const S = 256;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const ctx = c.getContext('2d');
+  if (!ctx) return null;
+  const cx = S * 0.5;
+  const cy = S * 0.5;
+  const R = S * 0.5;
+  const rng = (() => {
+    let a = 0x9e3779b9 >>> 0;
+    return () => { a = (a * 1664525 + 1013904223) >>> 0; return a / 4294967296; };
+  })();
+
+  ctx.clearRect(0, 0, S, S);
+
+  // Scorched bowl: opaque charred centre fading into thrown-up dust at the lip.
+  const bowl = ctx.createRadialGradient(cx, cy, 0, cx, cy, R);
+  bowl.addColorStop(0.0, 'rgba(6,5,4,0.98)');
+  bowl.addColorStop(0.32, 'rgba(14,12,10,0.96)');
+  bowl.addColorStop(0.54, 'rgba(32,26,20,0.90)');
+  bowl.addColorStop(0.7, 'rgba(66,52,38,0.60)');
+  bowl.addColorStop(0.86, 'rgba(108,90,66,0.30)');
+  bowl.addColorStop(1.0, 'rgba(124,106,78,0.0)');
+  ctx.fillStyle = bowl;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Radial blast rays: dark char streaks driven out from ground zero.
+  for (let i = 0; i < 72; i++) {
+    const ang = rng() * Math.PI * 2;
+    const inner = R * (0.10 + rng() * 0.16);
+    const outer = R * (0.46 + rng() * 0.44);
+    const wob = (rng() - 0.5) * 0.16;
+    const shade = 10 + ((rng() * 16) | 0);
+    ctx.strokeStyle = `rgba(${shade},9,8,${0.14 + rng() * 0.34})`;
+    ctx.lineWidth = 0.6 + rng() * 3.2;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(ang) * inner, cy + Math.sin(ang) * inner);
+    ctx.lineTo(cx + Math.cos(ang + wob) * outer, cy + Math.sin(ang + wob) * outer);
+    ctx.stroke();
+  }
+
+  // Raised dusty earth rim around the lip of the bowl.
+  ctx.strokeStyle = 'rgba(152,134,102,0.42)';
+  ctx.lineWidth = S * 0.036;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R * 0.8, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(78,64,46,0.30)';
+  ctx.lineWidth = S * 0.018;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R * 0.73, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Subtle ember glow ring still cooling inside the bowl (also used as the
+  // emissive map so the ring glows while the char itself stays black).
+  const ember = ctx.createRadialGradient(cx, cy, R * 0.26, cx, cy, R * 0.6);
+  ember.addColorStop(0.0, 'rgba(255,96,24,0)');
+  ember.addColorStop(0.55, 'rgba(255,104,32,0.2)');
+  ember.addColorStop(1.0, 'rgba(210,52,10,0)');
+  ctx.fillStyle = ember;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R * 0.62, 0, Math.PI * 2);
+  ctx.fill();
+
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = THREE.ClampToEdgeWrapping;
+  t.wrapT = THREE.ClampToEdgeWrapping;
   t.anisotropy = 4;
   return t;
 }
@@ -358,6 +501,12 @@ export class BuildingSystem {
 
     // Destruction state is pure data, so it exists headlessly too.
     this.destroyed = new Set();
+    // Cumulative structural HP per building key: light ordnance (20 mm GUN)
+    // chips it down instead of levelling the block in one hit.
+    this.buildingHp = new Map();
+    // Buildings that have finished collapsing and are still smouldering:
+    // [{ key, x, y, z, t, life, seed }], oldest first, capped at RUIN_FIRE_CAP.
+    this.ruinFires = [];
     // Buildings that are burning and falling right now: key -> collapse entry
     // ({ key, b, s, minY, topY, height, t, duration, tiltX, tiltZ, seed }).
     // They only join `destroyed` once the animation has played out, which is
@@ -367,13 +516,20 @@ export class BuildingSystem {
     this._cratersDirty = true;
     this._groundCache = new WeakMap();
     this._needsRebuild = true;
-    this.stats = { buildings: 0, roads: 0, settlements: 0, lights: 0, destroyed: 0, craters: 0 };
+    // Baked real-world settlement (OSM). null = pure procedural cities.
+    this.customSettlement = null;
+    this.stats = {
+      buildings: 0, roads: 0, settlements: 0, lights: 0,
+      destroyed: 0, craters: 0, ruins: 0, ruinFires: 0,
+    };
 
     // Everything below needs a scene; in Node we stop here (headless-safe).
     this.mesh = null;
     this.roadMesh = null;
     this.craterMesh = null;
     this.lightMesh = null;
+    this.ruinMesh = null;
+    this.craterTexture = null;
     this.groundMaterial = null;
     this.grounds = new Map();
     this._groundUse = new Set();
@@ -394,6 +550,22 @@ export class BuildingSystem {
     this.mesh.count = 0;
     this.mesh.name = 'buildings';
     this.scene.add(this.mesh);
+
+    // Ruined footprints live in their own instanced mesh: a bombed block is
+    // drawn as a multi-piece debris field (wall stubs, slabs, core) without
+    // inflating the standing-building instance budget.
+    const ruinGeo = new THREE.BoxGeometry(1, 1, 1);
+    ruinGeo.translate(0, 0.5, 0);
+    this.ruinMesh = new THREE.InstancedMesh(
+      ruinGeo,
+      this.material,
+      Math.max(2000, this.preset.ruinLimit || this.preset.buildingLimit || 16000),
+    );
+    this.ruinMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.ruinMesh.frustumCulled = false;
+    this.ruinMesh.count = 0;
+    this.ruinMesh.name = 'ruin-pieces';
+    this.scene.add(this.ruinMesh);
 
     this.streetTexture = makeStreetTexture();
     this.roadMaterial = new THREE.MeshLambertMaterial({
@@ -426,15 +598,22 @@ export class BuildingSystem {
     this.groundMaterial = new THREE.MeshLambertMaterial({
       map: makeUrbanTexture(),
       transparent: true,
-      opacity: 0.82,
+      opacity: 0.38,
       depthWrite: false,
       polygonOffset: true,
       polygonOffsetFactor: -1,
       polygonOffsetUnits: -1,
     });
 
+    this.craterTexture = makeCraterTexture();
     this.craterMaterial = new THREE.MeshLambertMaterial({
-      color: 0x26211e,
+      color: this.craterTexture ? 0xffffff : 0x26211e,
+      map: this.craterTexture || null,
+      transparent: true,
+      depthWrite: false,
+      emissive: this.craterTexture ? 0xff4a12 : 0x000000,
+      emissiveMap: this.craterTexture || null,
+      emissiveIntensity: 0.45,
       polygonOffset: true,
       polygonOffsetFactor: -2,
       polygonOffsetUnits: -2,
@@ -453,22 +632,38 @@ export class BuildingSystem {
   }
 
   update(dt, camera, sky) {
+    const step = Number.isFinite(dt) ? Math.max(0, dt) : 0;
+
+    // Smouldering ruins age first, so a building that finishes collapsing in
+    // this very step starts its 75 s burn at t = 0 instead of being aged away.
+    if (this.ruinFires.length > 0) {
+      for (const f of this.ruinFires) f.t += step;
+      while (this.ruinFires.length > 0 && this.ruinFires[0].t >= RUIN_FIRE_LIFE) {
+        this.ruinFires.shift();
+      }
+    }
+
     // Collapse timers are pure data, so they advance headlessly too and a
-    // finished building only then becomes permanent rubble.
+    // finished building only then becomes permanent rubble (and a new ember).
     if (this.collapsing.size > 0) {
-      const step = Number.isFinite(dt) ? Math.max(0, dt) : 0;
       for (const [key, c] of this.collapsing) {
         c.t += step;
         if (c.t >= c.duration) {
           this.collapsing.delete(key);
           this.destroyed.add(key);
+          this._registerRuinFire(c);
         }
       }
       this._needsRebuild = true;
       this.stats.destroyed = this.destroyed.size + this.collapsing.size;
     }
+    this.stats.ruinFires = this.ruinFires.length;
 
-    if (!this.scene || !camera) return;
+    if (!this.scene) return;
+    // Fresh scorch marks arrive every few frames while strafing: rebuild the
+    // (cheap) crater mesh on its own instead of re-instancing every building.
+    if (this._cratersDirty && !this._needsRebuild) this._rebuildCraters();
+    if (!camera) return;
     if (sky) {
       this.material.uniforms.uSunDir.value.copy(sky.sunDir);
       this.material.uniforms.uSunColor.value.copy(sky.sunColor);
@@ -487,31 +682,132 @@ export class BuildingSystem {
   }
 
   // -------------------------------------------------------------------------
+  // Baked real-world city (OSM)
+  // -------------------------------------------------------------------------
+  /**
+   * Swap the procedural city for a baked real-world building set.
+   *
+   * Each `rawList` item is `[x, z, w, d, h, rot, kindCode]` in world metres,
+   * with `kindCode` 0 = house, 1 = apartment, 2 = industrial, 3 = tower. The
+   * whole list becomes one virtual settlement (`id: 'vipava-osm'`, type
+   * `metro`, radius 22 km) so grounding, side-wall hits, cumulative damage,
+   * burn/collapse and permanent ruins all run through the existing pipeline.
+   * Procedural settlements inside the 100 km DEM box are dropped while baked
+   * buildings are active; those outside it survive.
+   *
+   * Passing `null` (or an empty list) reverts cleanly to procedural cities.
+   *
+   * @returns {object|null} the virtual settlement, or null when reverting
+   */
+  setCustomBuildings(rawList) {
+    if (!Array.isArray(rawList) || rawList.length === 0) {
+      this.customSettlement = null;
+      this._needsRebuild = true;
+      return null;
+    }
+
+    const buildings = [];
+    for (const item of rawList) {
+      if (!Array.isArray(item) || item.length < 7) continue;
+      const x = Number(item[0]);
+      const z = Number(item[1]);
+      const w = Number(item[2]);
+      const d = Number(item[3]);
+      const h = Number(item[4]);
+      const rot = Number(item[5]);
+      if (!Number.isFinite(x) || !Number.isFinite(z) || !Number.isFinite(rot)) continue;
+      if (!(w > 0) || !(d > 0) || !(h > 0)) continue;
+      const kind = CUSTOM_KINDS[Math.floor(Number(item[6])) | 0] || 'house';
+      const palette = CUSTOM_PALETTE[kind];
+      buildings.push({
+        x,
+        z,
+        w,
+        d,
+        h,
+        rot,
+        kind,
+        color: palette[Math.floor(hash2(Math.round(x), Math.round(z), 0x51ed270b) * palette.length)],
+      });
+    }
+
+    this.customSettlement = {
+      id: CUSTOM_SETTLEMENT_ID,
+      type: 'metro',
+      name: 'Vipava Valley',
+      x: 0,
+      z: 0,
+      radius: CUSTOM_SETTLEMENT_RADIUS,
+      population: buildings.length * 3,
+      buildings,
+      roads: [],
+    };
+    this._needsRebuild = true;
+    return this.customSettlement;
+  }
+
+  /**
+   * Settlements visible in the query circle, with the baked OSM city swapped in.
+   * While it is active, procedural cities inside the DEM box are hidden so the
+   * real valley is not covered by an invented grid; everything outside survives.
+   */
+  _settlementsNear(x, z, radius) {
+    const near = settlementsNear(x, z, radius);
+    const custom = this.customSettlement;
+    if (!custom) return near;
+
+    const out = [];
+    for (const s of near) {
+      if (Math.abs(s.x) <= DEM_HALF && Math.abs(s.z) <= DEM_HALF) continue;
+      out.push(s);
+    }
+    const dx = custom.x - x;
+    const dz = custom.z - z;
+    const reach = radius + custom.radius;
+    if (dx * dx + dz * dz <= reach * reach) out.unshift(custom);
+    return out;
+  }
+
+  // -------------------------------------------------------------------------
   // Damage
   // -------------------------------------------------------------------------
+  /** Effective structural HP of one building: tall blocks soak more punishment. */
+  _hpFor(b) {
+    const h = Number.isFinite(b.h) ? b.h : 0;
+    return Math.max(40, Math.min(180, h * 2.2));
+  }
+
   /**
    * Apply a blast at a world position.
    *
    * `splashRadius` is the lethal radius in metres; buildings whose centre is
-   * within `splashRadius + max(w, d) * 0.4` start to burn and collapse. A
-   * charred crater is added when `damage >= 40`. Returns the newly hit
-   * buildings (`{ destroyedCount, positions }`) so callers can spawn fires,
-   * smoke and toasts; the positions are the burning centre of each building.
+   * within `splashRadius + max(w, d) * 0.4` take distance-falloff damage.
+   * Heavy ordnance (`damage >= 40`: AIM-9, Mk-82, BFFG) levels everything in
+   * that radius outright; light ordnance (20 mm GUN, 18) chips each building's
+   * cumulative `buildingHp` until the block ignites and collapses. A permanent
+   * scorch crater is added for `damage >= 15`, scaled by weapon class.
+   *
+   * Returns `{ destroyedCount, damagedCount, positions }` so callers can spawn
+   * fires, smoke and toasts; the positions are the burning centre of each
+   * building that started collapsing.
    */
   applyBlast(position, splashRadius = 30, damage = 100) {
     const px = Number.isFinite(position?.x) ? position.x : 0;
     const pz = Number.isFinite(position?.z) ? position.z : 0;
     const splash = Math.max(1, Number.isFinite(splashRadius) ? splashRadius : 30);
-    const result = { destroyedCount: 0, positions: [] };
+    const power = Number.isFinite(damage) ? Math.max(0, damage) : 100;
+    const heavy = power >= 40; // AIM-9 / Mk-82 / BFFG level structures outright
+    const result = { destroyedCount: 0, damagedCount: 0, positions: [] };
 
-    if (damage >= 40) {
-      const r = clamp(splash * 0.32, 4, 34);
-      this.craters.push({ x: px, y: terrainHeight(px, pz), z: pz, r });
+    // Weapon-scaled permanent craters: 20 mm scorch -> 160 m BFFG wasteland.
+    if (power >= 15) {
+      const r = craterRadiusFor(power, splash);
+      this.craters.push({ x: px, y: terrainHeight(px, pz), z: pz, r, damage: power });
       while (this.craters.length > MAX_CRATERS) this.craters.shift();
       this._cratersDirty = true;
     }
 
-    const near = settlementsNear(px, pz, splash + 1600);
+    const near = this._settlementsNear(px, pz, splash + 1600);
     for (const s of near) {
       for (const b of s.buildings) {
         const key = buildingKey(s, b);
@@ -519,7 +815,28 @@ export class BuildingSystem {
         const reach = splash + Math.max(b.w, b.d) * 0.4;
         const dx = b.x - px;
         const dz = b.z - pz;
-        if (dx * dx + dz * dz > reach * reach) continue;
+        const dist2 = dx * dx + dz * dz;
+        if (dist2 > reach * reach) continue;
+
+        // Distance falloff, floored so the blast edge still hurts.
+        const dist = Math.sqrt(dist2);
+        const falloff = clamp(1 - dist / (reach + 1), 0.25, 1);
+        const dmg = power * falloff;
+
+        const hpMax = this._hpFor(b);
+        const prevHp = this.buildingHp.has(key) ? this.buildingHp.get(key) : hpMax;
+        if (!heavy && prevHp - dmg > 0) {
+          // Small arms: accumulate structural damage and char the block a bit.
+          const hp = prevHp - dmg;
+          this.buildingHp.set(key, hp);
+          result.damagedCount++;
+          // Only re-instance when the scorch tier visibly changes.
+          if (Math.ceil((hp / hpMax) * 3) !== Math.ceil((prevHp / hpMax) * 3)) {
+            this._needsRebuild = true;
+          }
+          continue;
+        }
+        this.buildingHp.delete(key);
 
         const g = this._ground(b);
         const minY = g.base;
@@ -551,8 +868,45 @@ export class BuildingSystem {
     result.destroyedCount = result.positions.length;
     this.stats.destroyed = this.destroyed.size + this.collapsing.size;
     this.stats.craters = this.craters.length;
-    if (result.destroyedCount > 0 || damage >= 40) this._needsRebuild = true;
+    if (result.destroyedCount > 0 || heavy) this._needsRebuild = true;
     return result;
+  }
+
+  /** Register a finished collapse as a smouldering ruin emitter (capped). */
+  _registerRuinFire(c) {
+    this.ruinFires.push({
+      key: c.key,
+      x: c.b.x,
+      y: c.minY + 1.4 + Math.min(6, c.height * 0.08),
+      z: c.b.z,
+      t: 0,
+      life: RUIN_FIRE_LIFE,
+      seed: c.seed,
+    });
+    while (this.ruinFires.length > RUIN_FIRE_CAP) this.ruinFires.shift();
+  }
+
+  /**
+   * World-space ember/smoke emitters for collapsed buildings that are still
+   * smouldering. Each entry lives RUIN_FIRE_LIFE seconds (75 s) after its
+   * collapse finished; the rubble itself is permanent.
+   */
+  getRuinFirePoints() {
+    const out = [];
+    for (const f of this.ruinFires) {
+      const life = f.life || RUIN_FIRE_LIFE;
+      const progress = clamp(life > 0 ? f.t / life : 1, 0, 1);
+      out.push({
+        x: f.x,
+        y: f.y,
+        z: f.z,
+        age: f.t,
+        life,
+        progress,
+        intensity: 1 - progress,
+      });
+    }
+    return out;
   }
 
   /**
@@ -584,7 +938,7 @@ export class BuildingSystem {
     const mx = ax + ex * 0.5;
     const mz = az + ez * 0.5;
     const halfLen = 0.5 * Math.hypot(ex, ez);
-    const near = settlementsNear(mx, mz, halfLen + 1600);
+    const near = this._settlementsNear(mx, mz, halfLen + 1600);
 
     let bestT = 1;
     let best = null;
@@ -703,15 +1057,18 @@ export class BuildingSystem {
     return out;
   }
 
-  /** Clear every destroyed building, in-flight collapse and crater (mission reset / respawn). */
+  /** Clear every destroyed building, in-flight collapse, partial damage and crater (mission reset / respawn). */
   resetDamage() {
     this.destroyed.clear();
     this.collapsing.clear();
+    this.buildingHp.clear();
+    this.ruinFires.length = 0;
     this.craters.length = 0;
     this._cratersDirty = true;
     this._needsRebuild = true;
     this.stats.destroyed = 0;
     this.stats.craters = 0;
+    this.stats.ruinFires = 0;
   }
 
   // -------------------------------------------------------------------------
@@ -745,9 +1102,10 @@ export class BuildingSystem {
     if (!this.scene || !camera) return;
     const alt = Math.max(0, camera.position.y);
     const radius = clamp((this.preset.buildingRadius || 8000) + alt * 5, this.preset.buildingRadius || 8000, 30000);
-    const settlements = settlementsNear(camera.position.x, camera.position.z, radius);
+    const settlements = this._settlementsNear(camera.position.x, camera.position.z, radius);
     this._groundUse.clear();
     for (const s of settlements) {
+      if (s.id === CUSTOM_SETTLEMENT_ID) continue; // real OSM city: no giant ground decal
       if (s.type === 'metro' || s.type === 'town') {
         this._ensureGround(s);
         this._groundUse.add(s.id);
@@ -761,10 +1119,13 @@ export class BuildingSystem {
     }
 
     let n = 0;
+    let rn = 0;
     let ln = 0;
     let colorDirty = false;
+    let ruinColorDirty = false;
 
     const limit = this.preset.buildingLimit || 16000;
+    const ruinLimit = this.ruinMesh ? this.ruinMesh.instanceMatrix.count : 0;
     const lightLimit = this.lightMesh.instanceMatrix.count;
 
     const addBox = (x, baseY, z, w, h, d, rot, color, tiltX = 0, tiltZ = 0) => {
@@ -782,21 +1143,32 @@ export class BuildingSystem {
       return true;
     };
 
+    // Ruin pieces go to their own instanced mesh (matrix + colour buffers are
+    // independent, so they never disturb the standing-building instancing).
+    const addRuinBox = (x, baseY, z, w, h, d, rot, color, tiltX = 0, tiltZ = 0) => {
+      if (rn >= ruinLimit || !(h > 0) || !(w > 0) || !(d > 0)) return false;
+      _p.set(x, baseY, z);
+      _e.set(tiltX, rot || 0, tiltZ);
+      _q.setFromEuler(_e);
+      _s.set(w, h, d);
+      _m.compose(_p, _q, _s);
+      this.ruinMesh.setMatrixAt(rn, _m);
+      _c.setHex(color).convertSRGBToLinear();
+      this.ruinMesh.setColorAt(rn, _c);
+      rn++;
+      ruinColorDirty = true;
+      return true;
+    };
+
     for (const s of settlements) {
       for (const b of s.buildings) {
         if (n >= limit) break;
         const g = this._ground(b);
         const key = buildingKey(s, b);
         if (this.destroyed.has(key)) {
-          // Collapsed shell: low charred rubble instead of a tower.
-          const rubble = 1.6 + hash2(Math.round(b.x), Math.round(b.z), 0x5bd1e995) * 1.6;
-          addBox(b.x, g.base, b.z, b.w * 0.82, rubble, b.d * 0.82, b.rot + 0.12, 0x22201e);
-          addBox(
-            b.x + (hash2(Math.round(b.x), Math.round(b.z), 0x1b56c4e9) - 0.5) * b.w * 0.5,
-            g.base,
-            b.z + (hash2(Math.round(b.z), Math.round(b.x), 0x2545f491) - 0.5) * b.d * 0.5,
-            b.w * 0.42, rubble * 0.55, b.d * 0.42, b.rot - 0.3, 0x2c2724,
-          );
+          // Permanent multi-piece ruin: jagged wall stubs, tilted slabs and a
+          // scorched debris core where the tower used to be.
+          this._addRuin(addRuinBox, b, g);
           continue;
         }
         const c = this.collapsing.get(key);
@@ -804,13 +1176,24 @@ export class BuildingSystem {
           this._addCollapse(addBox, b, g, c);
           continue;
         }
-        this._addSilhouette(addBox, b, g.base, g.top);
+        // Partially strafed blocks darken toward char as their HP drains.
+        let tint = 1;
+        const hp = this.buildingHp.get(key);
+        if (hp !== undefined) {
+          const ratio = clamp(hp / this._hpFor(b), 0, 1);
+          tint = 0.58 + 0.42 * ratio;
+        }
+        this._addSilhouette(addBox, b, g.base, g.top, tint);
       }
     }
 
     this.mesh.count = n;
     this.mesh.instanceMatrix.needsUpdate = true;
     if (colorDirty && this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
+
+    this.ruinMesh.count = rn;
+    this.ruinMesh.instanceMatrix.needsUpdate = true;
+    if (ruinColorDirty && this.ruinMesh.instanceColor) this.ruinMesh.instanceColor.needsUpdate = true;
 
     // Streets: one ribbon mesh for every settlement road in range. Distant
     // roads are sub-pixel, so they are culled, and the ribbon is only rebuilt
@@ -876,22 +1259,25 @@ export class BuildingSystem {
     this.stats.lights = ln;
     this.stats.destroyed = this.destroyed.size + this.collapsing.size;
     this.stats.craters = this.craters.length;
+    this.stats.ruins = rn;
   }
 
   // Ground floor `base` -> `top` boxes for one building, per kind.
-  _addSilhouette(addBox, b, base, top) {
+  // `tint` (1 = pristine) darkens a block that has taken structural damage.
+  _addSilhouette(addBox, b, base, top, tint = 1) {
     const h = top - base;
-    const dark = shade(b.color, 0.72);
+    const body = tint >= 0.999 ? b.color : shade(b.color, tint);
+    const dark = shade(body, 0.72);
     switch (b.kind) {
       case 'tower': {
         // Wide podium, main shaft, stepped crown, plant room, spire.
         const podiumH = Math.min(h * 0.16, h - 2);
-        addBox(b.x, base, b.z, b.w * 1.12, podiumH, b.d * 1.12, b.rot, b.color);
-        addBox(b.x, base + podiumH, b.z, b.w, h - podiumH, b.d, b.rot, b.color);
+        addBox(b.x, base, b.z, b.w * 1.12, podiumH, b.d * 1.12, b.rot, body);
+        addBox(b.x, base + podiumH, b.z, b.w, h - podiumH, b.d, b.rot, body);
         const crownH = Math.min(12, Math.max(2.5, h * 0.12));
         const cw = b.w * 0.72;
         const cd = b.d * 0.72;
-        addBox(b.x, top, b.z, cw, crownH, cd, b.rot, b.color);
+        addBox(b.x, top, b.z, cw, crownH, cd, b.rot, body);
         addBox(b.x, top + crownH, b.z, cw * 0.34, 2.6, cd * 0.34, b.rot + 0.2, 0x545a5c);
         if (b.h > 75) {
           addBox(b.x, top + crownH + 2.6, b.z, 0.8, Math.min(14, b.h * 0.1), 0.8, b.rot, 0x6b7072);
@@ -899,25 +1285,25 @@ export class BuildingSystem {
         break;
       }
       case 'apartment': {
-        addBox(b.x, base, b.z, b.w, h, b.d, b.rot, b.color);
+        addBox(b.x, base, b.z, b.w, h, b.d, b.rot, body);
         // Rooftop parapet / utility penthouse.
-        addBox(b.x, top, b.z, b.w * 0.82, Math.min(2.2, Math.max(1, h * 0.05)), b.d * 0.82, b.rot, shade(b.color, 0.85));
+        addBox(b.x, top, b.z, b.w * 0.82, Math.min(2.2, Math.max(1, h * 0.05)), b.d * 0.82, b.rot, shade(body, 0.85));
         break;
       }
       case 'industrial': {
-        addBox(b.x, base, b.z, b.w, h, b.d, b.rot, b.color);
+        addBox(b.x, base, b.z, b.w, h, b.d, b.rot, body);
         // Clerestory roof monitor running the length of the hall.
         addBox(b.x, top, b.z, b.w * 0.42, 1.6, b.d * 0.88, b.rot, 0x6f736e);
         break;
       }
       case 'shed': {
-        addBox(b.x, base, b.z, b.w, h, b.d, b.rot, b.color);
+        addBox(b.x, base, b.z, b.w, h, b.d, b.rot, body);
         addBox(b.x, top, b.z, b.w * 0.94, 0.7, b.d * 0.94, b.rot, dark);
         break;
       }
       default: {
         // house / shop: main block plus a darker stepped roof cap.
-        addBox(b.x, base, b.z, b.w, h, b.d, b.rot, b.color);
+        addBox(b.x, base, b.z, b.w, h, b.d, b.rot, body);
         addBox(b.x, top, b.z, b.w * 0.88, 1.1, b.d * 0.88, b.rot, dark);
       }
     }
@@ -958,6 +1344,97 @@ export class BuildingSystem {
     }
   }
 
+  // Permanent ruin of one levelled building: a scorched debris core, 3-4
+  // jagged broken wall stubs along the old footprint edge and two tilted
+  // concrete slabs. Fully deterministic from the building position.
+  _addRuin(addBox, b, g) {
+    const base = g.base;
+    const rx = Math.round(b.x);
+    const rz = Math.round(b.z);
+    const h1 = hash2(rx, rz, 0x9e3779b1);
+    const h2 = hash2(rz, rx, 0x85ebca6b);
+    const h3 = hash2(rx + 17, rz - 31, 0xc2b2ae35);
+    const h4 = hash2(rx - 53, rz + 11, 0x27d4eb2f);
+    const hw = b.w * 0.5;
+    const hd = b.d * 0.5;
+    const cos = Math.cos(b.rot);
+    const sin = Math.sin(b.rot);
+
+    // Dark scorched debris core: low, wide and slightly skewed off-axis.
+    addBox(
+      b.x, base, b.z,
+      b.w * (0.84 + h1 * 0.14),
+      0.8 + h2 * 1.3,
+      b.d * (0.84 + h3 * 0.14),
+      b.rot + (h4 - 0.5) * 0.22,
+      0x1a1817,
+    );
+
+    // Broken perimeter walls: 3-4 chars of the old facade, each a tall stub
+    // plus a smaller jagged chunk sheared off its top.
+    const pieces = 3 + (h1 > 0.5 ? 1 : 0);
+    for (let i = 0; i < pieces; i++) {
+      const a = hash2(rx + i * 131, rz - i * 71, 0x5bd1e995);
+      const c = hash2(rx - i * 37, rz + i * 113, 0x1b56c4e9);
+      const alongX = (i & 1) === 0; // stub runs along a ±Z wall
+      const sign = (i & 2) ? 1 : -1;
+      let lx;
+      let lz;
+      if (alongX) {
+        lx = (a - 0.5) * b.w * 0.84;
+        lz = sign * hd;
+      } else {
+        lx = sign * hw;
+        lz = (c - 0.5) * b.d * 0.84;
+      }
+      const wx = b.x + lx * cos - lz * sin;
+      const wz = b.z + lx * sin + lz * cos;
+
+      const span = alongX ? b.w : b.d;
+      const len = span * (0.2 + a * 0.24);
+      const thick = 0.9 + c * 0.9;
+      const stubH = 2.2 + c * 4.6;
+      const wallRot = b.rot + (a - 0.5) * 0.16;
+
+      addBox(
+        wx, base, wz,
+        alongX ? len : thick,
+        stubH,
+        alongX ? thick : len,
+        wallRot,
+        i & 1 ? 0x33302b : 0x2a2724,
+        (a - 0.5) * 0.16, (c - 0.5) * 0.16,
+      );
+      // Jagged break: a narrower, lower chunk hanging off the top.
+      addBox(
+        wx + (c - 0.5) * 1.4, base, wz + (a - 0.5) * 1.4,
+        alongX ? len * (0.32 + c * 0.22) : thick * 0.85,
+        stubH * (0.32 + a * 0.3),
+        alongX ? thick * 0.85 : len * (0.32 + c * 0.22),
+        wallRot + (c - 0.5) * 0.5,
+        0x3b342d,
+        (c - 0.5) * 0.42, (a - 0.5) * 0.42,
+      );
+    }
+
+    // Two tilted concrete slabs lying in the debris field.
+    for (let i = 0; i < 2; i++) {
+      const t = hash2(rx + 300 + i * 91, rz - 200 + i * 53, 0x2545f491);
+      const s = hash2(rz + 400 - i * 61, rx - 100 + i * 79, 0x7f4a7c15);
+      addBox(
+        b.x + (t - 0.5) * b.w * 0.55,
+        base + 0.2,
+        b.z + (s - 0.5) * b.d * 0.55,
+        b.w * (0.22 + t * 0.18),
+        0.5 + s * 0.4,
+        b.d * (0.16 + s * 0.16),
+        b.rot + (t - 0.5) * 1.6,
+        i === 0 ? 0x4a443d : 0x3c3732,
+        0.22 + t * 0.26, (s - 0.5) * 0.34,
+      );
+    }
+  }
+
   _rebuildStreetRibbons(streets) {
     const data = buildStreetRibbonData(streets, terrainHeight);
     const geo = new THREE.BufferGeometry();
@@ -976,26 +1453,30 @@ export class BuildingSystem {
   _rebuildCraters() {
     this._cratersDirty = false;
     if (!this.craterMesh) return;
-    const RINGS = 16;
-    const INNER = 10;
+    const RINGS = 18;
+    const INNER = 12;
     const pos = [];
+    const uv = [];
     const idx = [];
     for (const c of this.craters) {
       const base = pos.length / 3;
       const ground = Number.isFinite(c.y) ? c.y : terrainHeight(c.x, c.z);
       pos.push(c.x, ground - 0.55, c.z); // 0: bowl centre
+      uv.push(0.5, 0.5);
       for (let i = 0; i < INNER; i++) {
         const a = (i / INNER) * Math.PI * 2;
         const rr = c.r * 0.55;
         const x = c.x + Math.cos(a) * rr;
         const z = c.z + Math.sin(a) * rr;
         pos.push(x, terrainHeight(x, z) - 0.25, z);
+        uv.push(0.5 + Math.cos(a) * 0.275, 0.5 + Math.sin(a) * 0.275);
       }
       for (let i = 0; i < RINGS; i++) {
         const a = (i / RINGS) * Math.PI * 2;
         const x = c.x + Math.cos(a) * c.r;
         const z = c.z + Math.sin(a) * c.r;
         pos.push(x, terrainHeight(x, z) + 0.06, z);
+        uv.push(0.5 + Math.cos(a) * 0.5, 0.5 + Math.sin(a) * 0.5);
       }
       const inner0 = base + 1;
       const outer0 = base + 1 + INNER;
@@ -1015,6 +1496,7 @@ export class BuildingSystem {
     }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
     geo.setIndex(idx);
     geo.computeVertexNormals();
     geo.computeBoundingSphere();
@@ -1054,6 +1536,7 @@ export class BuildingSystem {
     if (!this.scene) return;
     this.mesh.geometry.dispose();
     this.material.dispose();
+    this.ruinMesh.geometry.dispose();
     this.roadMesh.geometry.dispose();
     this.roadMaterial.dispose();
     this.streetTexture?.dispose();
@@ -1061,13 +1544,25 @@ export class BuildingSystem {
     this.lightMaterial.dispose();
     this.craterMesh.geometry.dispose();
     this.craterMaterial.dispose();
+    this.craterTexture?.dispose();
     this.groundMaterial.map?.dispose();
     this.groundMaterial.dispose();
     this.mesh.removeFromParent();
+    this.ruinMesh.removeFromParent();
     this.roadMesh.removeFromParent();
     this.lightMesh.removeFromParent();
     this.craterMesh.removeFromParent();
   }
+}
+
+// Permanent crater size per weapon class (metres of visible scorched ground).
+function craterRadiusFor(damage, splash) {
+  if (splash >= 200 || damage >= 2000) return 160; // BFFG ground zero
+  if (damage >= 160) return 38; // Mk-82
+  if (damage >= 100) return 18; // AIM-9
+  if (damage >= 40) return 10; // heavy fragments
+  // 20 mm strafing: a 4..6 m bullet scorch, ramping with impact energy.
+  return 4 + clamp((damage - 15) / 25, 0, 1) * 2;
 }
 
 // Multiply an sRGB hex towards black for roof caps.

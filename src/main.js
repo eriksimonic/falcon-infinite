@@ -28,7 +28,8 @@ import { HUD } from './ui/hud.js';
 import { TacticalOverlay } from './ui/tactical.js';
 import { KneeboardMap } from './ui/kneeboard.js';
 import { UI } from './ui/menu.js';
-import { spawnPoint, airportNear, airportsNear } from './world/terrain.js';
+import { spawnPoint, airportNear, airportsNear, setActiveDEM, terrainHeight } from './world/terrain.js';
+import { loadVipavaDEM, loadVipavaOSM } from './world/dem.js';
 import { settlementsNear } from './world/settlements.js';
 import { clamp } from './world/noise.js';
 
@@ -125,6 +126,8 @@ class App {
     this.sky = new SkySystem(this.scene, this.renderer);
 
     this.spawn = this.chooseSpawn();
+    // Kept so switching back from a baked theater restores the procedural start.
+    this._proceduralSpawn = this.spawn;
     this.world = new World(this.scene, this.preset);
     // Offshore carrier group. Its deck elevation is published through
     // world.heightAt() so the jet lands, taxis and catapults like any runway.
@@ -258,12 +261,66 @@ class App {
     this.ui.toast('QUALITY · ' + name.toUpperCase());
   }
 
-  setTheater(name) {
+  /**
+   * Switch theater. `vipava` streams the baked real-world DEM + OSM extract and
+   * re-grounds every system on it; `temperate` / `desert` drop the baked data
+   * and restore the exact procedural terrain and spawn.
+   */
+  async setTheater(name) {
     const th = THEATERS[name];
     if (!th) return;
     this.sky.setTheater(name);
     this.world.setTheater(name);
+
+    if (name === 'vipava') {
+      let dem = null;
+      let osm = null;
+      try {
+        dem = await loadVipavaDEM(
+          th.demUrl || './media/vipava_dem.png',
+          th.metaUrl || './media/vipava_meta.json',
+        );
+        osm = await loadVipavaOSM();
+      } catch (err) {
+        console.warn('VIPAVA · dataset load failed, keeping procedural terrain', err);
+      }
+
+      if (dem) {
+        setActiveDEM(dem);
+        this.world.buildings.setCustomBuildings(osm?.buildings || null);
+        this.world.roads.setCustomRoads(osm?.roads || null);
+        // Ajdovscina Airfield (LJAJ) sits at the DEM centre; the real airport
+        // metadata rides along for HUD / kneeboard / ILS use.
+        this.spawn = {
+          x: 0,
+          z: 0,
+          y: terrainHeight(0, 0) + CONFIG.aircraft.gearHeight + 0.02,
+          heading: 74,
+          airport: dem.meta?.airports?.[0] || null,
+        };
+        // Gulf of Trieste is ~28 km south of the valley, well offshore.
+        this.carrier.placeNear(-24000, 28000);
+      } else {
+        setActiveDEM(null);
+        this.world.buildings.setCustomBuildings(null);
+        this.world.roads.setCustomRoads(null);
+        if (this._proceduralSpawn) this.spawn = this._proceduralSpawn;
+      }
+    } else {
+      setActiveDEM(null);
+      this.world.buildings.setCustomBuildings(null);
+      this.world.roads.setCustomRoads(null);
+      if (this._proceduralSpawn) this.spawn = this._proceduralSpawn;
+      this.carrier.placeNear(this.spawn.x, this.spawn.z);
+    }
+
+    // Terrain, forests, cities and asphalt were all built for the previous
+    // height field: repaint them around the new start point.
+    this.camera.position.set(this.spawn.x, this.spawn.y + 8, this.spawn.z);
     this.world.terrain.refresh(this.camera.position, 16);
+    this.world.buildings.rebuild(this.camera);
+    this.world.roads.update(this.camera);
+    this.world.vegetation.rebuild(this.camera);
     this.ui.toast('THEATER · ' + th.label);
   }
 
@@ -400,7 +457,7 @@ class App {
     this.aircraft.model.quaternion.copy(this.aircraft.flight.quaternion);
   }
 
-  startFlight() {
+  async startFlight() {
     if (!this.ready) return;
     this.input.requestPointerLock();
     this.audio.start().then(() => {
@@ -410,7 +467,8 @@ class App {
     });
     this.audio.resetEngine();
     this.audio.setPaused(false);
-    this.setTheater(this.ui.theater || 'temperate');
+    // Wait for the baked theater (DEM + OSM) so the spawn is the real runway.
+    await this.setTheater(this.ui.theater || 'temperate');
     this.aircraft.setMode('cockpit');
     this.aircraft.reset(this.spawn);
     this._startActiveMission(this.spawn);
@@ -839,6 +897,21 @@ class App {
             const firePoints = bld.getCollapsingFirePoints();
             const n = Math.min(6, firePoints.length);
             for (let i = 0; i < n; i++) this.vfx.spawnFirePuff(firePoints[i], 1.3);
+          }
+        }
+
+        // Feature 26: levelled blocks keep smouldering for 75 s. Poll the ruin
+        // emitters on a 0.35 s timer and feed up to 5 of the freshest into the
+        // fire-puff pool so devastated city blocks glow and smoke long after
+        // the fireball has gone.
+        this._ruinFxT = (this._ruinFxT || 0) + simDt;
+        if (this._ruinFxT >= 0.35) {
+          this._ruinFxT = 0;
+          const bld = this.world.buildings;
+          if (bld && typeof bld.getRuinFirePoints === 'function') {
+            const ruins = bld.getRuinFirePoints();
+            const start = Math.max(0, ruins.length - 5);
+            for (let i = start; i < ruins.length; i++) this.vfx.spawnFirePuff(ruins[i], 0.85);
           }
         }
       }

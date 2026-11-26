@@ -11,7 +11,7 @@ export const MAX_TERRAIN_HEIGHT = 2400;
 // ---------------------------------------------------------------------------
 // Base landform (no airports)
 // ---------------------------------------------------------------------------
-export function baseHeight(x, z) {
+function proceduralBaseHeight(x, z) {
   // Large-scale domain warp makes coastlines and ranges feel organic.
   const wx = x + 4200 * noise2(x * 0.000010, z * 0.000010, 911);
   const wz = z + 4200 * noise2(x * 0.000010 + 7.3, z * 0.000010 - 2.1, 917);
@@ -42,6 +42,41 @@ export function baseHeight(x, z) {
   // Smooth valley floors a touch so lowlands are habitable.
   if (h > 0 && h < 140) h *= 0.94;
   return h;
+}
+
+// ---------------------------------------------------------------------------
+// Optional baked DEM (real-world theater, e.g. Vipava Valley).
+//
+// When no DEM is active `baseHeight` is a direct call to the procedural
+// landform, so existing theaters stay bit-identical. When a DEM is active the
+// real elevation is blended in, fading smoothly to the procedural world at the
+// data edge (the DEM owns blendWeight).
+// ---------------------------------------------------------------------------
+let _activeDEM = null;
+
+/** Activate a HeightmapDEM, or pass null to restore procedural terrain. */
+export function setActiveDEM(dem) {
+  _activeDEM = dem || null;
+}
+
+/** Currently active HeightmapDEM (or null). */
+export function getActiveDEM() {
+  return _activeDEM;
+}
+
+export function baseHeight(x, z) {
+  const dem = _activeDEM;
+  if (dem === null) return proceduralBaseHeight(x, z);
+
+  const w = dem.blendWeight(x, z);
+  if (w > 0) {
+    const demH = dem.sample(x, z);
+    if (demH !== null && demH !== undefined) {
+      if (w >= 0.9999) return demH;
+      return demH * w + proceduralBaseHeight(x, z) * (1 - w);
+    }
+  }
+  return proceduralBaseHeight(x, z);
 }
 
 export function terrainNormal(x, z, out) {

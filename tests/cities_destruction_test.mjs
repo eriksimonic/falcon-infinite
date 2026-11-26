@@ -398,6 +398,213 @@ check(sideSys.collapsing.size === 0 && sideSys.destroyed.size === 0,
   'resetDamage left collapse state behind');
 
 // ---------------------------------------------------------------------------
+// 9. Feature 26/27 — 20 mm chipping, BFFG wasteland, ruin decay, baked OSM city
+// ---------------------------------------------------------------------------
+// Light ordnance (GUN: 6 m splash, 18 dmg) must accumulate `buildingHp` instead
+// of levelling the block, while still leaving its 4..6 m scorch crater.
+const gunSys = new BuildingSystem(null, HEADLESS_PRESET);
+
+let gunTarget = null;
+for (const b of site.buildings) {
+  if (b.h >= 10 && (!gunTarget || b.h < gunTarget.h)) gunTarget = b;
+}
+check(!!gunTarget, 'test settlement has no low-rise building for the gun test');
+
+const gunKey = `${site.id}:${Math.round(gunTarget.x)}:${Math.round(gunTarget.z)}`;
+const gunPos = { x: gunTarget.x, y: terrainHeight(gunTarget.x, gunTarget.z), z: gunTarget.z };
+const gunHpMax = gunSys._hpFor(gunTarget);
+check(gunHpMax >= 40, `unexpected structural HP ${gunHpMax}`);
+
+const gunFirst = gunSys.applyBlast(gunPos, 6, 18);
+check(gunFirst.destroyedCount === 0, 'one 20 mm round levelled a building');
+check(gunFirst.damagedCount >= 1, 'one 20 mm round chipped no building');
+check(gunFirst.positions.length === 0, 'a chipping round reported destruction positions');
+check(gunSys.buildingHp.has(gunKey), 'gun damage was not stored as cumulative HP');
+check(gunSys.collapsing.size === 0 && gunSys.destroyed.size === 0,
+  'gun damage skipped straight to collapse');
+const gunHp1 = gunSys.buildingHp.get(gunKey);
+check(Math.abs(gunHp1 - (gunHpMax - 18)) < 1e-6,
+  `single hit removed ${fmt(gunHpMax - gunHp1)} HP instead of 18`);
+check(gunSys.craters.length === 1, `gun hit added ${gunSys.craters.length} craters`);
+check(gunSys.craters[0].r >= 4 && gunSys.craters[0].r <= 6,
+  `gun scorch radius ${fmt(gunSys.craters[0].r)} m is outside 4..6 m`);
+check(Math.abs(gunSys.craters[0].x - gunTarget.x) < 1e-6 &&
+  Math.abs(gunSys.craters[0].z - gunTarget.z) < 1e-6,
+  'gun scorch was not placed at the impact point');
+
+let gunHits = 1;
+let gunCollapsed = false;
+for (let i = 0; i < 24 && !gunCollapsed; i++) {
+  const r = gunSys.applyBlast(gunPos, 6, 18);
+  gunHits++;
+  if (r.destroyedCount > 0) gunCollapsed = true;
+}
+check(gunCollapsed, 'repeated 20 mm hits never collapsed the building');
+check(gunHits >= 2, 'a building collapsed after a single 20 mm round');
+check(gunHits <= Math.ceil(gunHpMax / 18) + 1,
+  `took ${gunHits} gun hits to collapse a ${fmt(gunHpMax)} HP block`);
+check(gunSys.collapsing.has(gunKey) || gunSys.destroyed.has(gunKey),
+  'the gun-damaged building is not collapsing');
+check(gunSys.buildingHp.has(gunKey) === false,
+  'a collapsed building kept partial-damage HP');
+check(gunSys.craters.length === gunHits, `expected ${gunHits} scorch marks, got ${gunSys.craters.length}`);
+let gunCraterOk = true;
+for (const c of gunSys.craters) {
+  if (!(c.r >= 4 && c.r <= 6)) gunCraterOk = false;
+}
+check(gunCraterOk, 'a gun scorch crater fell outside the 4..6 m band');
+
+// BFFG: 420 m splash at 5000 damage must leave a 160 m wasteland.
+const bffgSys = new BuildingSystem(null, HEADLESS_PRESET);
+const bffg = bffgSys.applyBlast({ x: site.x, y: terrainHeight(site.x, site.z), z: site.z }, 420, 5000);
+check(bffg.destroyedCount > 0, 'BFFG blast destroyed nothing');
+check(bffg.destroyedCount === bffg.positions.length, 'BFFG destroyed count/positions mismatch');
+check(bffg.destroyedCount >= 20, `BFFG blast only reached ${bffg.destroyedCount} buildings`);
+// A 420 m splash can legitimately swallow a whole small town; what must hold is
+// that the reach boundary is exact: everything inside falls, nothing beyond it.
+let bffgInside = 0;
+let bffgMissed = 0;
+let bffgBeyond = 0;
+let bffgBeyondHit = 0;
+for (const b of site.buildings) {
+  const dist = Math.hypot(b.x - site.x, b.z - site.z);
+  const reach = 420 + Math.max(b.w, b.d) * 0.4;
+  const key = `${site.id}:${Math.round(b.x)}:${Math.round(b.z)}`;
+  const hit = bffgSys.collapsing.has(key) || bffgSys.destroyed.has(key);
+  if (dist <= reach) {
+    bffgInside++;
+    if (!hit) bffgMissed++;
+  } else if (dist > reach + 1) {
+    bffgBeyond++;
+    if (hit) bffgBeyondHit++;
+  }
+}
+check(bffgInside >= 20, `only ${bffgInside} buildings sat inside the BFFG splash`);
+check(bffgMissed === 0, `${bffgMissed} buildings inside the BFFG splash survived`);
+check(bffgBeyondHit === 0, `${bffgBeyondHit} buildings beyond the BFFG splash were destroyed`);
+check(bffgSys.craters.length === 1, `BFFG blast left ${bffgSys.craters.length} craters`);
+const bffgCrater = bffgSys.craters[0];
+check(bffgCrater && bffgCrater.r === 160, `BFFG crater is ${fmt(bffgCrater ? bffgCrater.r : 0)} m, expected 160 m`);
+check(bffgCrater && Math.abs(bffgCrater.x - site.x) < 1e-6 && Math.abs(bffgCrater.z - site.z) < 1e-6,
+  'BFFG crater was not placed at ground zero');
+check(bffgSys.collapsing.size >= 20, 'BFFG blast did not start collapses');
+check(bffgSys.destroyed.size === 0, 'BFFG snapped buildings to rubble without collapsing');
+
+// ---------------------------------------------------------------------------
+// 10. Completed collapses register ruin fires and decay after 80 s
+// ---------------------------------------------------------------------------
+const ruinSys = new BuildingSystem(null, HEADLESS_PRESET);
+check(ruinSys.getRuinFirePoints().length === 0, 'ruin fires exist before any collapse');
+const ruinBlast = ruinSys.applyBlast({ x: target.x, y: target.y, z: target.z }, 75, 180);
+check(ruinBlast.destroyedCount >= 1, 'ruin-fire test blast destroyed nothing');
+check(ruinSys.getRuinFirePoints().length === 0, 'ruin fires appeared before the collapse finished');
+
+ruinSys.update(5);
+check(ruinSys.collapsing.size === 0, 'collapses did not finish within 5 s');
+check(ruinSys.destroyed.size === ruinBlast.destroyedCount, 'collapsed buildings did not become rubble');
+const ruin0 = ruinSys.getRuinFirePoints();
+check(ruin0.length === ruinSys.destroyed.size, 'completed collapses did not register a ruin fire each');
+let ruinOk = true;
+for (const p of ruin0) {
+  if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) ruinOk = false;
+  if (!(p.y > 0.5)) ruinOk = false;
+  if (p.progress !== 0) ruinOk = false;
+  if (!(p.life >= 70 && p.life <= 80)) ruinOk = false;
+  if (p.intensity !== 1) ruinOk = false;
+}
+check(ruinOk, 'ruin fire emitters are invalid at birth');
+check(ruinSys.stats.ruinFires === ruin0.length, 'stats.ruinFires out of sync');
+
+const ruinAt = (list) => list.find(
+  (p) => Math.abs(p.x - ruinBlast.positions[0].x) < 1e-6 && Math.abs(p.z - ruinBlast.positions[0].z) < 1e-6,
+);
+check(!!ruinAt(ruin0), 'ruin fire is not at a collapsed building');
+
+ruinSys.update(30);
+const ruinMid = ruinSys.getRuinFirePoints();
+check(ruinMid.length === ruin0.length, 'ruin fires vanished early');
+const midFire = ruinAt(ruinMid);
+check(!!midFire && midFire.progress > 0.25 && midFire.progress < 0.6,
+  `ruin fire progress after 35 s is ${fmt(midFire ? midFire.progress : -1)}`);
+check(!!midFire && midFire.intensity > 0 && midFire.intensity < 1, 'ruin fire intensity did not fade');
+
+ruinSys.update(45); // 80 s total, past the 75 s burn life
+check(ruinSys.getRuinFirePoints().length === 0, 'ruin fires did not decay after 80 s');
+check(ruinSys.stats.ruinFires === 0, 'stats.ruinFires stale after the embers died');
+check(ruinSys.destroyed.size === ruinBlast.destroyedCount,
+  'ruin decay removed the permanent rubble too');
+
+// ---------------------------------------------------------------------------
+// 11. Baked OSM city: virtual settlement registered, hittable, then reverted
+// ---------------------------------------------------------------------------
+const customSys = new BuildingSystem(null, HEADLESS_PRESET);
+const custom = customSys.setCustomBuildings([[0, 0, 20, 16, 35, 0.2, 3]]);
+check(!!custom, 'setCustomBuildings returned nothing');
+check(customSys.customSettlement === custom, 'customSettlement was not stored');
+check(custom.id === 'vipava-osm', `custom settlement id is ${custom.id}`);
+check(custom.type === 'metro', `custom settlement type is ${custom.type}`);
+check(Math.abs(custom.radius - 22000) < 1e-6, `custom settlement radius is ${custom.radius}`);
+check(custom.buildings.length === 1, `custom settlement holds ${custom.buildings.length} buildings`);
+check(customSys.stats.destroyed === 0, 'custom settlement started with damage');
+
+const cb = custom.buildings[0];
+check(cb.kind === 'tower', `kindCode 3 decoded as ${cb.kind}`);
+check(cb.x === 0 && cb.z === 0 && cb.w === 20 && cb.d === 16 && cb.h === 35,
+  'custom building dimensions were mangled');
+check(Math.abs(cb.rot - 0.2) < 1e-9, 'custom building rotation was mangled');
+check(typeof cb.color === 'number', 'custom building has no palette colour');
+
+const cg = customSys._ground(cb);
+const cMidY = (cg.base + cg.top) * 0.5;
+const cux = Math.cos(cb.rot);
+const cuz = -Math.sin(cb.rot);
+const cOffset = cb.w * 0.5 + 6;
+const cFrom = { x: cb.x - cux * cOffset, y: cMidY, z: cb.z - cuz * cOffset };
+const cTo = { x: cb.x, y: cMidY, z: cb.z };
+const cHit = customSys.hitBuilding(cFrom, cTo);
+check(!!cHit, 'hitBuilding missed the baked OSM tower');
+if (cHit) {
+  check(cHit.key === 'vipava-osm:0:0', `hitBuilding key is ${cHit.key}`);
+  check(cHit.building === cb, 'hitBuilding returned the wrong baked building');
+  check(cHit.settlement === custom, 'hitBuilding returned the wrong settlement');
+  check(cHit.y > cg.base + 1 && cHit.y <= cg.top + 1,
+    `baked facade hit at y=${fmt(cHit.y)} is outside the building`);
+  check(cHit.t > 0 && cHit.t < 1, `baked facade hit t=${cHit.t}`);
+}
+
+const chip = customSys.applyBlast({ x: cb.x, y: cMidY, z: cb.z }, 6, 18);
+check(chip.damagedCount >= 1, 'GUN did not chip the baked building');
+check(chip.destroyedCount === 0, 'GUN levelled the baked building in one round');
+check(customSys.buildingHp.has('vipava-osm:0:0'), 'baked building HP not accumulated');
+
+const level = customSys.applyBlast({ x: cb.x, y: cMidY, z: cb.z }, 30, 180);
+check(level.destroyedCount >= 1, 'heavy blast did not level the baked building');
+check(customSys.collapsing.has('vipava-osm:0:0'), 'baked building did not start collapsing');
+customSys.update(5);
+check(customSys.destroyed.has('vipava-osm:0:0'), 'baked building never became rubble');
+check(customSys.getRuinFirePoints().length === 1, 'baked ruin did not smoulder');
+
+const insideCustom = customSys._settlementsNear(0, 0, 6000);
+check(insideCustom.length === 1 && insideCustom[0].id === 'vipava-osm',
+  'procedural cities were not hidden while the baked OSM city is active');
+
+const reverted = customSys.setCustomBuildings(null);
+check(reverted === null, 'setCustomBuildings(null) did not return null');
+check(customSys.customSettlement === null, 'customSettlement was not cleared');
+check(customSys._needsRebuild === true, 'revert did not request a rebuild');
+const afterRevert = customSys._settlementsNear(0, 0, 6000);
+check(!afterRevert.some((s) => s.id === 'vipava-osm'), 'baked city is still listed after the revert');
+check(afterRevert.length >= 1, 'procedural cities did not come back after the revert');
+const afterHit = customSys.hitBuilding(cFrom, cTo);
+check(!afterHit || afterHit.settlement.id !== 'vipava-osm',
+  'hitBuilding still reports the removed baked city');
+
+const reapplied = customSys.setCustomBuildings([[12, 12, 10, 9, 8, 0, 0]]);
+check(!!reapplied && reapplied.buildings.length === 1, 'setCustomBuildings could not be re-applied');
+check(reapplied && reapplied.buildings[0].kind === 'house', 'kindCode 0 decoded as a non-house');
+customSys.setCustomBuildings(null);
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 console.log('Cities & destruction — acceptance test');

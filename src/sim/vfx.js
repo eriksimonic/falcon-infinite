@@ -8,6 +8,7 @@
 // headless tests: the pools then update without being attached to a scene.
 import * as THREE from 'three';
 import { clamp, smoothstep, mulberry32 } from '../world/noise.js';
+import { terrainHeight } from '../world/terrain.js';
 
 const SPEED_OF_SOUND = 340;
 const RIBBON_SEGMENTS = 36;
@@ -42,6 +43,22 @@ const MEGA_SPARK_MAX = 40;
 const MAX_PLUMES = 16; // a single Mk-82 blast can claim 4 (impact + 3 rubble columns)
 const PUFF_CAPACITY = 1400;
 const SPARK_CAPACITY = 420;
+
+// Feature 25: the blast is a five-lobe fireball cluster, a dynamic flash light
+// and a ballistic field of tumbling 3D chunks. Every lobe/chunk lives in a
+// preallocated pool, so a busy battlefield still allocates nothing per frame.
+const TAU = Math.PI * 2;
+const LOBE_COUNT = 4;
+const LOBE_COLORS = [0xff6e1a, 0xff4410, 0xff9926, 0x3a241a];
+// Fixed per-lobe geometry: radius factor, rise factor, size factor, churn rate.
+// Deterministic, so the cluster has a recognisable, non-spherical silhouette.
+const LOBE_ANGLE = [0.35, 2.25, 4.05, 5.55];
+const LOBE_RADIUS = [0.44, 0.68, 0.52, 0.8];
+const LOBE_RISE = [1.0, 0.52, 0.82, 0.3];
+const LOBE_SIZE = [0.62, 0.48, 0.56, 0.72];
+const LOBE_SPIN = [0.85, -1.3, 1.65, -0.55];
+const DEBRIS_CAPACITY = 160;
+const DEBRIS_GRAVITY = -9.81;
 const GUN_PORT = new THREE.Vector3(-0.75, 0.25, -2.5);
 const WINGTIP_LOCAL = [
   new THREE.Vector3(4.95, 0.02, 2.25),
@@ -54,6 +71,13 @@ const _tan = new THREE.Vector3();
 const _toCam = new THREE.Vector3();
 const _side = new THREE.Vector3();
 const _local = new THREE.Vector3();
+
+// Scratch objects for the instanced debris matrices (never reallocated).
+const _dMat = new THREE.Matrix4();
+const _dPos = new THREE.Vector3();
+const _dScale = new THREE.Vector3();
+const _dQuat = new THREE.Quaternion();
+const _dEuler = new THREE.Euler();
 
 function hasPose(flight) {
   return !!(
@@ -271,6 +295,22 @@ export class CombatVFX {
     this._explosionCursor = 0;
     this._buildExplosions();
 
+    // --- Feature 25: dynamic blast flash --------------------------------
+    // A single shared warm-orange point light, preallocated and simply
+    // repositioned/re-pulsed on detonation, so nearby skyscrapers, streets
+    // and terrain catch the muzzle of the fireball.
+    this._blastLight = new THREE.PointLight(0xff9b42, 0, 450, 1.5);
+    this._blastLight.position.set(0, 0, 0);
+    this.group.add(this._blastLight);
+    this._blastPeak = 0;
+    this._blastTimer = 0;
+    this._blastDuration = 0.7;
+    this._blastPhase = 0;
+
+    // --- Feature 25: tumbling 3D debris field ---------------------------
+    this.debris = this._buildDebris();
+    this.activeDebris = 0;
+
     // --- persistent burning wreck plumes ----------------------------------
     this.plumes = [];
     this._plumeCursor = 0;
@@ -300,11 +340,13 @@ export class CombatVFX {
     this.activeParticles = 0;
     this.activeExplosions = 0;
     this.activePlumes = 0;
+    this.activeDebris = 0;
     this.stats = {
       sonicBoom: false,
       activeParticles: 0,
       activeExplosions: 0,
       activePlumes: 0,
+      activeDebris: 0,
     };
   }
 
@@ -481,6 +523,27 @@ export class CombatVFX {
       fireball.renderOrder = 5;
       this.group.add(fireball);
 
+      // Feature 25: four extra fireball lobes per slot, each with its own
+      // material so it can billow, churn and fade independently. Index 3 is a
+      // dark, nearly-blackened lobe that drags the cluster into the smoke
+      // column; the rest are fiery orange shades.
+      const lobes = [];
+      for (let L = 0; L < LOBE_COUNT; L++) {
+        const lobeMat = new THREE.MeshBasicMaterial({
+          color: LOBE_COLORS[L],
+          transparent: true,
+          opacity: 0,
+          depthWrite: false,
+          blending: THREE.NormalBlending,
+        });
+        const lobe = new THREE.Mesh(this._coreGeo, lobeMat);
+        lobe.frustumCulled = false;
+        lobe.visible = false;
+        lobe.renderOrder = L === LOBE_COUNT - 1 ? 4 : 5;
+        this.group.add(lobe);
+        lobes.push(lobe);
+      }
+
       this.explosions.push({
         active: false,
         t: 0,
@@ -488,6 +551,7 @@ export class CombatVFX {
         scale: 1,
         smokeTimer: 0,
         mega: false,
+        lobeSeed: 0,
         // Per-slot stage timings: a mega-blast stretches every one of them.
         coreTime: CORE_TIME,
         fireballTime: FIREBALL_TIME,
@@ -500,8 +564,52 @@ export class CombatVFX {
         ringMat,
         fireball,
         fireballMat,
+        lobes,
       });
     }
+  }
+
+  _buildDebris() {
+    const geo = new THREE.BoxGeometry(1, 0.7, 0.85);
+    // Concrete/steel rubble: lit by the scene's sun + our own blast flash, so
+    // a Lambert material is enough and stays cheap with 160 instances.
+    const mat = new THREE.MeshLambertMaterial({ color: 0x4a4540 });
+    const mesh = new THREE.InstancedMesh(geo, mat, DEBRIS_CAPACITY);
+    mesh.frustumCulled = false;
+    mesh.count = 0;
+    mesh.renderOrder = 5;
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.group.add(mesh);
+
+    return {
+      capacity: DEBRIS_CAPACITY,
+      mesh,
+      cursor: 0,
+      rendered: 0,
+      activeDebris: 0,
+      // Flat state, one entry per chunk: position, velocity, Euler angles,
+      // angular velocity, size, lifetime, ground plane and occupancy.
+      px: new Float32Array(DEBRIS_CAPACITY),
+      py: new Float32Array(DEBRIS_CAPACITY),
+      pz: new Float32Array(DEBRIS_CAPACITY),
+      vx: new Float32Array(DEBRIS_CAPACITY),
+      vy: new Float32Array(DEBRIS_CAPACITY),
+      vz: new Float32Array(DEBRIS_CAPACITY),
+      rx: new Float32Array(DEBRIS_CAPACITY),
+      ry: new Float32Array(DEBRIS_CAPACITY),
+      rz: new Float32Array(DEBRIS_CAPACITY),
+      avx: new Float32Array(DEBRIS_CAPACITY),
+      avy: new Float32Array(DEBRIS_CAPACITY),
+      avz: new Float32Array(DEBRIS_CAPACITY),
+      sx: new Float32Array(DEBRIS_CAPACITY),
+      sy: new Float32Array(DEBRIS_CAPACITY),
+      sz: new Float32Array(DEBRIS_CAPACITY),
+      life: new Float32Array(DEBRIS_CAPACITY),
+      maxLife: new Float32Array(DEBRIS_CAPACITY),
+      floorY: new Float32Array(DEBRIS_CAPACITY),
+      active: new Uint8Array(DEBRIS_CAPACITY),
+      bounced: new Uint8Array(DEBRIS_CAPACITY),
+    };
   }
 
   _buildMuzzleFlash() {
@@ -568,6 +676,16 @@ export class CombatVFX {
     slot.core.visible = true;
     slot.ring.visible = true;
     slot.fireball.visible = true;
+    // Feature 25: give the lobe cluster its own churn phase and start every
+    // lobe at the blast centre (update() then throws them outward).
+    slot.lobeSeed = this.rng() * TAU;
+    for (let L = 0; L < slot.lobes.length; L++) {
+      const lobe = slot.lobes[L];
+      lobe.visible = true;
+      lobe.position.copy(slot.pos);
+      lobe.scale.setScalar(0.001);
+      lobe.material.opacity = 0;
+    }
 
     // 20–28 gravity-arcing hot embers and debris (32–40, much faster, for the
     // BFFG mega-blast).
@@ -606,6 +724,10 @@ export class CombatVFX {
         this._emitExplosionSmoke(slot, true, i >= INITIAL_SMOKE_PUFFS - HOT_SMOKE_PUFFS);
       }
     }
+
+    // Feature 25: pulse the shared blast light and throw the debris field.
+    this._fireBlastFlash(slot.pos, s);
+    this._spawnDebris(slot.pos, s);
 
     return slot;
   }
@@ -876,6 +998,37 @@ export class CombatVFX {
         e.fireballMat.opacity = 0;
       }
 
+      // Feature 25: four churning lobes orbit out of the core on independent
+      // phases, rise at different rates and squeeze/stretch as they billow.
+      // They outlive the main shell slightly and dissolve into the smoke.
+      const lobeSpan = e.fireballTime || FIREBALL_TIME;
+      for (let L = 0; L < e.lobes.length; L++) {
+        const lobe = e.lobes[L];
+        const lt = t / (lobeSpan * (0.9 + 0.06 * L));
+        if (lt < 1) {
+          const ease = 1 - Math.pow(1 - lt, 1.6);
+          const ang = LOBE_ANGLE[L] + e.lobeSeed + lt * LOBE_SPIN[L];
+          const rad = e.scale * LOBE_RADIUS[L] * (0.8 + 5.0 * ease);
+          const rise = e.scale * LOBE_RISE[L] * (0.1 + 1.05 * ease);
+          // Non-negative churn so a lobe never dips through the blast centre.
+          const wobble = (0.5 + 0.5 * Math.sin(lt * 9.0 + LOBE_ANGLE[L])) * e.scale * 0.2;
+          const ls = e.scale * LOBE_SIZE[L] * (0.55 + 5.4 * ease);
+          const fadeIn = lt < 0.08 ? lt / 0.08 : 1;
+          lobe.visible = true;
+          lobe.position.set(
+            e.pos.x + Math.cos(ang) * rad,
+            e.pos.y + rise + wobble,
+            e.pos.z + Math.sin(ang) * rad,
+          );
+          lobe.rotation.set(ang * 0.6, ang, ang * 0.35);
+          lobe.scale.set(ls, ls * (0.84 + 0.16 * Math.sin(ang * 1.7)), ls);
+          lobe.material.opacity = 0.6 * fadeIn * Math.pow(1 - lt, 1.15);
+        } else {
+          lobe.visible = false;
+          lobe.material.opacity = 0;
+        }
+      }
+
       // Ground-hugging condensation shockwave ring: scale * 24 at full expansion,
       // so a BFFG mega-blast (scale 14) throws a ~336 m ring over 2.2 s.
       const ringT = t / (e.ringTime || RING_TIME);
@@ -913,10 +1066,89 @@ export class CombatVFX {
         e.coreMat.opacity = 0;
         e.ringMat.opacity = 0;
         e.fireballMat.opacity = 0;
+        for (let L = 0; L < e.lobes.length; L++) {
+          e.lobes[L].visible = false;
+          e.lobes[L].material.opacity = 0;
+        }
         continue;
       }
       activeExplosions++;
     }
+
+    // --- Feature 25: blast flash decay ------------------------------------
+    if (this._blastTimer > 0) {
+      this._blastTimer = Math.max(0, this._blastTimer - dt);
+      this._blastPhase += dt;
+      const k = this._blastDuration > 0 ? this._blastTimer / this._blastDuration : 0;
+      // Fast initial flash with a slight fire flicker, then a smooth falloff.
+      const flicker = 0.84 + 0.16 * Math.sin(this._blastPhase * 44.0 + 1.3);
+      this._blastLight.intensity = this._blastTimer > 0
+        ? this._blastPeak * k * k * flicker
+        : 0;
+    } else if (this._blastLight.intensity !== 0) {
+      this._blastLight.intensity = 0;
+    }
+
+    // --- Feature 25: tumbling 3D debris -----------------------------------
+    const d = this.debris;
+    let activeDebris = 0;
+    let instances = 0;
+    for (let i = 0; i < DEBRIS_CAPACITY; i++) {
+      if (!d.active[i]) continue;
+
+      const life = d.life[i] - dt;
+      if (life <= 0) {
+        d.active[i] = 0;
+        continue;
+      }
+      d.life[i] = life;
+
+      d.vy[i] += DEBRIS_GRAVITY * dt;
+      d.px[i] += d.vx[i] * dt;
+      d.py[i] += d.vy[i] * dt;
+      d.pz[i] += d.vz[i] * dt;
+      d.rx[i] += d.avx[i] * dt;
+      d.ry[i] += d.avy[i] * dt;
+      d.rz[i] += d.avz[i] * dt;
+
+      const floorY = d.floorY[i];
+      if (d.py[i] <= floorY) {
+        d.py[i] = floorY;
+        if (!d.bounced[i]) {
+          // First contact: lively bounce that flips and damps vertical speed.
+          d.bounced[i] = 1;
+          d.vy[i] = -d.vy[i] * 0.35;
+          d.vx[i] *= 0.55;
+          d.vz[i] *= 0.55;
+          d.avx[i] *= 0.6;
+          d.avy[i] *= 0.6;
+          d.avz[i] *= 0.6;
+        } else {
+          // Settled: scrub the remaining slide and spin.
+          d.vy[i] = 0;
+          d.vx[i] *= 0.86;
+          d.vz[i] *= 0.86;
+          d.avx[i] *= 0.8;
+          d.avy[i] *= 0.8;
+          d.avz[i] *= 0.8;
+        }
+      }
+
+      // Fade the chunk out by shrinking it over its last ~35% of life.
+      const fade = clamp(life / (d.maxLife[i] * 0.35), 0, 1);
+      _dPos.set(d.px[i], d.py[i], d.pz[i]);
+      _dQuat.setFromEuler(_dEuler.set(d.rx[i], d.ry[i], d.rz[i]));
+      _dScale.set(d.sx[i] * fade, d.sy[i] * fade, d.sz[i] * fade);
+      _dMat.compose(_dPos, _dQuat, _dScale);
+      d.mesh.setMatrixAt(instances, _dMat);
+      instances++;
+      activeDebris++;
+    }
+    d.mesh.count = instances;
+    if (instances > 0 || d.rendered > 0) d.mesh.instanceMatrix.needsUpdate = true;
+    d.rendered = instances;
+    d.activeDebris = activeDebris;
+    this.activeDebris = activeDebris;
 
     // --- burning wreck plumes --------------------------------------------
     let activePlumes = 0;
@@ -950,12 +1182,14 @@ export class CombatVFX {
     this.stats.activeParticles = this.activeParticles;
     this.stats.activeExplosions = activeExplosions;
     this.stats.activePlumes = activePlumes;
+    this.stats.activeDebris = activeDebris;
 
     return {
       sonicBoom,
       activeParticles: this.activeParticles,
       activeExplosions,
       activePlumes,
+      activeDebris,
     };
   }
 
@@ -993,6 +1227,11 @@ export class CombatVFX {
       e.coreMat.opacity = 0;
       e.ringMat.opacity = 0;
       e.fireballMat.opacity = 0;
+      e.lobeSeed = 0;
+      for (let L = 0; L < e.lobes.length; L++) {
+        e.lobes[L].visible = false;
+        e.lobes[L].material.opacity = 0;
+      }
     }
     this._explosionCursor = 0;
 
@@ -1009,6 +1248,23 @@ export class CombatVFX {
     this.muzzle.mesh.visible = false;
     this.muzzle.mat.opacity = 0;
 
+    // Feature 25: clear the blast flash and every debris chunk.
+    this._blastTimer = 0;
+    this._blastPeak = 0;
+    this._blastPhase = 0;
+    this._blastLight.intensity = 0;
+    const d = this.debris;
+    d.active.fill(0);
+    d.bounced.fill(0);
+    d.life.fill(0);
+    d.maxLife.fill(0);
+    d.cursor = 0;
+    d.rendered = 0;
+    d.activeDebris = 0;
+    d.mesh.count = 0;
+    d.mesh.instanceMatrix.needsUpdate = true;
+    this.activeDebris = 0;
+
     this.rng = mulberry32(this.seed);
     this.activeParticles = 0;
     this.activeExplosions = 0;
@@ -1017,6 +1273,7 @@ export class CombatVFX {
     this.stats.activeParticles = 0;
     this.stats.activeExplosions = 0;
     this.stats.activePlumes = 0;
+    this.stats.activeDebris = 0;
   }
 
   // ----------------------------------------------------------------- helpers
@@ -1093,6 +1350,92 @@ export class CombatVFX {
     _local.copy(GUN_PORT).applyQuaternion(flight.quaternion).add(flight.position);
     this.muzzle.mesh.position.copy(_local);
     this.muzzle.mesh.quaternion.copy(flight.quaternion);
+  }
+
+  // Feature 25: re-pulse the shared blast light. Intensity and range scale
+  // with the ordnance; the decay window stretches 0.7 s -> 1.4 s.
+  _fireBlastFlash(pos, scale) {
+    const light = this._blastLight;
+    if (!light) return;
+    light.position.set(pos.x, pos.y + Math.max(4, scale * 2), pos.z);
+    light.distance = clamp(scale * 45, 90, 900);
+    this._blastPeak = clamp(scale * 18, 12, 260);
+    this._blastDuration = clamp(0.7 + scale * 0.05, 0.7, 1.4);
+    this._blastTimer = this._blastDuration;
+    this._blastPhase = 0;
+    light.intensity = this._blastPeak;
+  }
+
+  // Ground plane for a chunk: real terrain when it lies below the blast,
+  // otherwise the blast point itself (airburst over water/ridge).
+  _groundBelow(pos) {
+    const ground = terrainHeight(pos.x, pos.z);
+    if (!Number.isFinite(ground) || ground > pos.y) return pos.y;
+    return ground;
+  }
+
+  _allocDebris() {
+    const d = this.debris;
+    if (!d) return -1;
+    for (let n = 0; n < DEBRIS_CAPACITY; n++) {
+      const i = (d.cursor + n) % DEBRIS_CAPACITY;
+      if (!d.active[i]) {
+        d.cursor = (i + 1) % DEBRIS_CAPACITY;
+        return i;
+      }
+    }
+    // Saturated: recycle the oldest slot rather than growing the pool.
+    const i = d.cursor;
+    d.cursor = (i + 1) % DEBRIS_CAPACITY;
+    return i;
+  }
+
+  // Feature 25: ballistic debris burst. 4 chips for cannon hits, 12 shrapnel
+  // chunks for an AIM-9 kill, 22 rubble blocks for a Mk-82, 44 massive slabs
+  // for the BFFG mega-blast — all written into the fixed 160-chunk pool.
+  _spawnDebris(pos, scale) {
+    const d = this.debris;
+    if (!d) return 0;
+    const mega = scale >= 10;
+    const count = mega ? 44 : scale >= 3.5 ? 22 : scale >= 1.5 ? 12 : 4;
+    const floorY = this._groundBelow(pos);
+    const sizeK = 0.75 + Math.min(scale, 14) * 0.2;
+    const speedK = Math.sqrt(scale);
+    let launched = 0;
+
+    for (let n = 0; n < count; n++) {
+      const i = this._allocDebris();
+      if (i < 0) break;
+
+      const ang = this.rng() * TAU;
+      const outward = (5 + this.rng() * 17) * speedK * (mega ? 1.2 : 1);
+      const spread = 0.45 + this.rng() * 0.55;
+      const base = (0.35 + this.rng() * 0.85) * sizeK;
+
+      d.active[i] = 1;
+      d.bounced[i] = 0;
+      d.px[i] = pos.x + Math.cos(ang) * 0.8 * scale;
+      d.py[i] = pos.y + 0.4 * scale + this.rng() * scale;
+      d.pz[i] = pos.z + Math.sin(ang) * 0.8 * scale;
+      d.vx[i] = Math.cos(ang) * outward * spread;
+      d.vy[i] = (6 + this.rng() * 14) * speedK * (mega ? 1.35 : 1) + 4;
+      d.vz[i] = Math.sin(ang) * outward * spread;
+      d.rx[i] = this.rng() * TAU;
+      d.ry[i] = this.rng() * TAU;
+      d.rz[i] = this.rng() * TAU;
+      d.avx[i] = (this.rng() - 0.5) * 11;
+      d.avy[i] = (this.rng() - 0.5) * 11;
+      d.avz[i] = (this.rng() - 0.5) * 11;
+      d.sx[i] = base * (0.75 + this.rng() * 0.6);
+      d.sy[i] = base * (0.5 + this.rng() * 0.5);
+      d.sz[i] = base * (0.75 + this.rng() * 0.6);
+      const life = mega ? 7 + this.rng() * 3 : 4 + this.rng() * 3;
+      d.life[i] = life;
+      d.maxLife[i] = life;
+      d.floorY[i] = floorY;
+      launched++;
+    }
+    return launched;
   }
 
   // Feature 24: the BFFG detonation burst is a three-way mix — fiery

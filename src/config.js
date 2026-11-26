@@ -155,4 +155,15 @@ export const THEATERS = {
     horizonTint: 0xe6c79c,
     groundAmb: 0x8a6d48,
   },
+  vipava: {
+    label: 'VIPAVA VALLEY',
+    demUrl: './media/vipava_dem.png',
+    metaUrl: './media/vipava_meta.json',
+    // Crisp Adriatic blue zenith, warm limestone haze at the horizon.
+    zenithTint: 0x2b74b8,
+    horizonTint: 0xe9d7b4,
+    fogTint: 0xe2d1b2,
+    hazeBoost: 1.14,
+    groundAmb: 0x60624a,
+  },
 };

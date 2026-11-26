@@ -185,6 +185,10 @@ export class SkySystem {
     hor.lerp(grey, overcast * 0.55);
 
     const th = THEATERS[this.theater] || THEATERS.temperate;
+    if (th.zenithTint != null && dayT > 0.05) {
+      // Crisp, deep blue Mediterranean / Adriatic sky.
+      zen.lerp(new THREE.Color(th.zenithTint), 0.32 * dayT * (1 - overcast * 0.5));
+    }
     if (th.horizonTint != null && dayT > 0.05) {
       hor.lerp(new THREE.Color(th.horizonTint), 0.34 * dayT * (1 - overcast * 0.4));
     }

@@ -26,6 +26,9 @@ const WATER_LEVEL = 0.8;  // below this the road becomes a bridge
 const BRIDGE_DECK = 2.6;  // minimum bridge deck elevation above the sea
 const UV_METRES = 24;     // one texture repeat per 24 m of road
 
+// Real-world OSM roads: only ribbons this close to the camera are built.
+const CUSTOM_ROAD_RANGE = 26000;
+
 function makeRoadTexture() {
   if (typeof document === 'undefined' || !document || typeof document.createElement !== 'function') {
     return null;
@@ -281,7 +284,56 @@ export class RoadNetwork {
     this._lastX = Infinity;
     this._lastZ = Infinity;
     this._built = false;
+    // Baked real-world roads ({ width, points }) or null for procedural links.
+    this.customRoads = null;
     this.stats = { roads: 0, segments: 0, bridges: 0 };
+  }
+
+  /**
+   * Replace the procedural highway network with baked real-world polylines.
+   *
+   * Each item is `{ w, pts: [[x, z], ...] }` (OpenStreetMap metres). While
+   * active, `_rebuild` builds the terrain-conforming ribbon mesh from the real
+   * roads within 26 km of the camera. Pass `null` (or an empty list) to revert
+   * cleanly to the procedural network on the next update.
+   *
+   * @returns {Array<{width:number, points:Array<{x:number,z:number}>}>|null}
+   */
+  setCustomRoads(rawRoads) {
+    if (!Array.isArray(rawRoads) || rawRoads.length === 0) {
+      this.customRoads = null;
+      this._lastX = Infinity;
+      this._lastZ = Infinity;
+      this._built = false;
+      return null;
+    }
+
+    const roads = [];
+    for (const r of rawRoads) {
+      if (!r) continue;
+      const src = Array.isArray(r.pts) ? r.pts : Array.isArray(r.points) ? r.points : null;
+      if (!src || src.length < 2) continue;
+      const rawW = Number.isFinite(r.w) ? r.w : r.width;
+      const width = Number.isFinite(rawW) ? Math.max(2, rawW) : 9;
+      const points = [];
+      for (const p of src) {
+        if (!p) continue;
+        const x = Array.isArray(p) ? Number(p[0]) : Number(p.x);
+        const z = Array.isArray(p) ? Number(p[1]) : Number(p.z);
+        if (!Number.isFinite(x) || !Number.isFinite(z)) continue;
+        const tail = points.length ? points[points.length - 1] : null;
+        if (tail && Math.hypot(x - tail.x, z - tail.z) < 0.5) continue;
+        points.push({ x, z });
+      }
+      if (points.length < 2) continue;
+      roads.push({ width, points });
+    }
+
+    this.customRoads = roads.length > 0 ? roads : null;
+    this._lastX = Infinity;
+    this._lastZ = Infinity;
+    this._built = false;
+    return this.customRoads;
   }
 
   _linkTarget(s, all) {
@@ -413,6 +465,10 @@ export class RoadNetwork {
   _rebuild(camera) {
     const cx = camera.position.x;
     const cz = camera.position.z;
+    if (this.customRoads) {
+      this._rebuildCustom(cx, cz);
+      return;
+    }
     const all = settlementsNear(cx, cz, 34000);
     const near = all.filter((s) => {
       if (s.type === 'hamlet') return false;
@@ -449,7 +505,7 @@ export class RoadNetwork {
 
   update(camera) {
     if (!camera || !camera.position) return;
-    if (!this.preset || !this.preset.roadDetail) {
+    if (!this.preset || (!this.preset.roadDetail && !this.customRoads)) {
       if (this._built) this._clear();
       return;
     }
@@ -458,6 +514,52 @@ export class RoadNetwork {
     if (this._lastX === Infinity || dx * dx + dz * dz > 2000 * 2000) {
       this._rebuild(camera);
     }
+  }
+
+  /**
+   * Ribbon mesh for the baked OSM roads nearest the camera. Roads outside
+   * 26 km are dropped (sub-pixel), and the closest ones win the segment budget
+   * so a busy valley never stalls the frame on distant asphalt.
+   */
+  _rebuildCustom(cx, cz) {
+    const range2 = CUSTOM_ROAD_RANGE * CUSTOM_ROAD_RANGE;
+    const near = [];
+    for (const road of this.customRoads) {
+      const pts = road.points;
+      let best = Infinity;
+      for (let i = 0; i < pts.length; i++) {
+        const dx = pts[i].x - cx;
+        const dz = pts[i].z - cz;
+        const d = dx * dx + dz * dz;
+        if (d < best) best = d;
+      }
+      if (best <= range2) near.push({ road, d2: best });
+    }
+    near.sort((a, b) => a.d2 - b.d2);
+
+    const polylines = [];
+    let segmentBudget = this.capacity;
+    for (const { road } of near) {
+      let length = 0;
+      const pts = road.points;
+      for (let i = 1; i < pts.length; i++) {
+        length += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z);
+      }
+      const est = Math.max(1, Math.ceil(length / SAMPLE_STEP));
+      if (est > segmentBudget) continue;
+      segmentBudget -= est;
+      polylines.push({ width: road.width, points: pts });
+    }
+
+    const data = buildRoadRibbonData(polylines, terrainHeight);
+    this._applyGeometry(data);
+    this.mesh.visible = data.indices.length > 0;
+    this._built = true;
+    this._lastX = cx;
+    this._lastZ = cz;
+    this.stats.roads = polylines.length;
+    this.stats.segments = data.segmentCount;
+    this.stats.bridges = data.bridgeCount;
   }
 
   dispose() {

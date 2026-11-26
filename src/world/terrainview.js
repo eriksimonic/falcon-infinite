@@ -31,6 +31,24 @@ const PALETTES = {
     seabed: new THREE.Color(0x3a524a).convertSRGBToLinear(),
     snowLineBase: 1650,
   },
+  // Vipava Valley / Slovenian Karst: vineyard greens, pale limestone cliffs,
+  // alpine spruce on the high plateaus, deep Adriatic blue water.
+  vipava: {
+    sand: new THREE.Color(0xd7c49b).convertSRGBToLinear(),
+    grassLow: new THREE.Color(0x7f9b52).convertSRGBToLinear(),  // vineyard valley floor
+    grassHigh: new THREE.Color(0x9db56b).convertSRGBToLinear(),
+    forest: new THREE.Color(0x3c5a35).convertSRGBToLinear(),    // alpine spruce
+    rock: new THREE.Color(0xbdb6a4).convertSRGBToLinear(),      // pale Karst limestone
+    rockDark: new THREE.Color(0x8d8778).convertSRGBToLinear(),
+    snow: new THREE.Color(0xeef2ee).convertSRGBToLinear(),
+    dirt: new THREE.Color(0xa8956e).convertSRGBToLinear(),
+    seabed: new THREE.Color(0x24475b).convertSRGBToLinear(),
+    snowLineBase: 1550,
+    forestMix: 0.85,
+    dryMix: 0.28,
+    waterDeep: 0x0d3a5f,
+    waterShallow: 0x2f7f9c,
+  },
 };
 
 function distanceToRect(px, pz, x, z, size) {
@@ -52,10 +70,12 @@ function vertexColor(h, slope, x, z, out, pal = PALETTES.temperate) {
     out.copy(pal.grassLow).lerp(pal.grassHigh, n);
     // forest / irrigated oasis patches
     const forest = smoothstep(0.52, 0.74, fbm01(x * 0.0011, z * 0.0011, 3, 1201));
-    if (slope < 0.55) out.lerp(pal.forest, forest * (pal === PALETTES.desert ? 0.35 : 0.8));
+    const forestMix = pal.forestMix ?? (pal === PALETTES.desert ? 0.35 : 0.8);
+    if (slope < 0.55) out.lerp(pal.forest, forest * forestMix);
     // dry / dirt in low flat basins
     const dry = smoothstep(0.62, 0.84, fbm01(x * 0.00022, z * 0.00022, 2, 1311));
-    out.lerp(pal.dirt, dry * (pal === PALETTES.desert ? 0.55 : 0.35));
+    const dryMix = pal.dryMix ?? (pal === PALETTES.desert ? 0.55 : 0.35);
+    out.lerp(pal.dirt, dry * dryMix);
   }
 
   // rock on steep slopes
@@ -106,6 +126,7 @@ export class TerrainView {
     const next = PALETTES[name] ? name : 'temperate';
     if (next === this.theater) return;
     this.theater = next;
+    this.water.setPalette(PALETTES[next]);
     // Clear existing cached tiles so terrain seamlessly repaints in the new theater palette.
     for (const mesh of this.tiles.values()) {
       this.group.remove(mesh);
@@ -381,8 +402,7 @@ class WaterSurface {
       `,
       fragmentShader: /* glsl */`
         uniform float uTime;
-        uniform vec3 uSunDir, uSunColor, uSkyColor, uDeep, uShallow, fogColor;
-        uniform float fogDensity;
+        uniform vec3 uSunDir, uSunColor, uSkyColor, uDeep, uShallow;
         varying vec3 vWorld;
         #include <common>
         #include <fog_pars_fragment>
@@ -418,6 +438,13 @@ class WaterSurface {
     this.material.uniforms.uSunDir.value.copy(sunDir);
     this.material.uniforms.uSunColor.value.copy(sunColor);
     this.material.uniforms.uSkyColor.value.copy(skyColor);
+  }
+
+  /** Theater water tint; falls back to the temperate defaults. */
+  setPalette(pal = null) {
+    const u = this.material.uniforms;
+    u.uDeep.value.copy(new THREE.Color(pal?.waterDeep ?? 0x143c4a).convertSRGBToLinear());
+    u.uShallow.value.copy(new THREE.Color(pal?.waterShallow ?? 0x2f7383).convertSRGBToLinear());
   }
 
   update(dt, camera) {
