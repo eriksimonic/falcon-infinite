@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FALCON / INFINITE — F-16 Flight Simulator</title>
+  <meta name="description" content="An infinite procedural F-16 flight simulator: airports, cities, weather, day and night." />
+</head>
+<body>
+  <div id="app">
+    <canvas id="scene"></canvas>
+    <canvas id="hud"></canvas>
+    <div id="vignette"></div>
+    <div id="grain"></div>
+  </div>
+
+  <!-- boot / loading -->
+  <div id="boot" class="screen">
+    <div class="boot-inner">
+      <div class="brand">FALCON <span>/</span> INFINITE</div>
+      <div class="boot-line"><i></i><b id="boot-bar"></b></div>
+      <div class="boot-status" id="boot-status">INITIALISING FLIGHT SYSTEMS</div>
+    </div>
+  </div>
+
+  <!-- main menu -->
+  <div id="menu" class="screen hidden">
+    <div class="menu-grid">
+      <div class="menu-main">
+        <div class="eyebrow">F-16C BLOCK 50 · PROCEDURAL EARTH</div>
+        <h1>FALCON<span>/</span>INFINITE</h1>
+        <p class="lede">An endless world of coastlines, mountain belts, airports and living
+          towns. Fly the Falcon from the cockpit, chase the sun, land anywhere.</p>
+
+        <div class="option-row">
+          <div class="option-label">WEATHER</div>
+          <div class="pills" id="opt-weather">
+            <button data-v="clear">CLEAR</button>
+            <button data-v="few" class="on">FEW</button>
+            <button data-v="scattered">SCATTERED</button>
+            <button data-v="overcast">OVERCAST</button>
+            <button data-v="storm">STORM</button>
+          </div>
+        </div>
+        <div class="option-row">
+          <div class="option-label">WIND</div>
+          <div class="pills" id="opt-wind">
+            <button data-v="auto" class="on">AUTO</button>
+            <button data-v="calm">CALM</button>
+            <button data-v="breeze">BREEZE</button>
+            <button data-v="windy">WINDY</button>
+            <button data-v="gale">GALE</button>
+          </div>
+        </div>
+        <div class="option-row">
+          <div class="option-label">QUALITY</div>
+          <div class="pills" id="opt-quality">
+            <button data-v="low">LOW</button>
+            <button data-v="medium" class="on">MEDIUM</button>
+            <button data-v="high">HIGH</button>
+          </div>
+        </div>
+        <div class="option-row">
+          <div class="option-label">TIME</div>
+          <div class="pills" id="opt-time">
+            <button data-v="6.2">DAWN</button>
+            <button data-v="9">MORNING</button>
+            <button data-v="15.5" class="on">AFTERNOON</button>
+            <button data-v="19.1">DUSK</button>
+            <button data-v="23">NIGHT</button>
+          </div>
+        </div>
+
+        <button id="start-btn" class="start">START FLIGHT <span>↵</span></button>
+        <div class="start-hint">Click to capture mouse in the cockpit · ESC for menu</div>
+      </div>
+
+      <div class="menu-side">
+        <div class="side-title">FLIGHT CONTROLS</div>
+        <div class="keys">
+          <div><kbd>W</kbd><kbd>S</kbd><span>Pitch</span></div>
+          <div><kbd>A</kbd><kbd>D</kbd><span>Roll</span></div>
+          <div><kbd>Q</kbd><kbd>E</kbd><span>Rudder</span></div>
+          <div><kbd>⇧</kbd><kbd>CTRL</kbd><span>Throttle</span></div>
+          <div><kbd>G</kbd><span>Landing gear</span></div>
+          <div><kbd>F</kbd><span>Flaps</span></div>
+          <div><kbd>B</kbd><span>Brakes / airbrake</span></div>
+          <div><kbd>V</kbd><span>Cockpit / external</span></div>
+          <div><kbd>C</kbd><span>Camera</span></div>
+          <div><kbd>T</kbd><span>Time scale</span></div>
+          <div><kbd>[</kbd><kbd>]</kbd><span>Time of day</span></div>
+          <div><kbd>Y</kbd><kbd>U</kbd><span>Weather / wind</span></div>
+          <div><kbd>H</kbd><span>Help</span></div>
+        </div>
+        <div class="side-foot">Mouse look in cockpit · wheel zoom · F3 telemetry</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- pause -->
+  <div id="pause" class="screen hidden">
+    <div class="panel">
+      <div class="eyebrow">FLIGHT PAUSED</div>
+      <h2>HOLDING</h2>
+      <div class="pause-stats" id="pause-stats"></div>
+      <button id="resume-btn" class="start small">RESUME <span>ESC</span></button>
+      <button id="respawn-btn" class="ghost">RESET TO RUNWAY</button>
+      <button id="menu-btn" class="ghost">RETURN TO MENU</button>
+    </div>
+  </div>
+
+  <!-- help -->
+  <div id="help" class="screen hidden">
+    <div class="panel wide">
+      <div class="eyebrow">REFERENCE</div>
+      <h2>CONTROLS</h2>
+      <div class="help-columns">
+        <div class="keys">
+          <div><kbd>W</kbd><kbd>S</kbd><span>Pitch down / up</span></div>
+          <div><kbd>A</kbd><kbd>D</kbd><span>Roll left / right</span></div>
+          <div><kbd>Q</kbd><kbd>E</kbd><span>Rudder</span></div>
+          <div><kbd>⇧</kbd><kbd>CTRL</kbd><span>Throttle up / down</span></div>
+          <div><kbd>↑</kbd><kbd>↓</kbd><span>Throttle (alt)</span></div>
+          <div><kbd>G</kbd><span>Landing gear</span></div>
+          <div><kbd>F</kbd><span>Flaps 0 / 1 / 2</span></div>
+          <div><kbd>B</kbd><span>Airbrake / wheel brakes</span></div>
+        </div>
+        <div class="keys">
+          <div><kbd>V</kbd><span>Cockpit ↔ external</span></div>
+          <div><kbd>C</kbd><span>Cycle camera</span></div>
+          <div><kbd>T</kbd><span>Time scale ×1 → ×300</span></div>
+          <div><kbd>[</kbd><kbd>]</kbd><span>Time of day − / + 1h</span></div>
+          <div><kbd>Y</kbd><span>Cycle weather</span></div>
+          <div><kbd>U</kbd><span>Cycle wind</span></div>
+          <div><kbd>R</kbd><span>Reset to runway</span></div>
+          <div><kbd>M</kbd><span>Mute audio</span></div>
+          <div><kbd>P</kbd><kbd>ESC</kbd><span>Pause</span></div>
+          <div><kbd>F1</kbd><span>Hide interface</span></div>
+          <div><kbd>F3</kbd><span>Performance panel</span></div>
+        </div>
+      </div>
+      <p class="help-note">Hold right mouse button in the cockpit to look around. In external
+        view, drag to orbit and scroll to zoom. The HUD is drawn as F-16 symbology: airspeed
+        left, altitude right, pitch ladder and flight-path marker centre.</p>
+      <button id="help-close" class="ghost">CLOSE</button>
+    </div>
+  </div>
+
+  <!-- crash -->
+  <div id="crash" class="screen hidden">
+    <div class="panel crash-panel">
+      <div class="eyebrow danger">AIRFRAME LOST</div>
+      <h2 id="crash-reason">IMPACT</h2>
+      <div class="crash-sub" id="crash-sub">The aircraft was destroyed.</div>
+      <button id="crash-reset" class="start small">RESET TO RUNWAY <span>R</span></button>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <div id="debug" class="hidden"></div>
+  <div id="atc" class="hidden"></div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
