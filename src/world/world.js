@@ -6,6 +6,7 @@ import { BuildingSystem } from './buildings.js';
 import { VegetationSystem } from './vegetation.js';
 import { RoadNetwork } from './roadnet.js';
 import { InlandWaterSystem } from './water.js';
+import { LandmarkSystem } from './landmarks.js';
 import { terrainHeight, slopeAt, airportNear, airportsNear } from './terrain.js';
 
 export class World {
@@ -19,6 +20,9 @@ export class World {
     this.roads = new RoadNetwork(scene, preset);
     // Real OSM rivers & lakes, draped over the active terrain (Vipava theater).
     this.inlandWater = new InlandWaterSystem(scene);
+    // Iconic real-world landmarks (churches, bridges, dams, masts, castles,
+    // lighthouses) re-grounded on the active DEM when the theater is Vipava.
+    this.landmarks = new LandmarkSystem(scene);
     // Optional offshore carrier group; main.js attaches one once it is placed.
     this.carrier = null;
   }
@@ -50,6 +54,7 @@ export class World {
     this.roads.update(camera);
     this.vegetation.update(dt, camera, sky);
     this.inlandWater.update(dt, sky);
+    this.landmarks.update(dt);
   }
 
   heightAt(x, z) {

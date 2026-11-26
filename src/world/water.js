@@ -15,9 +15,15 @@ import { terrainHeight } from './terrain.js';
 
 const RIVER_STEP_M = 25; // resample distance along a river centreline
 const RIVER_LIFT_M = 0.35; // metres above the terrain surface
-const SEA_CUTOFF_M = 0.4; // below this the Adriatic Sea plane takes over
+// The Adriatic plane sits 0.45 m below y=0 and the coastal deltas around
+// Monfalcone / Grado are only 0..2 m high. Inland ribbons must stay clear of
+// that band entirely, otherwise the sea plane and the river sheet Z-fight.
+const SEA_CUTOFF_M = 1.8; // below this the Adriatic Sea plane takes over
 const LAKE_LIFT_M = 0.45;
-const LAKE_MIN_Y = 1.2;
+// Same reasoning for lakes: a lagoon surface pinned near y=0 collides with the
+// sea plane across the whole Grado marsh. 2.0 m keeps every lake sheet above
+// the sea plane's offset band.
+const LAKE_MIN_Y = 2.0;
 const LAKE_PERIMETER_STEP_M = 30;
 
 // ---------------------------------------------------------------------------

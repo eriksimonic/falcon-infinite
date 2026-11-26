@@ -544,7 +544,7 @@ check(!!custom, 'setCustomBuildings returned nothing');
 check(customSys.customSettlement === custom, 'customSettlement was not stored');
 check(custom.id === 'vipava-osm', `custom settlement id is ${custom.id}`);
 check(custom.type === 'metro', `custom settlement type is ${custom.type}`);
-check(Math.abs(custom.radius - 22000) < 1e-6, `custom settlement radius is ${custom.radius}`);
+check(Math.abs(custom.radius - 52000) < 1e-6, `custom settlement radius is ${custom.radius}`);
 check(custom.buildings.length === 1, `custom settlement holds ${custom.buildings.length} buildings`);
 check(customSys.stats.destroyed === 0, 'custom settlement started with damage');
 

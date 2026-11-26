@@ -6,7 +6,10 @@
 // Web Speech implementation. The kneeboard renders against a minimal 2D
 // canvas mock, exactly like the rest of the HUD stack.
 
-import { KneeboardMap } from '../src/ui/kneeboard.js';
+import {
+  KneeboardMap, bearingTo, cardinal8, formatGeoPosition, formatPlaceBearing,
+  formatWorldOffset, nearestPlace,
+} from '../src/ui/kneeboard.js';
 import { BitchingBetty } from '../src/core/betty.js';
 
 let checks = 0;
@@ -25,6 +28,7 @@ function finite(v) {
 function makeCanvas() {
   const state = {
     texts: [],
+    textRuns: [],
     calls: 0,
     font: '',
     fillStyle: '',
@@ -58,9 +62,18 @@ function makeCanvas() {
       bump('setLineDash');
       state.dashes.push(pattern);
     },
-    fillText(text) {
+    fillText(text, x, y) {
       bump('fillText');
-      state.texts.push(String(text));
+      const s = String(text);
+      state.texts.push(s);
+      state.textRuns.push({
+        text: s,
+        x: Number.isFinite(x) ? x : 0,
+        y: Number.isFinite(y) ? y : 0,
+        font: state.font,
+        align: state.textAlign,
+        fill: state.fillStyle,
+      });
     },
     strokeText() { bump('strokeText'); },
     measureText(text) {
@@ -311,7 +324,187 @@ function makeCanvas() {
 }
 
 // ===========================================================================
-// 5. BitchingBetty — priority, cooldowns, mute, announce
+// 5. KneeboardMap — place labels & live location bar
+// ===========================================================================
+{
+  // ---- pure readout helpers ----------------------------------------------
+  ok(formatPlaceBearing(900, 0, 'Grado') === 'OVER GRADO',
+    'inside 1.5 km reads OVER <NAME>', formatPlaceBearing(900, 0, 'Grado'));
+  ok(formatPlaceBearing(1500, 90, 'grado') === '1.5 KM E OF GRADO',
+    'beyond 1.5 km reads DIST CARDINAL OF NAME', formatPlaceBearing(1500, 90, 'grado'));
+  ok(formatPlaceBearing(12400, 225, 'Monfalcone') === '12 KM SW OF MONFALCONE',
+    'kilometres round above 10 km', formatPlaceBearing(12400, 225, 'Monfalcone'));
+
+  ok(cardinal8(0) === 'N' && cardinal8(45) === 'NE' && cardinal8(90) === 'E'
+    && cardinal8(180) === 'S' && cardinal8(225) === 'SW' && cardinal8(270) === 'W'
+    && cardinal8(359) === 'N', 'compass cardinals follow the bearing');
+  ok(bearingTo({ x: 0, z: 0 }, { x: 0, z: -1000 }) === 0,
+    'north (-Z) is 000');
+  ok(Math.abs(bearingTo({ x: 0, z: 0 }, { x: 1000, z: 0 }) - 90) < 1e-9,
+    'east (+X) is 090');
+  ok(Math.abs(bearingTo({ x: 0, z: 0 }, { x: 0, z: 1000 }) - 180) < 1e-9,
+    'south (+Z) is 180');
+  ok(Math.abs(bearingTo({ x: 0, z: 0 }, { x: -1000, z: 0 }) - 270) < 1e-9,
+    'west (-X) is 270');
+
+  const origin = { lat0: 45.89, lon0: 13.89 };
+  ok(formatGeoPosition({ x: 0, z: 0 }, origin) === '45.89°N 13.89°E',
+    'GPS readout at the geo origin', formatGeoPosition({ x: 0, z: 0 }, origin));
+  ok(formatGeoPosition({ x: 0, z: -11132 }, origin) === '45.99°N 13.89°E',
+    'north (-Z) raises the latitude', formatGeoPosition({ x: 0, z: -11132 }, origin));
+  ok(formatGeoPosition({ x: 0, z: 11132 }, { lat0: -33.9, lon0: 18.4 }) === '34.00°S 18.40°E',
+    'southern latitudes keep the S hemisphere',
+    formatGeoPosition({ x: 0, z: 11132 }, { lat0: -33.9, lon0: 18.4 }));
+  ok(String(formatGeoPosition({ x: -2000000, z: 0 }, origin)).endsWith('°W'),
+    'west offsets flip the longitude hemisphere',
+    formatGeoPosition({ x: -2000000, z: 0 }, origin));
+  ok(formatGeoPosition({ x: 0, z: 0 }, null) === null, 'no geoOrigin yields no GPS string');
+  ok(formatGeoPosition({ x: NaN, z: 0 }, origin) === null, 'NaN position yields no GPS string');
+  ok(formatWorldOffset({ x: 3000, z: -2000 }) === '3.0E 2.0N KM',
+    'world-offset fallback keeps east/north signs', formatWorldOffset({ x: 3000, z: -2000 }));
+  ok(nearestPlace({ x: 0, z: 0 }, null) === null, 'no places yields no nearest entry');
+  const near1 = nearestPlace({ x: 0, z: 0 }, [
+    { name: 'Far', x: 9000, z: 0 }, { name: 'Near', x: 300, z: 400 },
+  ]);
+  ok(near1 && near1.place.name === 'Near' && Math.abs(near1.distM - 500) < 1e-9,
+    'nearestPlace picks the closest entry', near1 && near1.place.name);
+
+  // ---- place labels on the chart ----------------------------------------
+  const W = 1200;
+  const H = 900;
+  const labels = new KneeboardMap();
+  labels.visible = true;
+  const g = labels._geometry(W, H);
+  const chartTop = g.y + g.headerH;
+  const chartBottom = chartTop + g.size;
+
+  const placeCanvas = makeCanvas();
+  const places = [
+    { name: 'Monfalcone', kind: 'city', x: 0, z: -6000 },
+    { name: 'Grado', kind: 'town', x: 6000, z: -2000 },
+    { name: 'Aquileia', kind: 'landmark', x: -6000, z: 3000 },
+  ];
+  labels.draw(placeCanvas, W, H, { x: 0, z: 0, heading: 90, places });
+  const placeTexts = placeCanvas.__state.texts;
+  ok(placeTexts.includes('MONFALCONE'), 'city name label rendered', placeTexts.join('|'));
+  ok(placeTexts.includes('GRADO'), 'town name label rendered');
+  ok(placeTexts.includes('AQUILEIA'), 'landmark name label rendered');
+  ok(labels.placesPlotted === 3, 'every visible place is labelled', String(labels.placesPlotted));
+
+  let outsideSquare = 0;
+  for (const run of placeCanvas.__state.textRuns) {
+    if (!['MONFALCONE', 'GRADO', 'AQUILEIA'].includes(run.text)) continue;
+    if (run.x < g.x || run.x > g.x + g.size || run.y < chartTop || run.y > chartBottom) {
+      outsideSquare++;
+    }
+  }
+  ok(outsideSquare === 0, 'place labels stay clipped inside the map square',
+    `outside=${outsideSquare}`);
+
+  // Overlapping labels are suppressed instead of smearing together.
+  const clutter = new KneeboardMap();
+  clutter.visible = true;
+  const clutterCanvas = makeCanvas();
+  clutter.draw(clutterCanvas, W, H, {
+    x: 0, z: 0,
+    places: [
+      { name: 'Duino', kind: 'city', x: 0, z: -6000 },
+      { name: 'Duino East', kind: 'city', x: 200, z: -6000 },
+    ],
+  });
+  ok(clutter.placesPlotted === 1, 'colliding labels are dropped', String(clutter.placesPlotted));
+  ok(clutterCanvas.__state.texts.includes('DUINO'), 'first label survives the clutter filter');
+  ok(!clutterCanvas.__state.texts.includes('DUINO EAST'), 'colliding label is not drawn');
+
+  // Off-chart places are neither labelled nor dotted.
+  const offMap = new KneeboardMap();
+  offMap.visible = true;
+  const offCanvas = makeCanvas();
+  offMap.draw(offCanvas, W, H, {
+    x: 0, z: 0, places: [{ name: 'Udine', kind: 'city', x: 40000, z: 0 }],
+  });
+  ok(offMap.placesPlotted === 0, 'places outside the chart radius are not labelled');
+  ok(!offCanvas.__state.texts.includes('UDINE'), 'off-chart place name is not drawn');
+
+  // Label budget keeps the chart from turning into text soup.
+  const busy = new KneeboardMap();
+  busy.visible = true;
+  const busyCanvas = makeCanvas();
+  const gridPlaces = [];
+  for (let i = 0; i < 40; i++) {
+    gridPlaces.push({
+      name: 'P' + i, kind: 'city', x: -7000 + (i % 8) * 2000, z: -7000 + Math.floor(i / 8) * 2000,
+    });
+  }
+  busy.draw(busyCanvas, W, H, { x: 0, z: 0, places: gridPlaces });
+  ok(busy.placesPlotted <= 10, 'place labels are capped at 10', String(busy.placesPlotted));
+  ok(busy.placesPlotted > 0, 'the nearest grid places still label', String(busy.placesPlotted));
+
+  // Hostile place payloads never throw.
+  const junk = new KneeboardMap();
+  junk.visible = true;
+  let threw = null;
+  try {
+    junk.draw(makeCanvas(), W, H, {
+      x: 0, z: 0,
+      places: [null, undefined, {}, { name: '', x: 1, z: 2 }, { name: 'Bad', x: NaN, z: 0 }],
+    });
+    junk.draw(makeCanvas(), W, H, { x: 0, z: 0, places: 'nope', geoOrigin: 42 });
+    junk.draw(makeCanvas(), W, H, { x: 0, z: 0, places: null, geoOrigin: null });
+  } catch (err) {
+    threw = err;
+  }
+  ok(!threw, 'hostile places / geoOrigin payloads are tolerated', threw && threw.message);
+  ok(junk.placesPlotted === 0, 'invalid places plot nothing', String(junk.placesPlotted));
+
+  // ---- live location bar -------------------------------------------------
+  const live = new KneeboardMap();
+  live.visible = true;
+  const liveCanvas = makeCanvas();
+  live.draw(liveCanvas, W, H, {
+    x: 0, z: 0, heading: 0,
+    places: [{ name: 'Grado', kind: 'city', x: 0, z: -1200 }],
+    geoOrigin: origin,
+  });
+  ok(liveCanvas.__state.texts.includes('OVER GRADO'),
+    'location bar reads OVER <NAME> inside 1.5 km', liveCanvas.__state.texts.join('|'));
+  ok(liveCanvas.__state.texts.includes('45.89°N 13.89°E'),
+    'location bar shows live GPS lat/lon', liveCanvas.__state.texts.join('|'));
+  ok(live.location && Math.abs(live.location.nearest.distM - 1200) < 1e-6,
+    'readout stores the nearest-place distance');
+
+  const barBar = makeCanvas();
+  live.draw(barBar, W, H, {
+    x: 0, z: -2400, heading: 0,
+    places: [{ name: 'Grado', kind: 'city', x: 0, z: 0 }],
+    geoOrigin: origin,
+  });
+  ok(barBar.__state.texts.includes('2.4 KM S OF GRADO'),
+    'location bar reads DIST CARDINAL OF NAME beyond 1.5 km',
+    barBar.__state.texts.join('|'));
+  ok(barBar.__state.texts.includes('45.91°N 13.89°E'),
+    'GPS follows the aircraft north', barBar.__state.texts.join('|'));
+
+  // Without a geo origin the bar falls back to world offsets.
+  const noGeo = makeCanvas();
+  live.draw(noGeo, W, H, { x: 3000, z: -2000, heading: 0, places: [] });
+  ok(noGeo.__state.texts.includes('3.0E 2.0N KM'),
+    'world-offset readout when no geoOrigin is supplied', noGeo.__state.texts.join('|'));
+  ok(live.location && live.location.nearest === null, 'no places means no nearest-place line');
+
+  // Nested flight state still feeds the bar.
+  const nested = makeCanvas();
+  live.draw(nested, W, H, {
+    flight: { position: { x: 0, z: 0 }, heading: 270 },
+    places: [{ name: 'Duino', kind: 'city', x: 4000, z: 0 }],
+    geoOrigin: origin,
+  });
+  ok(nested.__state.texts.includes('4.0 KM E OF DUINO'),
+    'nested flight.position feeds the location bar', nested.__state.texts.join('|'));
+}
+
+// ===========================================================================
+// 6. BitchingBetty — priority, cooldowns, mute, announce
 // ===========================================================================
 function advance(betty, seconds, state, step = 0.05) {
   const results = [];

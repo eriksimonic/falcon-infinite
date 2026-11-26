@@ -88,12 +88,117 @@ function terrainColor(h) {
 const pad3 = (v) => String(Math.round(v) % 360).padStart(3, '0');
 const pad2 = (v) => String(Math.round(v)).padStart(2, '0');
 
+// ------------------------------------------------------------ place labels
+export const OVER_PLACE_M = 1500;
+const PLACE_MAX_LABELS = 10;
+const CARDINALS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+const M_PER_DEG = 111320;
+
+/** Normalise a `{ name, x, z, kind }` entry (also tolerates `{ position }`). */
+function placeInfo(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const n = typeof raw.name === 'string' ? raw.name : (typeof raw.label === 'string' ? raw.label : '');
+  const name = n.trim();
+  if (!name) return null;
+  const p = objPos(raw);
+  if (!p) return null;
+  const kind = typeof raw.kind === 'string' ? raw.kind.toLowerCase() : 'place';
+  return { name, x: p.x, z: p.z, kind };
+}
+
+/** Compass point (8-wind) for a bearing in degrees clockwise from north. */
+export function cardinal8(bearingDeg) {
+  const b = ((num(bearingDeg, 0) % 360) + 360) % 360;
+  return CARDINALS[Math.round(b / 45) % 8];
+}
+
+/** Bearing from `own` to `target`, degrees clockwise from north (north = -Z). */
+export function bearingTo(own, target) {
+  if (!own || !target) return 0;
+  const dx = target.x - own.x;
+  const dz = target.z - own.z;
+  if (!Number.isFinite(dx) || !Number.isFinite(dz) || (dx === 0 && dz === 0)) return 0;
+  return ((Math.atan2(dx, -dz) * 180) / Math.PI + 360) % 360;
+}
+
+/** 'OVER VERSA' inside 1.5 km, else '12.4 KM SW OF GRADO'. */
+export function formatPlaceBearing(distM, bearingDeg, name) {
+  const label = String(name || 'UNKNOWN').trim().toUpperCase();
+  const d = Math.max(0, num(distM, 0));
+  if (d < OVER_PLACE_M) return `OVER ${label}`;
+  const km = d / 1000;
+  return `${km < 10 ? km.toFixed(1) : Math.round(km)} KM ${cardinal8(bearingDeg)} OF ${label}`;
+}
+
+/** '45.89\u00B0N 13.89\u00B0E' for a world offset relative to `geoOrigin`. */
+export function formatGeoPosition(own, geoOrigin) {
+  if (!own || !geoOrigin || typeof geoOrigin !== 'object') return null;
+  const lat0 = num(geoOrigin.lat0 ?? geoOrigin.lat, NaN);
+  const lon0 = num(geoOrigin.lon0 ?? geoOrigin.lon, NaN);
+  if (!Number.isFinite(lat0) || !Number.isFinite(lon0)) return null;
+  const east = num(own.x, NaN);
+  const north = -num(own.z, NaN);
+  if (!Number.isFinite(east) || !Number.isFinite(north)) return null;
+
+  const lat = lat0 + north / M_PER_DEG;
+  const cosLat = Math.max(0.02, Math.abs(Math.cos((clamp(lat, -89, 89) * Math.PI) / 180)));
+  const lon = lon0 + east / (M_PER_DEG * cosLat);
+  const deg = (v) => Math.abs(v).toFixed(2);
+  return `${deg(lat)}\u00B0${lat >= 0 ? 'N' : 'S'} ${deg(lon)}\u00B0${lon >= 0 ? 'E' : 'W'}`;
+}
+
+/** Fallback when there is no geo origin: '2.4E 1.8S KM' (north = -Z). */
+export function formatWorldOffset(own) {
+  const x = num(own && own.x, 0);
+  const z = num(own && own.z, 0);
+  const km = (v) => Math.abs(v / 1000).toFixed(1);
+  return `${km(x)}${x >= 0 ? 'E' : 'W'} ${km(z)}${z <= 0 ? 'N' : 'S'} KM`;
+}
+
+/** Nearest usable place to `own`. */
+export function nearestPlace(own, places) {
+  const o = own || { x: 0, z: 0 };
+  const list = Array.isArray(places) ? places : [];
+  let best = null;
+  let bestD = Infinity;
+  for (const raw of list) {
+    const p = placeInfo(raw);
+    if (!p) continue;
+    const d = Math.hypot(p.x - o.x, p.z - o.z);
+    if (Number.isFinite(d) && d < bestD) {
+      best = p;
+      bestD = d;
+    }
+  }
+  if (!best) return null;
+  return { place: best, distM: bestD, bearingDeg: bearingTo(o, best) };
+}
+
+/** Full status-bar readout: place line + live position line. */
+export function kneeboardLocationReadout(own, places, geoOrigin) {
+  const nearest = nearestPlace(own, places);
+  return {
+    nearest,
+    place: nearest ? formatPlaceBearing(nearest.distM, nearest.bearingDeg, nearest.place.name) : null,
+    gps: formatGeoPosition(own, geoOrigin) || formatWorldOffset(own),
+  };
+}
+
+function rectsOverlap(a, b) {
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
 export class KneeboardMap {
   constructor() {
     this.visible = false;
     this.rangeM = 32000;
     this.track = [];
     this.selectedAirport = null;
+
+    // Live-location readout from the last draw (nearest place + GPS line) and
+    // how many place labels the clutter filter actually plotted.
+    this.location = null;
+    this.placesPlotted = 0;
 
     // Diagnostics: number of terrain grid rebuilds (cache misses).
     this.gridBuilds = 0;
@@ -132,17 +237,20 @@ export class KneeboardMap {
   // strip sits above it. Both draw() and pickAirportAt() share this layout.
   _geometry(w, h) {
     const minD = Math.max(0, Math.min(w, h));
-    const size = Math.max(90, Math.min(minD * 0.48, Math.min(w - 24, h - 24)));
+    // Reserve the header strip and the live-location bar before sizing the map.
+    const barGuess = Math.max(13, 15 * clamp(minD / 340, 0.7, 2.0));
+    const size = Math.max(90, Math.min(minD * 0.48, Math.min(w - 24, h - 24) - barGuess));
     const k = clamp(size / 340, 0.7, 2.0);
     const headerH = Math.max(14, 17 * k);
-    const totalH = size + headerH;
+    const barH = Math.max(13, 15 * k);
+    const totalH = size + headerH + barH;
     const margin = Math.max(10, minD * 0.03);
     const x = margin;
     const y = clamp((h - totalH) * 0.5, margin, Math.max(margin, h - totalH - margin));
     const cx = x + size * 0.5;
     const cy = y + headerH + size * 0.5;
     const r = Math.max(10, size * 0.5 - 9 * k);
-    return { x, y, size, headerH, totalH, cx, cy, r, k };
+    return { x, y, size, headerH, barH, totalH, cx, cy, r, k };
   }
 
   _scale(g) {
@@ -281,6 +389,10 @@ export class KneeboardMap {
     const heading = this._heading(flight);
     const g = this._geometry(W, H);
     const k = g.k;
+    const places = Array.isArray(st.places) ? st.places
+      : (Array.isArray(flight.places) ? flight.places : []);
+    const geoOrigin = st.geoOrigin && typeof st.geoOrigin === 'object' ? st.geoOrigin
+      : (flight.geoOrigin && typeof flight.geoOrigin === 'object' ? flight.geoOrigin : null);
 
     ctx.save();
     ctx.textBaseline = 'middle';
@@ -339,6 +451,7 @@ export class KneeboardMap {
     if (grid) this._drawTerrain(ctx, g, grid, own);
 
     this._drawGraticule(ctx, g);
+    this._drawPlaces(ctx, g, own, places);
     this._drawRings(ctx, g);
     this._drawCompass(ctx, g);
     this._drawTrack(ctx, g, own);
@@ -365,6 +478,7 @@ export class KneeboardMap {
     ctx.stroke();
 
     this._drawWind(ctx, g, this._wind(st));
+    this._drawStatusBar(ctx, g, own, places, geoOrigin);
 
     // Corner detail ticks.
     ctx.strokeStyle = GREEN_FAINT;
@@ -388,6 +502,145 @@ export class KneeboardMap {
   }
 
   // ------------------------------------------------------------ chart parts
+  /** Approximate text width; the headless canvas mock has no font metrics. */
+  _textWidth(ctx, text) {
+    if (!text) return 0;
+    if (typeof ctx.measureText === 'function') {
+      try {
+        const m = ctx.measureText(text);
+        if (m && Number.isFinite(m.width)) return m.width;
+      } catch (err) {
+        /* fall through to the fixed-advance estimate */
+      }
+    }
+    return String(text).length * 5.5;
+  }
+
+  /** Trim a string with an ellipsis so it fits `maxW` pixels. */
+  _fitText(ctx, text, maxW) {
+    const s = String(text || '');
+    if (!s || !(maxW > 0)) return '';
+    if (this._textWidth(ctx, s) <= maxW) return s;
+    let out = s;
+    while (out.length > 1 && this._textWidth(ctx, `${out.slice(0, -1)}\u2026`) > maxW) {
+      out = out.slice(0, -1);
+    }
+    return out.length > 1 ? `${out}\u2026` : '';
+  }
+
+  /**
+   * Subtle place/landmark labels. Cities and landmarks get a tiny dot; labels
+   * are clamped inside the chart square and dropped when they would collide,
+   * so the chart stays readable in the Monfalcone / Grado lowlands.
+   */
+  _drawPlaces(ctx, g, own, places) {
+    this.placesPlotted = 0;
+    const list = Array.isArray(places) ? places : [];
+    if (!list.length) return;
+    const k = g.k;
+    const chartTop = g.y + g.headerH;
+    const chartBottom = chartTop + g.size;
+    const entries = [];
+    const seen = new Set();
+
+    for (const raw of list) {
+      const p = placeInfo(raw);
+      if (!p || seen.has(p.name)) continue;
+      seen.add(p.name);
+      const s = this._project(p.x, p.z, own, g);
+      if (!Number.isFinite(s.x) || !Number.isFinite(s.y)) continue;
+      const d = Math.hypot(s.x - g.cx, s.y - g.cy);
+      // Inside the chart square, clear of the rim and of the aircraft symbol.
+      if (d > g.r - 7 * k || d < 13 * k) continue;
+      if (s.y < chartTop + 12 * k || s.y > chartBottom - 12 * k) continue;
+      entries.push({ ...p, sx: s.x, sy: s.y, d });
+    }
+    if (!entries.length) return;
+
+    entries.sort((a, b) => a.d - b.d);
+    ctx.textBaseline = 'middle';
+    ctx.font = `600 ${Math.round(7.5 * k)}px ${MONO}`;
+    const textH = 8 * k;
+    const taken = [];
+
+    for (const p of entries) {
+      if (this.placesPlotted >= PLACE_MAX_LABELS) break;
+      const label = p.name.toUpperCase().slice(0, 22);
+      const box = {
+        x: p.sx + 4 * k,
+        y: p.sy - textH * 0.5,
+        w: this._textWidth(ctx, label) + 3 * k,
+        h: textH,
+      };
+      if (box.x + box.w > g.x + g.size - 5 * k) box.x = p.sx - 4 * k - box.w;
+      if (box.x < g.x + 5 * k) box.x = g.x + 5 * k;
+      if (box.y < chartTop + 13 * k) box.y = chartTop + 13 * k;
+      if (box.y + box.h > chartBottom - 13 * k) box.y = chartBottom - 13 * k - box.h;
+      // Clutter guard: skip labels that would sit on one already plotted.
+      if (taken.some((t) => rectsOverlap(t, box))) continue;
+
+      const city = p.kind === 'city' || p.kind === 'town' || p.kind === 'village';
+      const landmark = p.kind === 'landmark' || p.kind === 'peak' || p.kind === 'airfield';
+      ctx.fillStyle = city ? 'rgba(234,255,241,0.80)' : 'rgba(186,214,199,0.58)';
+      ctx.textAlign = 'left';
+      ctx.fillText(label, box.x + 1.5 * k, box.y + box.h * 0.5);
+
+      if (city || landmark) {
+        ctx.beginPath();
+        ctx.arc(p.sx, p.sy, (city ? 1.9 : 1.4) * k, 0, TAU);
+        ctx.fillStyle = city ? 'rgba(234,255,241,0.75)' : 'rgba(186,214,199,0.55)';
+        ctx.fill();
+      }
+      taken.push(box);
+      this.placesPlotted++;
+    }
+  }
+
+  /**
+   * Compact live-location bar under the chart: nearest place + live position
+   * (GPS when `state.geoOrigin` is supplied, world offsets otherwise).
+   */
+  _drawStatusBar(ctx, g, own, places, geoOrigin) {
+    const k = g.k;
+    const top = g.y + g.headerH + g.size;
+    const readout = kneeboardLocationReadout(own, places, geoOrigin);
+    this.location = readout;
+
+    ctx.save();
+    roundRectPath(ctx, g.x, g.y, g.size, g.totalH, 9 * k);
+    ctx.clip();
+    ctx.fillStyle = 'rgba(9, 24, 17, 0.92)';
+    ctx.fillRect(g.x, top, g.size, g.barH);
+    ctx.strokeStyle = GREEN_FAINT;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(g.x + 6 * k, top + 0.5);
+    ctx.lineTo(g.x + g.size - 6 * k, top + 0.5);
+    ctx.stroke();
+    ctx.restore();
+
+    const baseY = top + g.barH * 0.5 + 0.5;
+    const padX = 8 * k;
+    const gpsText = readout.gps ? String(readout.gps) : '';
+
+    ctx.textBaseline = 'middle';
+    ctx.font = `700 ${Math.round(8 * k)}px ${MONO}`;
+    const gpsW = gpsText ? this._textWidth(ctx, gpsText) + 10 * k : 0;
+    const placeText = this._fitText(ctx, readout.place || '', g.size - padX * 2 - gpsW);
+
+    if (placeText) {
+      ctx.textAlign = 'left';
+      ctx.fillStyle = readout.nearest && readout.nearest.distM < OVER_PLACE_M ? GREEN : INK;
+      ctx.fillText(placeText, g.x + padX, baseY);
+    }
+    if (gpsText) {
+      ctx.textAlign = 'right';
+      ctx.fillStyle = MUTED;
+      ctx.font = `600 ${Math.round(8 * k)}px ${MONO}`;
+      ctx.fillText(gpsText, g.x + g.size - padX, baseY);
+    }
+  }
+
   _drawTerrain(ctx, g, grid, own) {
     const sc = g.r / (grid.rangeM * 0.5);
     const cellPx = grid.step * sc;

@@ -260,7 +260,8 @@ let _osmData = null;
 
 /**
  * Load the baked OSM extract for the Vipava theater:
- * `{ roads: [{ w, pts: [[x, z], ...] }], buildings: [[x, z, w, d, h, rot, kindCode], ...] }`.
+ * `{ roads: [{ w, pts: [[x, z], ...] }], buildings: [[x, z, w, d, h, rot, kindCode], ...],
+ *    landmarks: [{ id, name, kind, x, z, rot, scale?, length?, height? }, ...] }`.
  *
  * The payload is fetched once and cached in memory; any failure (missing file,
  * offline, malformed JSON) resolves to `null` so a theater switch can fall back
@@ -268,7 +269,7 @@ let _osmData = null;
  * cached, so a later switch retries.
  *
  * @param {string} url
- * @returns {Promise<{roads: Array, buildings: Array}|null>}
+ * @returns {Promise<{roads: Array, buildings: Array, landmarks: Array}|null>}
  */
 export async function loadVipavaOSM(url = './media/vipava_osm.json') {
   if (_osmData) return _osmData;
@@ -284,6 +285,7 @@ export async function loadVipavaOSM(url = './media/vipava_osm.json') {
       _osmData = {
         roads: Array.isArray(json.roads) ? json.roads : [],
         buildings: Array.isArray(json.buildings) ? json.buildings : [],
+        landmarks: Array.isArray(json.landmarks) ? json.landmarks : [],
       };
       return _osmData;
     } catch {

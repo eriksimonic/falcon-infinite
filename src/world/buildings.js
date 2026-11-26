@@ -31,7 +31,9 @@ const RUIN_FIRE_CAP = 24; // active ember plumes keep the VFX pool bounded
 // Real-world (baked OSM) city: one virtual settlement carries every baked
 // building so the same grounding / damage / ruin pipeline applies unchanged.
 const CUSTOM_SETTLEMENT_ID = 'vipava-osm';
-const CUSTOM_SETTLEMENT_RADIUS = 22000; // covers the whole 100 km DEM valley core
+const CUSTOM_SETTLEMENT_RADIUS = 52000; // reachable everywhere inside the 100 km region
+const LARGE_SETTLEMENT_RADIUS = 24000; // per-building stream radius for the OSM city
+const LARGE_SETTLEMENT_MIN_SIZE = 3000; // settlements larger than this stream per building
 const DEM_HALF = 50000; // the baked DEM owns +-50 km; procedural cities outside it stay
 const CUSTOM_KINDS = ['house', 'apartment', 'industrial', 'tower'];
 // LJAJ (Ajdovscina) is a true East-West strip at the DEM centre: RWY 09/27 runs
@@ -1102,12 +1104,57 @@ export class BuildingSystem {
   }
 
   // -------------------------------------------------------------------------
+  // Per-building distance streaming for the big baked OSM city
+  // -------------------------------------------------------------------------
+  /**
+   * Buildings of `s` that should be drawn from the current camera position.
+   *
+   * Small procedural settlements return their list untouched. The large baked
+   * OSM settlement streams per building: everything outside
+   * `clamp(buildingRadius + alt * 5, buildingRadius, 24 km)` is skipped, so
+   * flying into any of the ten valley towns always draws that town first, and
+   * when more buildings are in range than the instance budget allows the
+   * nearest ones win.
+   *
+   * @param {object} s settlement
+   * @param {number} camX
+   * @param {number} camZ
+   * @param {number} radius stream radius in metres
+   * @param {number} budget remaining instance slots
+   * @returns {Array} buildings to instance
+   */
+  _streamBuildings(s, camX, camZ, radius, budget) {
+    if (s.id !== CUSTOM_SETTLEMENT_ID && !(s.radius > LARGE_SETTLEMENT_MIN_SIZE)) {
+      return s.buildings;
+    }
+    if (!(budget > 0)) return [];
+
+    const r2 = radius * radius;
+    const picks = [];
+    for (const b of s.buildings) {
+      const dx = b.x - camX;
+      const dz = b.z - camZ;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > r2) continue;
+      picks.push({ b, d2 });
+    }
+    if (picks.length > budget) {
+      picks.sort((a, b) => a.d2 - b.d2);
+      picks.length = budget;
+    }
+    const out = new Array(picks.length);
+    for (let i = 0; i < picks.length; i++) out[i] = picks[i].b;
+    return out;
+  }
+
+  // -------------------------------------------------------------------------
   // Rebuild the visible set around the camera
   // -------------------------------------------------------------------------
   rebuild(camera) {
     if (!this.scene || !camera) return;
     const alt = Math.max(0, camera.position.y);
-    const radius = clamp((this.preset.buildingRadius || 8000) + alt * 5, this.preset.buildingRadius || 8000, 30000);
+    const baseRadius = this.preset.buildingRadius || 8000;
+    const radius = clamp(baseRadius + alt * 5, baseRadius, LARGE_SETTLEMENT_RADIUS);
     const settlements = this._settlementsNear(camera.position.x, camera.position.z, radius);
     this._groundUse.clear();
     for (const s of settlements) {
@@ -1167,7 +1214,8 @@ export class BuildingSystem {
     };
 
     for (const s of settlements) {
-      for (const b of s.buildings) {
+      const stream = this._streamBuildings(s, camera.position.x, camera.position.z, radius, limit - n);
+      for (const b of stream) {
         if (n >= limit) break;
         const g = this._ground(b);
         const key = buildingKey(s, b);

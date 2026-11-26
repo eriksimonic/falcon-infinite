@@ -10,7 +10,7 @@
     "preview": "vite preview --host 127.0.0.1 --port 4173",
     "mcp": "node mcp/server.mjs",
     "wso": "node mcp/wso_copilot.mjs",
-    "test": "node tests/settlements_test.mjs && node tests/flight_test.mjs && node tests/weapons_test.mjs && node tests/targets_test.mjs && node tests/missions_test.mjs && node tests/vfx_test.mjs && node tests/tactical_test.mjs && node tests/autopilot_test.mjs && node tests/fuel_test.mjs && node tests/kneeboard_test.mjs && node tests/ejection_traffic_test.mjs && node tests/mcp_test.mjs && node tests/wso_test.mjs && node tests/carrier_test.mjs && node tests/replay_test.mjs && node tests/cockpit_test.mjs && node tests/roadnet_test.mjs && node tests/cities_destruction_test.mjs && node tests/dem_test.mjs && node tests/water_test.mjs"
+    "test": "node tests/settlements_test.mjs && node tests/flight_test.mjs && node tests/weapons_test.mjs && node tests/targets_test.mjs && node tests/missions_test.mjs && node tests/vfx_test.mjs && node tests/tactical_test.mjs && node tests/autopilot_test.mjs && node tests/fuel_test.mjs && node tests/kneeboard_test.mjs && node tests/ejection_traffic_test.mjs && node tests/mcp_test.mjs && node tests/wso_test.mjs && node tests/carrier_test.mjs && node tests/replay_test.mjs && node tests/cockpit_test.mjs && node tests/roadnet_test.mjs && node tests/cities_destruction_test.mjs && node tests/dem_test.mjs && node tests/water_test.mjs && node tests/landmarks_test.mjs"
   },
   "dependencies": {
     "three": "^0.187.0"

@@ -85,6 +85,9 @@ class App {
     this._ilsState = null;
     this._divertAirport = null;
     this._meatballState = null;
+    // Baked Vipava geography for the kneeboard map: DEM origin + named places.
+    this._vipavaGeoOrigin = null;
+    this._vipavaPlaces = null;
     this._cloudMist = 0;
     this._rwrHighest = 'NONE';
     this._replayActive = false;
@@ -298,6 +301,32 @@ class App {
         // Real OSM rivers/lakes are draped on the freshly active DEM, so the
         // water has to be built after setActiveDEM/setCustomAirports above.
         this.world.inlandWater.setWaterData(water);
+        // Iconic landmarks are re-grounded on the same DEM (hilltop basilicas,
+        // the Nanos mast, the Solkan bridge and the Soča dams).
+        this.world.landmarks.setLandmarks(osm?.landmarks || null);
+        // Kneeboard map origin: the DEM centre is Ajdovščina (LJAJ).
+        this._vipavaGeoOrigin = dem.meta
+          ? { lat0: dem.meta.lat0, lon0: dem.meta.lon0 }
+          : { lat0: 45.8878, lon0: 13.8869 };
+        this._vipavaPlaces = [
+          { name: 'Ajdovscina', x: 0, z: 0, kind: 'city' },
+          { name: 'Vipava', x: 5380, z: 4150, kind: 'town' },
+          { name: 'Nova Gorica', x: -18700, z: -7500, kind: 'city' },
+          { name: 'Gorizia', x: -21000, z: -6200, kind: 'city' },
+          { name: 'Solkan', x: -18200, z: -10000, kind: 'town' },
+          { name: 'Tolmin', x: -12600, z: -32900, kind: 'town' },
+          { name: 'Trieste', x: -8300, z: 26400, kind: 'city' },
+          { name: 'Koper', x: -12200, z: 37800, kind: 'city' },
+          { name: 'Piran', x: -24800, z: 39800, kind: 'town' },
+          { name: 'Postojna', x: 25400, z: 12600, kind: 'town' },
+          { name: 'Sezana', x: -1100, z: 19800, kind: 'town' },
+          { name: 'Idrija', x: 10700, z: -12800, kind: 'town' },
+          { name: 'Monfalcone', x: -27500, z: 8900, kind: 'city' },
+          { name: 'Grado', x: -39000, z: 23500, kind: 'town' },
+          { name: 'Stanjel', x: -3200, z: 7100, kind: 'town' },
+          { name: 'Nanos', x: 12900, z: 12900, kind: 'landmark' },
+          ...(this.world.landmarks?.landmarks || []).map((l) => ({ name: l.name, x: l.x, z: l.z, kind: 'landmark' })),
+        ];
         // Ajdovscina Airfield (LJAJ) sits at the DEM centre and runs East-West:
         // start on the RWY 09 threshold, nose east into the sunrise.
         const ljaj = customAirports?.find((ap) => ap.id === 'LJAJ' || ap.code === 'LJAJ')
@@ -320,6 +349,9 @@ class App {
         this.world.buildings.setCustomBuildings(null);
         this.world.roads.setCustomRoads(null);
         this.world.inlandWater.setWaterData(null);
+        this.world.landmarks.setLandmarks(null);
+        this._vipavaGeoOrigin = null;
+        this._vipavaPlaces = null;
         if (this._proceduralSpawn) this.spawn = this._proceduralSpawn;
       }
     } else {
@@ -328,6 +360,9 @@ class App {
       this.world.buildings.setCustomBuildings(null);
       this.world.roads.setCustomRoads(null);
       this.world.inlandWater.setWaterData(null);
+      this.world.landmarks.setLandmarks(null);
+      this._vipavaGeoOrigin = null;
+      this._vipavaPlaces = null;
       if (this._proceduralSpawn) this.spawn = this._proceduralSpawn;
       this.carrier.placeNear(this.spawn.x, this.spawn.z);
     }
@@ -1044,6 +1079,10 @@ class App {
           steerpoint,
           windDir: t.windDir,
           windKts: t.windKts,
+          geoOrigin: this._vipavaGeoOrigin,
+          places: this._vipavaPlaces || settlementsNear(f.position.x, f.position.z, this.kneeboard.rangeM)
+            .filter((s) => s.type !== 'hamlet')
+            .map((s) => ({ name: s.name, x: s.x, z: s.z, kind: s.type })),
         } : null,
         telemetry: t,
         camera: this.camera,

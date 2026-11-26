@@ -439,12 +439,17 @@ class WaterSurface {
       `,
       fog: true,
       // Push the sea plane behind any low-lying coastal terrain sharing y=0.
+      // The surface itself also sits SEA_LEVEL - 0.45 below the waterline, so
+      // the 0..2 m Monfalcone/Grado deltas never Z-fight it; the offset is the
+      // second line of defence for shallow river mouths.
       polygonOffset: true,
-      polygonOffsetFactor: 2,
-      polygonOffsetUnits: 2,
+      polygonOffsetFactor: 4,
+      polygonOffsetUnits: 4,
     });
     this.mesh = new THREE.Mesh(geo, this.material);
-    this.mesh.position.y = SEA_LEVEL;
+    // Sink the sheet below the sea-level datum so flat coastal land (0..2 m)
+    // sits unambiguously above it and shorelines stop shimmering.
+    this.mesh.position.y = SEA_LEVEL - 0.45;
     this.mesh.renderOrder = -1;
     this.mesh.frustumCulled = false;
     scene.add(this.mesh);
