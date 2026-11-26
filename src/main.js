@@ -693,7 +693,12 @@ class App {
       const glocState = this.tactical.update(simDt, f);
 
       // Wave 3 systems: Tanker, Fuel, Traffic/Wingman, ILS, Kneeboard & Bitching Betty
+      const wasTankerContact = !!this._tankerState?.contact;
       this._tankerState = this.tanker.update(simDt, f);
+      if (this._tankerState?.contact && !wasTankerContact) {
+        this.combatAudio.boomContact();
+        this.ui.toast('TANKER · BOOM CONTACT — FUEL FLOWING');
+      }
       this._fuelState = this.fuel.update(simDt, f, !!this._tankerState?.contact);
       if (this._fuelState.bingoTriggered) {
         this.ui.toast('BINGO FUEL · ' + Math.round(this._fuelState.fuelLb) + ' LB');

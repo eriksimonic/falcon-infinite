@@ -1,16 +1,34 @@
-// Procedural combat audio layered on top of SimAudio's shared AudioContext.
+// Hybrid combat audio layered on top of SimAudio's shared AudioContext.
+//
+// Preloads authentic F-16 & military weapon samples from /media/sfx/ into
+// WebAudio AudioBuffers when running in a browser, and automatically falls
+// back to the built-in procedural WebAudio synth while loading or in headless
+// environments.
 //
 // Continuous cues:
-//   - AIM-9 IR seeker growl (~220 Hz) -> steady lock tone (~880 Hz)
-//   - RWR search ping / lock triple-chirp / launch warble
+//   - AIM-9 IR seeker growl (real sample or ~220 Hz synth) -> lock tone
+//   - RWR search ping / lock triple-chirp / SAM launch warning
 //   - Pilot G-strain breathing under sustained load
-// One-shots: cannon, missile launch, bomb release, flare pop, explosion,
-// sonic boom, radio beep.
-//
-// No samples. Every AudioParam write is sanitised (finite, positive frequency,
-// in-range time) so a bad telemetry frame can never throw or poison the graph.
+// One-shots: Vulcan cannon, missile launch, bomb release, flare pop,
+// explosion (distance-filtered), sonic boom, tanker boom contact, radio beep.
 
 const TAU = Math.PI * 2;
+
+const SAMPLE_URLS = {
+  vulcan: '/media/sfx/vulcan.wav',
+  aim9_growl: '/media/sfx/aim9_growl.wav',
+  missile_launch: '/media/sfx/missile_launch.wav',
+  aim_launch_pop: '/media/sfx/aim_launch_pop.wav',
+  bomb_release: '/media/sfx/bomb_release.wav',
+  flare_pop: '/media/sfx/flare_pop.wav',
+  explosion: '/media/sfx/explosion.wav',
+  explosion_heavy: '/media/sfx/explosion_heavy.ogg',
+  sonic_boom: '/media/sfx/sonic_boom.ogg',
+  rwr_new: '/media/sfx/rwr_new.wav',
+  rwr_sam_launch: '/media/sfx/rwr_sam_launch.wav',
+  boom_contact: '/media/sfx/boom_contact.wav',
+  caution: '/media/sfx/caution.wav',
+};
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const fin = (v, fb = 0) => (typeof v === 'number' && Number.isFinite(v) ? v : fb);
@@ -24,6 +42,13 @@ export class CombatAudio {
     this._bus = null;
     this._noiseBuf = null;
     this._noiseOff = 0;
+    this._samples = new Map();
+    this._samplesLoading = false;
+    this._aim9SampleSrc = null;
+    this._aim9SampleGain = null;
+    this._rwrLaunchCd = 0;
+    this._expToggle = 0;
+    this._jitterSeed = 0x51a7c3;
     this._t = 0;
     this._bt = 0;
     this._pingCd = 0;
@@ -63,9 +88,84 @@ export class CombatAudio {
     try {
       this._build();
       this.ready = true;
+      this._loadSamples();
     } catch (err) {
       this.ready = false;
       this._bus = null;
+    }
+  }
+
+  _nextRand() {
+    this._jitterSeed = (Math.imul(this._jitterSeed, 1664525) + 1013904223) >>> 0;
+    return this._jitterSeed / 4294967296;
+  }
+
+  _loadSamples() {
+    if (this._samplesLoading || !this.ctx) return;
+    if (typeof window === 'undefined' || typeof fetch !== 'function') return;
+    if (typeof this.ctx.decodeAudioData !== 'function') return;
+    this._samplesLoading = true;
+
+    const ctx = this.ctx;
+    for (const [key, url] of Object.entries(SAMPLE_URLS)) {
+      fetch(url)
+        .then((res) => (res.ok ? res.arrayBuffer() : null))
+        .then((ab) => (ab && this.ctx === ctx ? ctx.decodeAudioData(ab) : null))
+        .then((decoded) => {
+          if (!decoded || this.ctx !== ctx) return;
+          this._samples.set(key, decoded);
+          if (key === 'aim9_growl') this._initAim9SampleLoop(decoded);
+        })
+        .catch(() => { /* graceful fallback to procedural synth */ });
+    }
+  }
+
+  _initAim9SampleLoop(buf) {
+    if (!this._ready() || this._aim9SampleSrc || !buf) return;
+    try {
+      const src = this.ctx.createBufferSource();
+      src.buffer = buf;
+      src.loop = true;
+      const g = this._gainNode(0);
+      src.connect(g).connect(this._bus);
+      this._start(src, this._now());
+      this._aim9SampleSrc = src;
+      this._aim9SampleGain = g;
+    } catch (err) {
+      this._aim9SampleSrc = null;
+      this._aim9SampleGain = null;
+    }
+  }
+
+  _playSample(key, opts = {}) {
+    if (!this._ready()) return false;
+    const buf = this._samples.get(key);
+    if (!buf || typeof this.ctx.createBufferSource !== 'function') return false;
+    try {
+      const t0 = this._now();
+      const src = this.ctx.createBufferSource();
+      src.buffer = buf;
+      const jitter = clamp(fin(opts.jitter, 0.04), 0, 0.25);
+      const baseRate = clamp(fin(opts.rate, 1), 0.4, 2.5);
+      const rate = clamp(baseRate * (1 + (this._nextRand() * 2 - 1) * jitter), 0.4, 2.5);
+      if (src.playbackRate) this._paramSet(src.playbackRate, rate, t0);
+
+      const g = this._gainNode(clamp(fin(opts.gain, 0.7), 0.001, 1.2));
+      const lpHz = fin(opts.lowpassHz, 0);
+      if (lpHz > 40) {
+        const lp = this._filter('lowpass', lpHz, 0.7);
+        src.connect(lp).connect(g).connect(this._bus);
+      } else {
+        src.connect(g).connect(this._bus);
+      }
+
+      const off = Math.max(0, fin(opts.startOffset, 0));
+      const dur = fin(opts.duration, 0);
+      if (dur > 0.02) src.start(t0, off, dur);
+      else src.start(t0, off);
+      return true;
+    } catch (err) {
+      return false;
     }
   }
 
@@ -171,6 +271,7 @@ export class CombatAudio {
       this._target(this._seekerGain.gain, 0, now, 0.06);
       this._target(this._seekerNoiseGain.gain, 0, now, 0.06);
       this._target(this._lockGain.gain, 0, now, 0.04);
+      if (this._aim9SampleGain) this._target(this._aim9SampleGain.gain, 0, now, 0.06);
       this._target(this._rwrGain.gain, 0, now, 0.04);
       this._target(this._breathGain.gain, 0, now, 0.06);
       return;
@@ -184,44 +285,69 @@ export class CombatAudio {
     const rwr = this._normRwr(s.rwrHighest);
 
     // ------------------------------------------------------- Sidewinder
-    this._freqTarget(this._seekerOsc.frequency, 220 * (1 + 0.004 * Math.sin(this._t * 7.3)), now, 0.06);
-    this._freqTarget(this._seekerOsc2.frequency, 223.7 * (1 + 0.004 * Math.sin(this._t * 6.1 + 1.2)), now, 0.06);
-    this._freqTarget(this._lockOsc.frequency, 880, now, 0.02);
-    this._target(this._seekerGain.gain, lockOn ? 0.024 : (aim9 ? 0.10 : 0), now, 0.06);
-    this._target(this._seekerNoiseGain.gain, aim9 && !lockOn ? 0.030 : 0, now, 0.06);
-    this._target(this._lockGain.gain, lockOn ? 0.075 : 0, now, 0.02);
+    if (this._aim9SampleGain && this._aim9SampleSrc) {
+      // Real F-16 AIM-9 growl sample; pitch rises sharply on IR heat lock.
+      this._target(this._aim9SampleGain.gain, aim9 ? (lockOn ? 0.22 : 0.14) : 0, now, 0.05);
+      if (this._aim9SampleSrc.playbackRate) {
+        this._target(this._aim9SampleSrc.playbackRate, lockOn ? 1.68 : 1.0, now, 0.05);
+      }
+      this._target(this._seekerGain.gain, 0, now, 0.05);
+      this._target(this._seekerNoiseGain.gain, 0, now, 0.05);
+      this._target(this._lockGain.gain, lockOn ? 0.032 : 0, now, 0.02);
+    } else {
+      this._freqTarget(this._seekerOsc.frequency, 220 * (1 + 0.004 * Math.sin(this._t * 7.3)), now, 0.06);
+      this._freqTarget(this._seekerOsc2.frequency, 223.7 * (1 + 0.004 * Math.sin(this._t * 6.1 + 1.2)), now, 0.06);
+      this._freqTarget(this._lockOsc.frequency, 880, now, 0.02);
+      this._target(this._seekerGain.gain, lockOn ? 0.024 : (aim9 ? 0.10 : 0), now, 0.06);
+      this._target(this._seekerNoiseGain.gain, aim9 && !lockOn ? 0.030 : 0, now, 0.06);
+      this._target(this._lockGain.gain, lockOn ? 0.075 : 0, now, 0.02);
+    }
 
     // ------------------------------------------------------- RWR
     this._pingCd -= step;
     this._lockCd -= step;
     this._warbleT -= step;
+    this._rwrLaunchCd -= step;
 
     if (rwr === 'LAUNCH') {
-      this._target(this._rwrGain.gain, 0.058, now, 0.03);
-      if (this._warbleT <= 0) {
-        this._warbleHi = !this._warbleHi;
-        this._freqTarget(this._rwrOsc.frequency, this._warbleHi ? 1440 : 620, now, 0.012);
-        this._warbleT = 0.13;
+      if (this._samples.has('rwr_sam_launch')) {
+        this._target(this._rwrGain.gain, 0, now, 0.04);
+        if (this._rwrLaunchCd <= 0) {
+          this._playSample('rwr_sam_launch', { gain: 0.42, jitter: 0 });
+          this._rwrLaunchCd = 1.65;
+        }
+      } else {
+        this._target(this._rwrGain.gain, 0.058, now, 0.03);
+        if (this._warbleT <= 0) {
+          this._warbleHi = !this._warbleHi;
+          this._freqTarget(this._rwrOsc.frequency, this._warbleHi ? 1440 : 620, now, 0.012);
+          this._warbleT = 0.13;
+        }
+        if (this._rwrPrev !== 'LAUNCH') this._launchAlarm(now);
       }
-      if (this._rwrPrev !== 'LAUNCH') this._launchAlarm(now);
     } else if (rwr === 'LOCK') {
       this._target(this._rwrGain.gain, 0, now, 0.05);
       if (this._lockCd <= 0) {
-        this._tripleChirp(now);
+        if (!this._playSample('rwr_new', { gain: 0.34, rate: 1.25, jitter: 0 })) {
+          this._tripleChirp(now);
+        }
         this._lockCd = 0.95;
         this._pingCd = Math.max(this._pingCd, 0.6);
       }
     } else if (rwr === 'SEARCH') {
       this._target(this._rwrGain.gain, 0, now, 0.05);
       if (this._pingCd <= 0) {
-        this._beep(1180, 0.055, 0.032, 'sine', now);
-        this._pingCd = 1.15;
+        if (!this._playSample('rwr_new', { gain: 0.24, rate: 1.0, jitter: 0 })) {
+          this._beep(1180, 0.055, 0.032, 'sine', now);
+        }
+        this._pingCd = 1.6;
       }
     } else {
       this._target(this._rwrGain.gain, 0, now, 0.06);
       this._pingCd = 0;
       this._lockCd = 0;
       this._warbleT = 0;
+      this._rwrLaunchCd = 0;
     }
     this._rwrPrev = rwr;
 
@@ -244,6 +370,7 @@ export class CombatAudio {
   // -------------------------------------------------------------------------
   cannonShot() {
     if (!this._ready()) return;
+    if (this._playSample('vulcan', { gain: 0.48, rate: 1.0, jitter: 0.055 })) return;
     const t0 = this._now();
 
     // Low-mid bark.
@@ -279,6 +406,9 @@ export class CombatAudio {
 
   missileLaunch() {
     if (!this._ready()) return;
+    const playedMain = this._playSample('missile_launch', { gain: 0.64, rate: 1.0, jitter: 0.04, duration: 2.2 });
+    const playedPop = this._playSample('aim_launch_pop', { gain: 0.45, rate: 1.0, jitter: 0.04 });
+    if (playedMain || playedPop) return;
     const t0 = this._now();
 
     // Rocket ignition crack.
@@ -313,6 +443,7 @@ export class CombatAudio {
 
   bombRelease() {
     if (!this._ready()) return;
+    if (this._playSample('bomb_release', { gain: 0.62, rate: 1.0, jitter: 0.04 })) return;
     const t0 = this._now();
 
     const clunk = this._osc('sine', 108);
@@ -344,6 +475,7 @@ export class CombatAudio {
 
   flarePop() {
     if (!this._ready()) return;
+    if (this._playSample('flare_pop', { gain: 0.56, rate: 1.0, jitter: 0.06 })) return;
     const t0 = this._now();
 
     const pop = this._noiseSrc(false);
@@ -379,6 +511,10 @@ export class CombatAudio {
     const t0 = this._now();
     const d = Math.max(0, fin(distanceM, 0));
     const att = clamp(1 / (1 + d / 240), 0.04, 1);
+    const lpHz = clamp(14000 / (1 + d / 320), 420, 14000);
+    this._expToggle = 1 - this._expToggle;
+    const key = this._expToggle === 0 && this._samples.has('explosion_heavy') ? 'explosion_heavy' : 'explosion';
+    if (this._playSample(key, { gain: 0.85 * att, rate: 0.96, jitter: 0.08, lowpassHz: lpHz })) return;
 
     const boom = this._noiseSrc(false);
     if (boom) {
@@ -410,6 +546,7 @@ export class CombatAudio {
 
   sonicBoom() {
     if (!this._ready()) return;
+    if (this._playSample('sonic_boom', { gain: 0.78, rate: 1.0, jitter: 0.03 })) return;
     const t0 = this._now();
 
     // Double N-wave pressure crack.
@@ -440,6 +577,12 @@ export class CombatAudio {
       tail.connect(lp).connect(g).connect(this._bus);
       this._playNoise(tail, t0, end, 0.66);
     }
+  }
+
+  boomContact() {
+    if (!this._ready()) return;
+    if (this._playSample('boom_contact', { gain: 0.58, jitter: 0 })) return;
+    this.radioBeep();
   }
 
   radioBeep() {
