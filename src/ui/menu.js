@@ -43,6 +43,8 @@ const KEY_ROWS = [
   [
     { k: 'CTRL', s: 'THR-', c: 'flt', w: 1.6 },
     { k: 'SPACE', s: 'FIRE WEAPON', c: 'cbt', w: 4.2 },
+    { k: 'F5', s: 'WPN CAM', c: 'wld', w: 1.6 },
+    { k: 'F6', s: 'PHOTO', c: 'wld', w: 1.4 },
     { k: 'ESC', s: 'PAUSE', c: 'sys', w: 1.5 },
   ],
 ];
@@ -94,6 +96,8 @@ const CONTROL_GROUPS = [
       [['Y', 'U'], 'Weather / wind'],
       [['T'], 'Time scale'],
       [['[', ']'], 'Time − / + 1h'],
+      [['F5'], 'Weapon follow-cam'],
+      [['F6'], 'Photo mode / PNG'],
       [['F2', 'F4'], 'Replay / replay speed'],
       [['F1', 'F3'], 'Hide UI / Perf'],
     ],
@@ -152,12 +156,13 @@ export class UI {
     renderControlMap(this.$('menu-control-map'));
     renderControlMap(this.$('pause-control-map'));
 
+    // Feature 33: Vipava Valley golden hour is the default showcase.
     this.mission = 'free';
-    this.theater = 'temperate';
+    this.theater = 'vipava';
     this.weather = 'few';
     this.wind = 'auto';
     this.quality = 'medium';
-    this.hour = 15.5;
+    this.hour = 17.6;
 
     this._bindPills('opt-mission', (v) => { this.mission = v; this.cb.onMission?.(v); });
     this._bindPills('opt-theater', (v) => { this.theater = v; this.cb.onTheater?.(v); });
@@ -172,6 +177,13 @@ export class UI {
     this.$('menu-btn').addEventListener('click', () => this.cb.onMenu?.());
     this.$('help-close').addEventListener('click', () => this.hideHelp());
     this.$('crash-reset').addEventListener('click', () => this.cb.onRespawn?.());
+
+    // Feature 33: floating Photo Mode bar (hidden unless Photo Mode is active).
+    this.photoBar = this.$('photo-bar');
+    this.photoSave = this.$('photo-save');
+    this.photoExit = this.$('photo-exit');
+    this.photoSave?.addEventListener('click', () => this.cb.onPhotoSave?.());
+    this.photoExit?.addEventListener('click', () => this.cb.onPhotoExit?.());
 
     this._toastTimer = null;
     this._toastQueue = [];
@@ -237,6 +249,12 @@ export class UI {
 
   hideCrash() {
     this.crash.classList.add('hidden');
+  }
+
+  /** Feature 33: show / hide the floating Photo Mode bar. */
+  showPhotoBar(on) {
+    if (!this.photoBar) return;
+    this.photoBar.classList.toggle('hidden', !on);
   }
 
   toast(text, ms = 2200) {

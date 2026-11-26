@@ -24,6 +24,10 @@ import { EjectionSystem } from './aircraft/ejection.js';
 import { WeaponSystem } from './combat/weapons.js';
 import { TargetSystem } from './combat/targets.js';
 import { MissionDirector, MISSIONS } from './combat/missions.js';
+import { CanyonRunSystem } from './combat/canyon_run.js';
+import { PostFXSystem } from './sim/postfx.js';
+import { FlightJuiceSystem } from './sim/juice.js';
+import { WeaponCamSystem, PhotoModeController } from './aircraft/weapon_cam.js';
 import { HUD } from './ui/hud.js';
 import { TacticalOverlay } from './ui/tactical.js';
 import { KneeboardMap } from './ui/kneeboard.js';
@@ -121,6 +125,9 @@ class App {
         this.time.setHour(h);
         this.ui.toast('TIME ' + this.time.clock);
       },
+      // Feature 33: floating Photo Mode bar buttons.
+      onPhotoSave: () => this._savePhoto(),
+      onPhotoExit: () => this.exitPhotoMode(),
     });
 
     this.time = new TimeSystem();
@@ -162,6 +169,41 @@ class App {
     this.replay = new ReplaySystem();
     this.hud = new HUD(document.getElementById('hud'));
     this.hud.setVisible(false);
+
+    // Feature 30/32 runtime systems: Soča canyon gates, selective bloom,
+    // flight juice, weapon follow-cam and the frozen-photo camera.
+    this.canyonRun = new CanyonRunSystem(this.scene);
+    this.postfx = new PostFXSystem(this.renderer, this.scene, this.aircraft.camera, {
+      enabled: this.preset.name !== 'low',
+    });
+    this.juice = new FlightJuiceSystem();
+    this.weaponCam = new WeaponCamSystem();
+    this.photoMode = new PhotoModeController();
+    this._canyonState = null;
+    this._juiceState = null;
+    this._weaponCamState = null;
+    this._canyonFinishAnnounced = false;
+    this._photoDrag = null;
+    this.postfx.resize(window.innerWidth, window.innerHeight, this._pixelRatio());
+
+    // Feature 33: Photo Mode drag-orbit. Capture phase, so the canvas never
+    // grabs the pointer lock while the simulation is frozen for the shot.
+    window.addEventListener('mousedown', (e) => {
+      if (!this.photoMode.active || e.button !== 0) return;
+      if (e.target && e.target.closest && e.target.closest('#photo-bar')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this._photoDrag = { x: e.clientX, y: e.clientY };
+    }, true);
+    window.addEventListener('mousemove', (e) => {
+      if (!this._photoDrag) return;
+      const dx = e.clientX - this._photoDrag.x;
+      const dy = e.clientY - this._photoDrag.y;
+      this._photoDrag.x = e.clientX;
+      this._photoDrag.y = e.clientY;
+      this.photoMode.orbit(dx, dy);
+    }, true);
+    window.addEventListener('mouseup', () => { this._photoDrag = null; }, true);
 
     window.addEventListener('resize', () => this.resize());
     window.addEventListener('keydown', (e) => this.onKey(e));
@@ -226,6 +268,17 @@ class App {
       this.clouds.update(0.016, this.camera, this.weather, this.sky);
       await raf();
 
+      // Feature 33: Vipava Valley is the default showcase — stream the real
+      // DEM + OSM extract (traffic included) during boot so the menu opens
+      // over Ajdovščina instead of the procedural placeholder.
+      if (this.ui.theater === 'vipava') {
+        this.ui.setBootProgress(0.96, 'STREAMING VIPAVA VALLEY');
+        await raf();
+        await this.setTheater('vipava');
+        this.aircraft.reset(this.spawn);
+        this._syncAircraftModel();
+      }
+
       this.ui.setBootProgress(1, 'READY');
       await new Promise((r) => setTimeout(r, 260));
       this.ui.hideBoot();
@@ -245,21 +298,29 @@ class App {
     }
   }
 
+  /** Effective device pixel ratio under the active quality preset. */
+  _pixelRatio() {
+    return Math.min(window.devicePixelRatio || 1, this.preset.pixelRatio);
+  }
+
   resize() {
     const w = window.innerWidth;
     const h = window.innerHeight;
     this.renderer.setSize(w, h, false);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, this.preset.pixelRatio));
+    this.renderer.setPixelRatio(this._pixelRatio());
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    // Feature 32: bloom render targets follow the canvas or the glare smears.
+    this.postfx.resize(w, h, this._pixelRatio());
   }
 
   setQuality(name) {
     const q = QUALITY[name];
     if (!q) return;
     this.preset = q;
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, q.pixelRatio));
+    this.renderer.setPixelRatio(this._pixelRatio());
     this.world.setPreset(q);
+    this.postfx.setEnabled(q.name !== 'low');
     this.resize();
     this.ui.toast('QUALITY · ' + name.toUpperCase());
   }
@@ -274,6 +335,10 @@ class App {
     if (!th) return;
     this.sky.setTheater(name);
     this.world.setTheater(name);
+    // Feature 33: the canyon course belongs to the Vipava height field; tear it
+    // down on every theater switch (startFlight re-arms it after the DEM loads).
+    this.canyonRun.stop();
+    this._canyonState = null;
 
     if (name === 'vipava') {
       let dem = null;
@@ -298,6 +363,12 @@ class App {
         setCustomAirports(customAirports);
         this.world.buildings.setCustomBuildings(osm?.buildings || null);
         this.world.roads.setCustomRoads(osm?.roads || null);
+        // Feature 31/33: hand the H4 + valley arteries to the traffic pools so
+        // head/tail-light streaks hug the real asphalt at night.
+        this.world.roadTraffic.setCustomRoads(
+          osm?.roads || [],
+          (x, z) => this.world.heightAt(x, z),
+        );
         // Real OSM rivers/lakes are draped on the freshly active DEM, so the
         // water has to be built after setActiveDEM/setCustomAirports above.
         this.world.inlandWater.setWaterData(water);
@@ -348,6 +419,7 @@ class App {
         setCustomAirports(null);
         this.world.buildings.setCustomBuildings(null);
         this.world.roads.setCustomRoads(null);
+        this.world.roadTraffic.clear();
         this.world.inlandWater.setWaterData(null);
         this.world.landmarks.setLandmarks(null);
         this._vipavaGeoOrigin = null;
@@ -359,6 +431,7 @@ class App {
       setCustomAirports(null);
       this.world.buildings.setCustomBuildings(null);
       this.world.roads.setCustomRoads(null);
+      this.world.roadTraffic.clear();
       this.world.inlandWater.setWaterData(null);
       this.world.landmarks.setLandmarks(null);
       this._vipavaGeoOrigin = null;
@@ -406,6 +479,11 @@ class App {
     this._flameoutNotified = false;
     this._lockedTarget = null;
     this._rwrContacts = [];
+    // Feature 30: the canyon course only exists for the Soča Canyon Run.
+    this._canyonFinishAnnounced = false;
+    if (this.ui.mission === 'soca_run') this.canyonRun.start(this.world);
+    else this.canyonRun.stop();
+    this._canyonState = this.canyonRun.active ? this.canyonRun.getState() : null;
     const specs = this.missions.startMission(this.ui.mission || 'free', spawn, this.world);
     if (specs.length > 0) this.targets.spawnScenario(specs, this.world);
     this._missionSnap = this.missions.update(0, this.aircraft.flight, this.targets.targets, []);
@@ -430,6 +508,33 @@ class App {
     if (code === 'F3') {
       this.debug = !this.debug;
       if (!this.debug) this.ui.setDebug('', false);
+      return;
+    }
+    if (code === 'F5') {
+      e.preventDefault();
+      this.toggleWeaponCam();
+      return;
+    }
+    if (code === 'F6') {
+      e.preventDefault();
+      this.togglePhotoMode();
+      return;
+    }
+    if (this.photoMode.active) {
+      // Simulation is frozen: only the photo rig listens.
+      if (code === 'Escape') { this.exitPhotoMode(); return; }
+      if (code === 'KeyS') { this._savePhoto(); return; }
+      if (code === 'BracketLeft') {
+        this.photoMode.adjustFov(-2);
+        this.ui.toast('FOV · ' + Math.round(this.photoMode.fov) + '°');
+        return;
+      }
+      if (code === 'BracketRight') {
+        this.photoMode.adjustFov(2);
+        this.ui.toast('FOV · ' + Math.round(this.photoMode.fov) + '°');
+        return;
+      }
+      e.preventDefault();
       return;
     }
     if (code === 'F1') {
@@ -469,6 +574,84 @@ class App {
       else if (this.mode === 'pause') this.resume();
       return;
     }
+  }
+
+  /** F5: weapon follow-cam rides the last live round to its impact. */
+  toggleWeaponCam() {
+    if (this.mode !== 'fly') {
+      this.ui.toast('WEAPON CAM · AVAILABLE IN FLIGHT');
+      return;
+    }
+    const on = this.weaponCam.toggle();
+    this.audio.click();
+    this.ui.toast(on ? 'WEAPON CAM · ON — F5 TO RELEASE' : 'WEAPON CAM · OFF');
+  }
+
+  /** F6: freeze the sim and orbit a detached camera for the snapshot. */
+  togglePhotoMode() {
+    if (this.photoMode.active) {
+      this.exitPhotoMode();
+      return;
+    }
+    if (this.mode !== 'fly') return;
+    const f = this.aircraft.flight;
+    const cam = this.camera;
+    const dx = cam.position.x - f.position.x;
+    const dz = cam.position.z - f.position.z;
+    const horiz = Math.hypot(dx, dz);
+    const yaw = horiz > 1e-3 ? Math.atan2(dx, dz) : 0;
+    const pitch = Math.atan2(cam.position.y - f.position.y, Math.max(horiz, 1e-3));
+    this.photoMode.enter(f.position, yaw, clamp(pitch, -1.3, 1.3));
+    this.photoMode.dist = clamp(horiz, 18, 90);
+    this.photoMode.fov = cam.fov;
+    cam.up.set(0, 1, 0);
+    this.input.releasePointerLock();
+    this._photoDrag = null;
+    if (this.kneeboard.visible) this.kneeboard.toggle();
+    this.hud.setVisible(false);
+    this.ui.showPhotoBar(true);
+    this.audio.click();
+    this.ui.toast('PHOTO MODE · DRAG ORBIT · SCROLL ZOOM · [ ] FOV · S SNAPSHOT');
+  }
+
+  /** Leave Photo Mode, restore the live view and hand the jet back. */
+  exitPhotoMode(silent = false) {
+    if (!this.photoMode.active) return;
+    this.photoMode.exit();
+    this._photoDrag = null;
+    this.camera.up.set(0, 1, 0);
+    // Restore the FOV / near plane of the active chase or cockpit view.
+    this.aircraft.setMode(this.aircraft.mode);
+    this.ui.showPhotoBar(false);
+    this.hud.setVisible(!this.uiHidden);
+    if (!silent) {
+      this.audio.click();
+      this.ui.toast('PHOTO MODE · OFF');
+      this.input.requestPointerLock();
+    }
+    this.last = performance.now();
+  }
+
+  /** Wheel-zoom the photo rig and re-place its camera on the orbit shell. */
+  _updatePhotoMode(dt) {
+    const wheel = this.input.mouse.wheel;
+    if (wheel) this.photoMode.zoom(-wheel * 0.6);
+    this.photoMode.updateCamera(this.camera, dt);
+  }
+
+  /**
+   * Snapshot the frozen frame. The WebGL drawing buffer is cleared when the
+   * browser presents, so the scene is rendered synchronously here and the
+   * canvas is read in the same task — the PNG is never blank.
+   */
+  _savePhoto() {
+    if (!this.photoMode.active) return null;
+    this.postfx.render(this.scene, this.camera);
+    const n = this.photoMode.snapshotCount + 1;
+    const url = this.photoMode.captureSnapshot(this.canvas, `falcon-infinite-vipava-${n}.png`);
+    this.audio.click();
+    this.ui.toast(url ? 'SNAPSHOT · PNG SAVED' : 'SNAPSHOT · FAILED');
+    return url;
   }
 
   /** F2: start / stop the instant replay. F4 cycles its playback rate. */
@@ -525,10 +708,12 @@ class App {
     this.audio.resetEngine();
     this.audio.setPaused(false);
     // Wait for the baked theater (DEM + OSM) so the spawn is the real runway.
-    await this.setTheater(this.ui.theater || 'temperate');
+    await this.setTheater(this.ui.theater || 'vipava');
     this.aircraft.setMode('cockpit');
-    this.aircraft.reset(this.spawn);
-    this._startActiveMission(this.spawn);
+    // Feature 30: the Soča Canyon Run starts airborne right outside Gate 1.
+    const spawn = this.ui.mission === 'soca_run' ? this._socaRunSpawn() : this.spawn;
+    this._placeAtSpawn(spawn);
+    this._startActiveMission(spawn);
     this.ui.hideMenu();
     this.ui.hidePause();
     this.ui.hideCrash();
@@ -617,11 +802,78 @@ class App {
     };
   }
 
+  /**
+   * Feature 30/33: flying start for the Soča Canyon Run. Spawns already
+   * airborne west of LJAJ, 185 m/s, heading 270 so Gate 1 is dead ahead.
+   */
+  _socaRunSpawn() {
+    return {
+      x: 200,
+      y: 230,
+      z: 0,
+      alt: 230,
+      heading: 270,
+      speed: 185,
+      airborne: true,
+    };
+  }
+
+  /**
+   * Place the jet on any spawn point. Airborne spawns arrive clean: gear up,
+   * throttle set, and the velocity vector pointing down the nose.
+   */
+  _placeAtSpawn(sp) {
+    const spawn = Number.isFinite(sp.y)
+      ? sp
+      : { ...sp, y: (sp.alt ?? 0) + CONFIG.aircraft.gearHeight };
+    const f = this.aircraft.flight;
+    this.aircraft.reset(spawn);
+    if (sp.airborne) {
+      f.gearDown = false;
+      f.gearPos = 0;
+      f.gearTarget = 0;
+      f.onGround = false;
+      f.throttle = 0.85;
+      f.targetThrottle = 0.85;
+      f.speed = sp.speed;
+      f.velocity.copy(f.forward).multiplyScalar(sp.speed);
+      this._syncAircraftModel();
+    }
+    return f;
+  }
+
+  /**
+   * Feature 30: steerpoint snapshot for the next canyon gate, shaped exactly
+   * like the mission steerpoint the HUD / tactical overlay already consume.
+   */
+  _gateSteerpoint(gate, f, t = null) {
+    const dx = gate.x - f.position.x;
+    const dz = gate.z - f.position.z;
+    const distM = Math.hypot(dx, dz);
+    const heading = Number.isFinite(t?.heading) ? t.heading : f.heading;
+    const brg = (Math.atan2(dx, -dz) * 180 / Math.PI + 360) % 360;
+    const idx = (this._canyonState?.gateIndex ?? 0) + 1;
+    const total = this._canyonState?.totalGates ?? 8;
+    return {
+      label: 'GATE ' + Math.min(idx, total) + ' · ' + (gate.name || 'SKY GATE'),
+      kind: 'GATE',
+      x: gate.x,
+      y: gate.y,
+      z: gate.z,
+      bearingDeg: brg,
+      relBearingDeg: ((brg - heading + 540) % 360) - 180,
+      distanceM: distM,
+      distanceNm: distM / 1852,
+      etaSec: distM / Math.max(f.speed, 40),
+    };
+  }
+
   respawn() {
     const f = this.aircraft.flight;
-    const ap = airportNear(f.position.x, f.position.z, 80000);
-    const sp = this.spawnForAirport(ap);
-    this.aircraft.reset(sp);
+    const socaRun = this.ui.mission === 'soca_run';
+    const ap = socaRun ? null : airportNear(f.position.x, f.position.z, 80000);
+    const sp = socaRun ? this._socaRunSpawn() : this.spawnForAirport(ap);
+    this._placeAtSpawn(sp);
     this.aircraft.setMode('cockpit');
     this._startActiveMission(sp);
     this.audio.resetEngine();
@@ -632,18 +884,30 @@ class App {
     this.mode = 'fly';
     this._crashTimer = 0;
     this.input.requestPointerLock();
-    this.ui.toast('RESET · ' + (ap ? ap.name.toUpperCase() : 'RUNWAY'));
+    this.ui.toast('RESET · ' + (socaRun
+      ? 'SOČA CANYON START'
+      : (ap ? ap.name.toUpperCase() : 'RUNWAY')));
   }
 
   returnToMenu() {
     this.mode = 'menu';
     this.audio.setPaused(true);
+    // Feature 30/32/33: tear down every in-flight overlay system before the
+    // menu flyover takes the camera back.
+    this.canyonRun.stop();
+    this._canyonState = null;
+    this._canyonFinishAnnounced = false;
+    this.exitPhotoMode(true);
+    this.weaponCam.reset();
+    this._weaponCamState = null;
+    this.juice.reset();
+    this._juiceState = null;
     this.ui.showMenu();
     this.ui.hidePause();
     this.ui.hideCrash();
     this.hud.setVisible(false);
     this.input.releasePointerLock();
-    this.aircraft.reset(this.spawn);
+    this._placeAtSpawn(this.spawn);
     this.aircraft.setMode('cockpit');
   }
 
@@ -756,6 +1020,13 @@ class App {
   }
 
   update(dt) {
+    // Feature 32: Photo Mode freezes the whole simulation — only the orbit rig
+    // and the render loop keep running.
+    if (this.photoMode.active) {
+      this._updatePhotoMode(dt);
+      return;
+    }
+
     const simDt = Math.min(dt, 0.05);
     const fly = this.mode === 'fly';
     const menu = this.mode === 'menu';
@@ -807,6 +1078,7 @@ class App {
         if (cRes.catapultLaunched) {
           this.ui.toast('CATAPULT · LAUNCH!');
           this.vfx.spawnTireSmoke(f.position, 1.4);
+          this.juice.addImpulse(0.42, 0.35);
         }
 
         if (f.touchdown > 0.2) {
@@ -827,6 +1099,39 @@ class App {
           }
         }
         if (f.crashed && this.mode === 'fly' && !this.ejection.active) this.onCrash();
+      }
+
+      // Feature 32: flight juice — G-LOC, G-strain, Mach crossing and recoil.
+      const mach = Number.isFinite(f.mach) ? f.mach : f.speed / 340.3;
+      this._juiceState = this.juice.update(simDt, {
+        gLoad: f.gLoad,
+        mach,
+        afterburner: f.afterburner,
+        onGround: f.onGround,
+        speed: f.speed,
+      });
+      if (this._juiceState.shockwaveCrossed) {
+        this.postfx.pulseBloom(0.45);
+        const boom = this.combatAudio.playSonicBoom || this.combatAudio.sonicBoom;
+        boom?.call(this.combatAudio);
+      }
+
+      // Feature 30: Soča Canyon gates — one pass per frame, gate index to HUD.
+      if (this.canyonRun.active) {
+        const cr = this.canyonRun.update(simDt, f.position, f.speed);
+        this._canyonState = this.canyonRun.getState();
+        if (cr.gatePassed) {
+          this.audio.click();
+          this.ui.toast('GATE ' + this._canyonState.gateIndex + '/'
+            + this._canyonState.totalGates + ' · ' + cr.gatePassed.name);
+          this.postfx.pulseBloom(0.28);
+        }
+        if (cr.finished && !this._canyonFinishAnnounced) {
+          this._canyonFinishAnnounced = true;
+          this.ui.toast('COURSE COMPLETE · ' + cr.medal + ' MEDAL');
+          this.betty.announce('Course complete, ' + cr.medal + ' medal');
+          this.postfx.pulseBloom(0.5);
+        }
       }
     } else if (menu) {
       this.aircraft.update(simDt, NEUTRAL_CMD, this.weather, this.input, false);
@@ -854,14 +1159,19 @@ class App {
             if (fired.type === 'GUN') {
               this.combatAudio.cannonShot();
               this.vfx.triggerMuzzleFlash(f);
+              this.juice.addImpulse(0.16, 0.14);
             } else if (fired.type === 'AIM9') {
               this.combatAudio.missileLaunch();
+              this.juice.addImpulse(0.28, 0.22);
               this.ui.toast('FOX 2 · AIM-9 AWAY');
             } else if (fired.type === 'MK82') {
               this.combatAudio.bombRelease();
+              this.juice.addImpulse(0.28, 0.22);
               this.ui.toast('PICKLE · MK-82 AWAY');
             } else if (fired.type === 'BFFG') {
               this.combatAudio.bffgFire();
+              this.juice.addImpulse(0.48, 0.35);
+              this.postfx.pulseBloom(0.5);
               this.ui.toast('BFFG AWAY — BRACE FOR IMPACT!!');
             }
           }
@@ -888,6 +1198,9 @@ class App {
               ev.position.y - f.position.y,
               ev.position.z - f.position.z,
             );
+            // Feature 32: distance-scaled blast shake plus a bloom spike.
+            this.juice.addImpulse(clamp(1 - dist / 900, 0, 1) * 0.9, 0.38);
+            this.postfx.pulseBloom(isBffg ? 0.75 : 0.45);
             if (isBffg) this.combatAudio.megaExplosion(dist);
             else if (ev.weapon !== 'GUN' || ev.hitTargetId) this.combatAudio.explosion(dist);
             const destroyed = this.targets.applyImpact(ev);
@@ -1045,6 +1358,10 @@ class App {
       t.replayRate = this.replay.playbackRate;
       t.replayTime = this.replay.playTime;
       t.replayDuration = this.replay.duration;
+      // Feature 32/30: juice vignettes, canyon strip and weapon-cam banner.
+      t.juice = this._juiceState;
+      t.canyon = this._canyonState;
+      t.weaponCam = this._weaponCamState;
 
       // Kneeboard diversion: a picked airport becomes the active steerpoint on
       // free flight (or whenever the mission has none of its own).
@@ -1057,13 +1374,36 @@ class App {
           kind: 'DIVERT',
         }
         : null;
-      const steerpoint = divert || this._missionSnap?.steerpoint || null;
-      const missionState = divert ? { ...this._missionSnap, steerpoint } : this._missionSnap;
+      // Feature 30: while the canyon run is live the steerpoint box rides the
+      // next sky gate instead of the mission objective.
+      const canyonSteer = (this._canyonState?.active && this._canyonState.nextGate)
+        ? this._gateSteerpoint(this._canyonState.nextGate, f, t)
+        : null;
+      const steerpoint = canyonSteer || divert || this._missionSnap?.steerpoint || null;
+      const missionState = (canyonSteer || divert)
+        ? { ...this._missionSnap, steerpoint }
+        : this._missionSnap;
 
       // Cloud-entry mist washes the view; smooth it so deck entry is not a pop.
       const mistTarget = this.clouds.getCloudDensity(this.camera.position, this.weather);
       this._cloudMist += (mistTarget - this._cloudMist) * (1 - Math.exp(-2.5 * simDt));
       if (mistTarget === 0 && this._cloudMist < 0.002) this._cloudMist = 0;
+
+      // Feature 32: the weapon follow-cam takes the camera AFTER the aircraft
+      // camera has placed it this frame; otherwise it reports idle.
+      if (this.weaponCam.active) {
+        this._weaponCamState = this.weaponCam.update(simDt, this.camera, this.weapons, f.position);
+      } else {
+        this._weaponCamState = null;
+      }
+
+      // Recoil / G / Mach shake, never applied in Photo Mode (handled above).
+      const juice = this._juiceState;
+      if (juice) {
+        this.camera.position.x += juice.shakeX * 1.6;
+        this.camera.position.y += juice.shakeY * 1.6;
+        this.camera.rotation.z += juice.shakeRoll;
+      }
 
       this.camera.updateMatrixWorld();
       this.hud.update(simDt, t, {
@@ -1175,7 +1515,9 @@ class App {
     this.fps = this.fps * 0.94 + (1 / dt) * 0.06;
 
     if (this.ready) this.update(dt);
-    this.renderer.render(this.scene, this.camera);
+    this.postfx.setNight(this.sky.night);
+    this.postfx.update(dt);
+    this.postfx.render(this.scene, this.camera);
     this.input.endFrame();
   }
 }

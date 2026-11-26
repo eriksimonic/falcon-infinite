@@ -101,8 +101,11 @@ export class LandmarkSystem {
     this.landmarks = [];
     this.group = this.scene ? new THREE.Group() : null;
     this._beacons = [];
+    // Night-only parts (facade washes, obstruction beacons, lighthouse beam).
+    this._uplights = [];
+    this._night = 0;
     this._time = 0;
-    this.stats = { landmarks: 0, beacons: 0 };
+    this.stats = { landmarks: 0, beacons: 0, uplights: 0, night: 0 };
 
     // Shared unit geometries, created lazily the first time a mesh is built
     // and disposed only by dispose() (clear() reuses them).
@@ -140,35 +143,92 @@ export class LandmarkSystem {
 
     this.stats.landmarks = this.landmarks.length;
     this.stats.beacons = this._beacons.length;
+    this.stats.uplights = this._uplights.length;
+    this.stats.night = this._night;
     return this.landmarks.length;
   }
 
-  /** Blink aviation strobes and pulse lighthouse beacons. */
-  update(dt) {
+  /**
+   * Set the dusk/night factor directly (0 = day, 1 = full night) and apply the
+   * warm uplighting, obstruction beacons and lighthouse beam immediately.
+   * `update(dt, night)` calls this for you.
+   */
+  setNight(night) {
+    const n = Number(night);
+    this._night = Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0;
+    this._applyNight();
+    return this._night;
+  }
+
+  /** Blink aviation strobes, pulse beacons and drive the night uplighting. */
+  update(dt, night = null) {
     const step = Number.isFinite(dt) ? Math.max(0, dt) : 0;
     this._time += step;
 
     for (const b of this._beacons) {
       if (b.kind === 'aviation') {
-        // Hard red strobe: ~1 Hz on/off with a touch of rise/fall.
+        // Hard red strobe: ~1 Hz on/off with a touch of rise/fall. At night it
+        // swells and burns brighter so the Nanos mast is an unmistakable
+        // valley-wide navigation marker.
         const phase = Math.sin(this._time * b.speed + b.phase);
         const on = phase > 0.15;
         b.mesh.visible = on;
-        if (b.material) b.material.emissiveIntensity = on ? 2.6 : 0.05;
-        b.mesh.scale.setScalar(on ? 1.15 : 0.85);
+        if (b.material) {
+          b.material.emissiveIntensity = (on ? 2.6 : 0.05) * (1 + this._night * 1.3);
+        }
+        b.mesh.scale.setScalar((on ? 1.15 : 0.85) * (1 + this._night * 0.4));
       } else {
         // Lighthouse: slow white pulse with an expanding halo.
         const pulse = 0.5 + 0.5 * Math.sin(this._time * b.speed + b.phase);
         if (b.material) {
-          b.material.opacity = 0.35 + 0.6 * pulse;
-          if ('emissiveIntensity' in b.material) b.material.emissiveIntensity = 0.6 + 2.4 * pulse;
+          b.material.opacity = Math.min(1, (0.35 + 0.6 * pulse) * (0.8 + 0.35 * this._night));
+          if ('emissiveIntensity' in b.material) {
+            b.material.emissiveIntensity = (0.6 + 2.4 * pulse) * (1 + this._night * 0.8);
+          }
         }
-        b.mesh.scale.setScalar(1 + 0.3 * pulse);
+        b.mesh.scale.setScalar((1 + 0.3 * pulse) * (1 + this._night * 0.5));
         if (b.halo) {
-          b.halo.scale.setScalar(1.4 + 1.5 * pulse);
-          if (b.halo.material) b.halo.material.opacity = 0.05 + 0.28 * pulse;
+          b.halo.scale.setScalar((1.4 + 1.5 * pulse) * (1 + this._night * 0.6));
+          if (b.halo.material) {
+            b.halo.material.opacity = (0.05 + 0.28 * pulse) * (0.9 + this._night * 0.9);
+          }
         }
       }
+    }
+
+    if (night !== null && night !== undefined) {
+      const n = Number(night);
+      this._night = Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0;
+    }
+    this._applyNight();
+  }
+
+  /**
+   * Apply the current `_night` value to every night-only part. Below 0.15
+   * (daytime) everything is hidden, so the added geometry costs no draw calls.
+   */
+  _applyNight() {
+    const n = this._night;
+    const active = n > 0.15;
+    this.stats.night = n;
+    for (const u of this._uplights) {
+      if (u.kind === 'beam') {
+        // Rotating white lighthouse beam sweeping the Gulf of Trieste.
+        u.mesh.rotation.y = this._time * 0.9;
+        u.material.opacity = active ? 0.08 + 0.30 * n : 0;
+        u.mesh.visible = u.material.opacity > 0.002;
+        continue;
+      }
+      if (u.kind === 'obstruction') {
+        const pulse = 0.5 + 0.5 * Math.sin(this._time * u.speed + u.phase);
+        const on = active && pulse > 0.2;
+        u.material.opacity = on ? 0.35 + 0.65 * pulse : 0;
+        u.mesh.visible = on;
+        continue;
+      }
+      // Warm stone wash: emissive gold scaled by night * 0.45.
+      u.material.opacity = active ? u.strength * n * 0.45 : 0;
+      u.mesh.visible = u.material.opacity > 0.002;
     }
   }
 
@@ -185,12 +245,17 @@ export class LandmarkSystem {
       b.material?.dispose();
       b.halo?.material?.dispose();
     }
+    // Night washes / obstruction beacons / lighthouse beams own their materials
+    // too (each fades independently), so release them here as well.
+    for (const u of this._uplights) u.material?.dispose();
+    this._uplights.length = 0;
     for (const material of this._materials.values()) material.dispose();
     this._materials.clear();
     this._beacons.length = 0;
     this.landmarks = [];
     this.stats.landmarks = 0;
     this.stats.beacons = 0;
+    this.stats.uplights = 0;
   }
 
   /** Detach the system from the scene and free everything. */
@@ -322,8 +387,122 @@ export class LandmarkSystem {
     }
 
     lm.object = obj;
+    if (this.group) this._addNightGlow(obj, lm);
     this.group.add(obj);
     return obj;
+  }
+
+  /**
+   * Night-only dressing for one landmark: a warm gold facade wash (churches,
+   * castles, the Solkan arches), red obstruction beacons on the Nanos mast and
+   * a rotating white beam on the Trieste lighthouse. Everything is created at
+   * opacity 0 and only switched on by `_applyNight()` after dusk, so daytime
+   * frames pay nothing.
+   */
+  _addNightGlow(parent, lm) {
+    // Shared unit cube, scaled per part; no per-landmark geometry to free.
+    const boxGeo = this._resources().box;
+
+    const addWash = (x, y, z, w, h, d, strength) => {
+      const material = new THREE.MeshBasicMaterial({
+        color: 0xffb860,
+        transparent: true,
+        opacity: 0,
+        toneMapped: false,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      });
+      const mesh = new THREE.Mesh(boxGeo, material);
+      mesh.position.set(x, y, z);
+      mesh.scale.set(w, h, d);
+      mesh.visible = false;
+      mesh.renderOrder = 3;
+      parent.add(mesh);
+      this._uplights.push({ kind: 'wash', mesh, material, strength });
+      return mesh;
+    };
+
+    const addObstruction = (y, radius, phase) => {
+      const material = new THREE.MeshBasicMaterial({
+        color: COL.beaconRed,
+        toneMapped: false,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+      });
+      const mesh = new THREE.Mesh(this._resources().sphere, material);
+      mesh.position.set(0, y, 0);
+      mesh.scale.setScalar(radius);
+      mesh.visible = false;
+      parent.add(mesh);
+      this._uplights.push({ kind: 'obstruction', mesh, material, phase, speed: 2.4 });
+    };
+
+    switch (lm.kind) {
+      case 'church': {
+        // Sveta Gora / Kostanjevica: warm wash up the nave walls and campanile.
+        const s = lm.scale;
+        const naveW = 15 * s;
+        const naveH = 11 * s;
+        const naveD = 28 * s;
+        const towerW = 7 * s;
+        const towerH = 30 * s;
+        const tz = -naveD * 0.5 - towerW * 0.5 - 1;
+        addWash(0, naveH * 0.42 + 1, 0, naveW + 1.6, naveH * 0.72, naveD + 1.6, 1.0);
+        addWash(0, towerH * 0.45, tz, towerW + 1.4, towerH * 0.8, towerW + 1.4, 0.75);
+        break;
+      }
+      case 'castle': {
+        // Gorizia / Predjama / Štanjel: curtain walls plus the central keep.
+        const s = lm.scale;
+        const yard = 32 * s;
+        const wallH = 9 * s;
+        const keepW = 14 * s;
+        const keepH = 20 * s;
+        addWash(0, (wallH + 2.2) * 0.5, 0, yard + 7, wallH + 2, yard + 7, 0.6);
+        addWash(0, keepH * 0.5 + 2, 0, keepW + 2, keepH * 0.8, keepW + 2, 1.0);
+        break;
+      }
+      case 'bridge': {
+        // Solkan arch span: a low glow under the deck so the arches read at night.
+        const length = lm.length || 220;
+        const height = lm.height || 34;
+        const deckW = 9.5 * Math.min(1.4, lm.scale);
+        addWash(0, height * 0.34, 0, length * 0.98, height * 0.62, deckW * 0.7, 0.9);
+        break;
+      }
+      case 'tower': {
+        // Nanos / Pleša: red obstruction beacons at two thirds and the top.
+        const height = lm.height || 90;
+        const phase = lm.phase ?? lm.x * 0.013 + lm.z * 0.007;
+        addObstruction(height * 0.66, 1.15, phase);
+        addObstruction(height * 0.99, 0.95, phase + 1.7);
+        break;
+      }
+      case 'lighthouse': {
+        // Faro della Vittoria: a long rotating white beam at lantern height.
+        const height = lm.height || 60;
+        const shaftH = height * 0.78;
+        const galleryY = shaftH + 3.4;
+        const material = new THREE.MeshBasicMaterial({
+          color: COL.beaconWhite,
+          transparent: true,
+          opacity: 0,
+          toneMapped: false,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+        });
+        const mesh = new THREE.Mesh(boxGeo, material);
+        mesh.position.set(0, galleryY + 3.6, 0);
+        mesh.scale.set(height * 2.4, 1.4, 3.2);
+        mesh.visible = false;
+        parent.add(mesh);
+        this._uplights.push({ kind: 'beam', mesh, material });
+        break;
+      }
+      default:
+        break;
+    }
   }
 
   // White Karst limestone nave, terracotta gable roof, tall campanile with a

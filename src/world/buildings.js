@@ -156,10 +156,24 @@ function makeBuildingMaterial() {
                             clamp(wrap, 0.0, 1.0));
         col = mix(col, skyGlass, glass * 0.62 * day);
 
-        // Night: unlit glass reads as a dark hole, lit offices glow warm.
+        // Night: unlit glass reads as a dark hole, lit rooms glow. Occupancy is
+        // hashed per building so whole blocks wake up together (an office tower
+        // burns bright, a row of houses lights three windows); every window
+        // then picks tungsten / amber / cool office white and its own
+        // brightness, which keeps Ajdovscina, Nova Gorica, Gorizia, Trieste and
+        // Koper looking organic from 3-15 km instead of uniformly tiled.
         col *= 1.0 - glass * 0.55 * uNight;
-        float lit = step(0.55, rnd) * glass;
-        col += vec3(1.0, 0.66, 0.30) * lit * uNight * 2.6;
+        float buildingSeed = h21(floor(vCol.xy * 97.0) + 3.7);
+        float occupancy = 0.45 + 0.20 * buildingSeed; // 45..65% of windows lit
+        float roomSeed = h21(cell * 1.37 + floor(vCol.yz * 71.0) + 11.3);
+        float lit = step(1.0 - occupancy, roomSeed) * glass;
+        float tone = h21(cell * 2.71 + floor(vCol.yz * 131.0) + 5.9);
+        vec3 winColor = mix(vec3(1.0, 0.78, 0.42), vec3(1.0, 0.62, 0.25), step(0.68, tone));
+        winColor = mix(winColor, vec3(0.78, 0.90, 1.0), step(0.92, tone));
+        float brightness = 0.72 + 0.28 * h21(cell * 3.17 + 7.1) + 0.28 * rnd;
+        // 1.45x warm boost at full night so selective bloom picks up the
+        // towns as bright clusters at altitude.
+        col += winColor * lit * uNight * 2.6 * 1.45 * brightness;
 
         // Subtle base ambient occlusion over the bottom 15% of each block.
         col *= mix(0.72, 1.0, smoothstep(0.0, 0.15, vLocal.y));

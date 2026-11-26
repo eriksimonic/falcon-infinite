@@ -11,6 +11,7 @@
 
 import { mulberry32 } from '../world/noise.js';
 import { terrainHeight, airportNear } from '../world/terrain.js';
+import { CANYON_GATES } from './canyon_run.js';
 
 export const MISSIONS = {
   free: {
@@ -38,6 +39,48 @@ export const MISSIONS = {
     briefing: 'Intercept hostile MiG-29 patrol flight before they reach friendly airspace.',
   },
 };
+
+// Feature 30 — bespoke Vipava Valley hero scenarios, anchored to the real
+// baked landmarks of the 100 x 100 km theatre.
+export const VIPAVA_MISSIONS = {
+  soca_run: {
+    id: 'soca_run',
+    label: 'SOČA CANYON RUN',
+    short: 'CANYON',
+    briefing: 'Low-level timed gate run from Ajdovščina through Vogršček, Gorizia, Solkan Bridge & Sveta Gora.',
+    theater: 'vipava',
+  },
+  nanos_sead: {
+    id: 'nanos_sead',
+    label: 'NANOS SEAD',
+    short: 'NANOS',
+    briefing: 'Destroy hostile SA-6 & early-warning radar perched on Nanos ridge and the Vipava H4 Viaduct.',
+    theater: 'vipava',
+  },
+  adriatic_cap: {
+    id: 'adriatic_cap',
+    label: 'ADRIATIC INTERCEPT',
+    short: 'ADRIATIC',
+    briefing: 'Intercept hostile MiG-29 flight sweeping inland from the Gulf of Trieste toward Nova Gorica.',
+    theater: 'vipava',
+  },
+};
+
+// The Vipava scenarios are attached non-enumerably: id lookup (the only path
+// used by MissionDirector, main.js and the MCP bridge) resolves them, while
+// `Object.keys(MISSIONS)` keeps reporting the four core missions that
+// tests/missions_test.mjs pins.
+for (const [id, meta] of Object.entries(VIPAVA_MISSIONS)) {
+  Object.defineProperty(MISSIONS, id, {
+    value: meta,
+    enumerable: false,
+    writable: false,
+    configurable: true,
+  });
+}
+
+// Nova Gorica town centre — the Adriatic intercept flow's inland aimpoint.
+const NOVA_GORICA = { x: -18000, z: -7000 };
 
 // Tactical radio cadence.
 const RADIO_TTL = 7.5; // seconds each message stays readable
@@ -156,6 +199,9 @@ export class MissionDirector {
     this.targetSpecs = [];
     this.radio = [];
     this.steerpoint = null;
+    // Canyon-run sorties keep their steerpoint glued to the next sky gate
+    // instead of a hostile objective.
+    this.canyonSteer = null;
     this.home = { label: 'HOME PLATE', x: 0, y: 0, z: 0, heading: 0 };
     this._clock = 0;
     this._lastLaunchWarn = -Infinity;
@@ -238,6 +284,56 @@ export class MissionDirector {
       addBandit(8000, 13000);
       addBandit(8000, 13000);
       addBandit(8000, 13000);
+    } else if (meta.id === 'nanos_sead') {
+      // Real baked coordinates: Nanos broadcast tower, Nanos plateau, the
+      // Vipava H4 Viaduct overlook and the valley logistics site.
+      const addFixed = (kind, label, x, z) => {
+        const spec = {
+          id: `${meta.id}-${kind.toLowerCase()}-${specs.length}`,
+          kind,
+          label,
+          x,
+          z,
+          y: heightAt(x, z),
+        };
+        specs.push(spec);
+        return spec;
+      };
+      addFixed('RADAR', 'NANOS EW RADAR', 12750, 12800);
+      addFixed('SAM', 'SA-6 BATTERY', 13080, 12650);
+      addFixed('SAM', 'SA-6 BATTERY', 4720, 4320);
+      addFixed('DEPOT', 'VIPAVA LOGISTICS', 5200, 4850);
+    } else if (meta.id === 'adriatic_cap') {
+      // Three MiG-29s feet-dry over the Gulf of Trieste, running north-east
+      // toward Nova Gorica.
+      const inbound = [
+        { x: -11000, z: 22000, alt: 1800 },
+        { x: -13500, z: 19500, alt: 2400 },
+        { x: -9000, z: 24000, alt: 2100 },
+      ];
+      for (const p of inbound) {
+        specs.push({
+          id: `${meta.id}-bandit-${specs.length}`,
+          kind: 'BANDIT',
+          label: 'MIG-29',
+          x: p.x,
+          z: p.z,
+          alt: p.alt,
+          heading: bearingDeg(p.x, p.z, NOVA_GORICA.x, NOVA_GORICA.z),
+          destination: { x: NOVA_GORICA.x, z: NOVA_GORICA.z },
+          orbitRadius: 900,
+          speed: 250,
+        });
+      }
+    } else if (meta.id === 'soca_run') {
+      // Pure high-speed canyon race: no hostiles, steerpoint on Gate 1.
+      const g0 = CANYON_GATES[0];
+      this.canyonSteer = {
+        label: `GATE 1 · ${g0.name}`,
+        x: g0.x,
+        y: heightAt(g0.x, g0.z) + g0.agl,
+        z: g0.z,
+      };
     }
 
     this.targetSpecs = specs;
@@ -311,6 +407,28 @@ export class MissionDirector {
   _openingCallout(missionId, specs, heightAt) {
     if (missionId === 'free') {
       this._push('MAGIC', 'MAGIC: VIPER 1-1, FREE FLIGHT — CLEARED AS FRAGGED', 'info');
+      return;
+    }
+    // Feature 30 Vipava scenarios: range control / AWACS launch calls.
+    if (missionId === 'soca_run') {
+      this._push(
+        'RANGE CONTROL',
+        'RANGE CONTROL: VIPER 1-1 CLEARED HOT FOR SOČA CANYON RUN — STAY LOW!',
+        'info',
+      );
+      return;
+    }
+    if (missionId === 'nanos_sead') {
+      this._push('OVERLORD', 'OVERLORD: POP-UP SA-6 ON NANOS RIDGE — CLEARED TO ENGAGE.', 'warn');
+      this._push(
+        'OVERLORD',
+        `OVERLORD: H4 VIADUCT BATTERY AND VIPAVA DEPOT IN THE PACKAGE — ${specs.length} TARGETS.`,
+        'info',
+      );
+      return;
+    }
+    if (missionId === 'adriatic_cap') {
+      this._push('OVERLORD', 'OVERLORD: FAST MOVERS FEET DRY OVER TRIESTE — INTERCEPT!', 'warn');
       return;
     }
     if (!specs.length) return;
@@ -454,8 +572,10 @@ export class MissionDirector {
       }
     }
 
-    const destination = steerTarget || this.home;
-    const label = steerTarget ? steerTarget.label : 'HOME PLATE';
+    const destination = steerTarget || this.canyonSteer || this.home;
+    const label = steerTarget
+      ? steerTarget.label
+      : (this.canyonSteer ? this.canyonSteer.label : 'HOME PLATE');
     const dx = destination.x - pos.x;
     const dz = destination.z - pos.z;
     const distanceM = Math.hypot(dx, dz);

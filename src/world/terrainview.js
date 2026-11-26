@@ -165,23 +165,30 @@ const DETAIL_ALBEDO = /* glsl */`
   vec2 terrP = vTerrWorld.xz;
   float terrDist = length( vTerrWorld - cameraPosition );
 
-  // Octave fade bands: nothing above the Nyquist limit of the far field.
-  float f6 = 1.0 - smoothstep( 400.0, 2600.0, terrDist );
-  float f28 = 1.0 - smoothstep( 1800.0, 9000.0, terrDist );
+  // Screen-space pixel footprint in metres: fwidth() is already m/px here.
+  float pxM = max( fwidth( terrP.x ), fwidth( terrP.y ) );
 
-  // 6 m / 28 m / 140 m world-space detail octaves.
+  // 4-octave per-band LOD cascade. Each band multiplies a smooth distance
+  // rolloff by its own wavelength-matched Nyquist rolloff, so an octave
+  // dissolves just before it would shimmer while the coarser octaves stay
+  // vivid from cruise altitude.
+  float f6 = ( 1.0 - smoothstep( 1200.0, 4800.0, terrDist ) ) * ( 1.0 - smoothstep( 1.4, 4.2, pxM ) );
+  float f28 = ( 1.0 - smoothstep( 4500.0, 16000.0, terrDist ) ) * ( 1.0 - smoothstep( 6.5, 19.0, pxM ) );
+  float f140 = ( 1.0 - smoothstep( 15000.0, 36000.0, terrDist ) ) * ( 1.0 - smoothstep( 32.0, 92.0, pxM ) );
+  float f520 = 1.0 - smoothstep( 34000.0, 56000.0, terrDist );
+
+  // 6 m / 28 m / 140 m / 520 m world-space detail octaves.
   vec3 n6 = thNoise( terrP * ( 1.0 / 6.0 ), 11.0 );
   vec3 n28 = thNoise( terrP * ( 1.0 / 28.0 ), 37.0 );
   vec3 n140 = thNoise( terrP * ( 1.0 / 140.0 ), 73.0 );
+  vec3 n520 = thNoise( terrP * ( 1.0 / 520.0 ), 131.0 );
   float d6 = n6.x - 0.5;
   float d28 = n28.x - 0.5;
   float d140 = n140.x - 0.5;
+  float d520 = n520.x - 0.5;
 
-  // Analytic detail displacement (m) and gradient (m per m).
-  float detailH = d6 * 0.55 * f6 + d28 * 1.8 * f28 + d140 * 4.2;
-  vec2 detailG = n6.yz * ( 0.55 * f6 / 6.0 )
-               + n28.yz * ( 1.8 * f28 / 28.0 )
-               + n140.yz * ( 4.2 / 140.0 );
+  // The detail gradient is assembled per octave in the micro-bump pass, where
+  // each band is weighted by its own fade.
 
   vec3 terrN = normalize( vec4( normalize( vNormal ), 0.0 ) * viewMatrix ).xyz;
   float terrSlope = length( terrN.xz ) / max( abs( terrN.y ), 0.08 );
@@ -192,7 +199,7 @@ const DETAIL_ALBEDO = /* glsl */`
   float detailA = uTerrShape.x * ( 1.0 - 0.55 * snowMask );
 
   // 1) Tactile albedo break-up: breaks the smooth vertex-colour plastic look.
-  float tone = 1.0 + ( d6 * 0.26 * f6 + d28 * 0.32 * f28 + d140 * 0.22 ) * detailA;
+  float tone = 1.0 + ( d6 * 0.24 * f6 + d28 * 0.30 * f28 + d140 * 0.24 * f140 + d520 * 0.18 * f520 ) * detailA;
   terrAlb *= clamp( tone, 0.62, 1.42 );
   // sunlit ridges warm, hollows cool
   float warmth = clamp( 0.5 + d28 * 1.7 + d6 * 0.9, 0.0, 1.0 );
@@ -201,7 +208,7 @@ const DETAIL_ALBEDO = /* glsl */`
 
   // 2) Geological cliffs: crisp strata bands, scree, crevice darkening.
   float rockMask = smoothstep( 0.34, 0.62, terrSlope ) * uTerrShape.z;
-  float strataAA = 1.0 - smoothstep( 0.25, 0.85,
+  float strataAA = 1.0 - smoothstep( 0.35, 1.35,
     fwidth( vTerrWorld.y ) / max( uTerrStrata.x, 1.0 ) );
   float warp = ( d140 * 0.9 + d28 * 0.15 ) * uTerrStrata.x;
   float band = thStrata( vTerrWorld.y, warp, uTerrStrata.x, uTerrStrata.y );
@@ -223,8 +230,8 @@ const DETAIL_ALBEDO = /* glsl */`
   float fieldFlat = 1.0 - smoothstep( 0.055, 0.14, terrSlope );
   float fieldMask = fieldHeight * fieldFlat * smoothstep( 0.30, 0.62, n140.x )
                   * uTerrShape.w * ( 1.0 - snowMask );
-  float fieldAA = 1.0 - smoothstep( 0.16, 0.50,
-    ( fwidth( terrP.x ) + fwidth( terrP.y ) ) / 110.0 );
+  float fieldAA = ( 1.0 - smoothstep( 0.28, 0.95, pxM / 120.0 ) )
+                * ( 1.0 - smoothstep( 14000.0, 26000.0, terrDist ) );
 
   // Rotation drifts with the macro noise so neighbouring valleys differ.
   float rot = mix( -0.5, 0.62, n140.x ) + d28 * 0.18;
@@ -245,7 +252,7 @@ const DETAIL_ALBEDO = /* glsl */`
   // Vineyard rows / plough furrows, faded before they alias.
   float vine = smoothstep( 0.70, 0.84, ch );
   float rowFade = ( 1.0 - smoothstep( 0.7, 2.0, fwidth( cf.x ) * 56.6 ) )
-                * ( 1.0 - smoothstep( 1400.0, 3200.0, terrDist ) );
+                * ( 1.0 - smoothstep( 2400.0, 4200.0, terrDist ) );
   float rows = 0.5 + 0.5 * sin( cf.x * 56.6 + ch * 12.0 );
   fieldCol *= mix( 1.0, mix( 0.78, 1.10, rows ), vine * rowFade );
 
@@ -260,11 +267,16 @@ const DETAIL_ALBEDO = /* glsl */`
 
 // Micro-bump pass, injected right after <normal_fragment_begin>.
 const DETAIL_NORMAL = /* glsl */`
-  // 4) Analytic micro-bump: tilt the lit normal by the detail gradient so the
-  // sun carves out ridges, ledges and terraces. Fades out before 22 km.
-  float bumpFade = 1.0 - smoothstep( 15000.0, 22000.0, terrDist );
-  float microAA = 1.0 - smoothstep( 0.35, 1.6, fwidth( terrP.x ) + fwidth( terrP.y ) );
-  float bumpAmt = uTerrShape.y * bumpFade * microAA * mix( 1.0, 1.35, rockMask );
+  // 4) Analytic micro-bump: tilt the lit normal by each detail octave's
+  // gradient, weighted by that octave's own distance/Nyquist fade. No global
+  // pixel-footprint kill switch here: that used to zero every octave (even the
+  // 28 m and 140 m bands) beyond ~450 m and flattened the terrain from altitude.
+  float bumpFade = 1.0 - smoothstep( 32000.0, 52000.0, terrDist );
+  float bumpAmt = uTerrShape.y * bumpFade * mix( 1.0, 1.35, rockMask );
+  vec2 detailG = n6.yz   * ( 0.65 * f6   / 6.0 )
+               + n28.yz  * ( 2.40 * f28  / 28.0 )
+               + n140.yz * ( 6.80 * f140 / 140.0 )
+               + n520.yz * ( 14.0 * f520 / 520.0 );
   vec2 bumpG = detailG;
 
   float bandUp = thStrata( vTerrWorld.y + 0.5, warp, uTerrStrata.x, uTerrStrata.y );
@@ -460,9 +472,10 @@ export class TerrainView {
     const leaves = [];
     const maxLevel = CONFIG.world.terrainMaxLevel;
     const minSize = CONFIG.world.terrainMinSize;
-    // Split a shade earlier than the config radius: ~6% more leaves, so ridge
-    // silhouettes stay crisp while flying fast, without a tile-count blow-up.
-    const factor = CONFIG.world.terrainDetailDistance * 1.06;
+    // Split earlier than the config radius: ~22% more leaves, so ridge
+    // silhouettes and valley slopes gain geometric resolution while still
+    // approaching from altitude, without a tile-count blow-up.
+    const factor = CONFIG.world.terrainDetailDistance * 1.22;
 
     const visit = (x, z, size, level) => {
       const d = distanceToRect(camX, camZ, x, z, size);

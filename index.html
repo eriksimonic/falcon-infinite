@@ -39,14 +39,17 @@
             <button data-v="sead">WILD WEASEL</button>
             <button data-v="strike">BAGHDAD STRIKE</button>
             <button data-v="cap">BARCAP SWEEP</button>
+            <button data-v="soca_run">SOČA CANYON</button>
+            <button data-v="nanos_sead">NANOS SEAD</button>
+            <button data-v="adriatic_cap">ADRIATIC CAP</button>
           </div>
         </div>
         <div class="option-row">
           <div class="option-label">THEATER</div>
           <div class="pills" id="opt-theater">
-            <button data-v="temperate" class="on">TEMPERATE</button>
+            <button data-v="temperate">TEMPERATE</button>
             <button data-v="desert">DESERT STRIKE</button>
-            <button data-v="vipava" data-theater="vipava">VIPAVA</button>
+            <button data-v="vipava" data-theater="vipava" class="on">VIPAVA VALLEY</button>
           </div>
         </div>
         <div class="option-row">
@@ -67,6 +70,7 @@
             <button data-v="breeze">BREEZE</button>
             <button data-v="windy">WINDY</button>
             <button data-v="gale">GALE</button>
+            <button data-v="burja">BURJA NE</button>
           </div>
         </div>
         <div class="option-row">
@@ -82,7 +86,8 @@
           <div class="pills" id="opt-time">
             <button data-v="6.2">DAWN</button>
             <button data-v="9">MORNING</button>
-            <button data-v="15.5" class="on">AFTERNOON</button>
+            <button data-v="15.5">AFTERNOON</button>
+            <button data-v="17.6" class="on">GOLDEN HR</button>
             <button data-v="19.1">DUSK</button>
             <button data-v="23">NIGHT</button>
           </div>
@@ -155,6 +160,9 @@
           <div><kbd>R</kbd><span>Reset to runway</span></div>
           <div><kbd>M</kbd><span>Mute audio</span></div>
           <div><kbd>P</kbd><kbd>ESC</kbd><span>Pause</span></div>
+          <div><kbd>F5</kbd><span>Weapon follow-cam</span></div>
+          <div><kbd>F6</kbd><span>Photo mode (drag orbit · wheel zoom · S saves PNG)</span></div>
+          <div><kbd>F2</kbd><kbd>F4</kbd><span>Replay / replay speed</span></div>
           <div><kbd>F1</kbd><span>Hide interface</span></div>
           <div><kbd>F3</kbd><span>Performance panel</span></div>
         </div>
@@ -179,6 +187,14 @@
   <div id="toast"></div>
   <div id="debug" class="hidden"></div>
   <div id="atc" class="hidden"></div>
+
+  <!-- Feature 33: floating Photo Mode bar (hidden unless Photo Mode is active) -->
+  <div id="photo-bar" class="hidden">
+    <span class="pb-title">PHOTO MODE</span>
+    <span class="pb-hint">DRAG ORBIT · SCROLL ZOOM · [ ] FOV</span>
+    <button id="photo-save" type="button">SAVE PNG (S)</button>
+    <button id="photo-exit" type="button">EXIT (F6 / ESC)</button>
+  </div>
 
   <script type="module" src="/src/main.js"></script>
 </body>

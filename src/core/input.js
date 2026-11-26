@@ -1,7 +1,7 @@
 // Keyboard + mouse input. Edge triggers are consumed once per frame.
 const PREVENT = new Set([
   'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Tab',
-  'BracketLeft', 'BracketRight',
+  'BracketLeft', 'BracketRight', 'F5', 'F6',
 ]);
 
 // Alt-held camera bindings: stop browser scrolling (arrows), page zoom (+/−)

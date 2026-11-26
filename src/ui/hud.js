@@ -77,11 +77,16 @@ export class HUD {
     if (!t) return;
     // Mist wash sits under all symbology so instruments stay crisp in cloud.
     this._drawCloudMist(t);
+    // Feature 32 cinematic stress cues sit under the avionics symbology.
+    this._drawJuiceFx(t);
     if (t.mode === 'cockpit') {
       this.drawCockpitHUD(t);
     } else {
       this.drawExternalHUD(t);
     }
+    // Feature 30/32 shared racing + optical-pod strips (both view modes).
+    this._drawCanyonStrip(t);
+    this._drawWeaponCamBanner(t);
     if (tactical && tactical.overlay) {
       tactical.overlay.draw(ctx, this.w, this.h, tactical);
     }
@@ -1027,6 +1032,169 @@ export class HUD {
     ctx.strokeRect(bx, cy - 11 * s, bw, 22 * s);
     ctx.fillStyle = color;
     ctx.fillText(String(Math.round(value)), bx + bw - 5 * s, cy + 1);
+    ctx.restore();
+  }
+
+  // -------------------------------------------------------------------------
+  // Feature 32: G-LOC / redout vignettes and the Mach 1.0 shock ring
+  // -------------------------------------------------------------------------
+  _drawJuiceFx(t) {
+    const ctx = this.ctx;
+    const w = this.w;
+    const h = this.h;
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+    const r = Math.hypot(w, h) * 0.5;
+
+    const black = t.juice?.blackout ?? 0;
+    if (black > 0.02) {
+      const a = Math.min(0.94, black * 0.95);
+      const grad = ctx.createRadialGradient(cx, cy, r * 0.16, cx, cy, r * 0.82);
+      grad.addColorStop(0, 'rgba(0, 0, 0, 0)');
+      grad.addColorStop(0.55, `rgba(0, 0, 0, ${(a * 0.55).toFixed(3)})`);
+      grad.addColorStop(1, `rgba(0, 0, 0, ${a.toFixed(3)})`);
+      ctx.save();
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, w, h);
+      ctx.restore();
+    }
+
+    const red = t.juice?.redout ?? 0;
+    if (red > 0.02) {
+      const a = Math.min(0.8, red * 0.85);
+      const grad = ctx.createRadialGradient(cx, cy, r * 0.2, cx, cy, r * 0.85);
+      grad.addColorStop(0, 'rgba(120, 0, 0, 0)');
+      grad.addColorStop(0.6, `rgba(140, 8, 4, ${(a * 0.45).toFixed(3)})`);
+      grad.addColorStop(1, `rgba(120, 0, 0, ${a.toFixed(3)})`);
+      ctx.save();
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, w, h);
+      ctx.restore();
+    }
+
+    const mach = t.juice?.machPulse ?? 0;
+    if (mach > 0.05) {
+      ctx.save();
+      ctx.strokeStyle = `rgba(214, 240, 255, ${(0.30 * mach).toFixed(3)})`;
+      ctx.lineWidth = Math.max(2, 18 * mach);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * 0.94, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Feature 30: Soča Canyon Run racing telemetry strip
+  // -------------------------------------------------------------------------
+  _fmtRaceTime(seconds) {
+    const sec = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+    const m = Math.floor(sec / 60);
+    const s = sec - m * 60;
+    return `${String(m).padStart(2, '0')}:${s.toFixed(1).padStart(4, '0')}`;
+  }
+
+  _drawCanyonStrip(t) {
+    const c = t.canyon;
+    if (!c || !c.active) return;
+    const ctx = this.ctx;
+    const w = this.w;
+    const h = this.h;
+    const cockpit = t.mode === 'cockpit';
+    const s = cockpit
+      ? Math.max(0.58, Math.min(1.12, Math.min(w / 1600, h / 900) * 0.88))
+      : Math.max(0.76, Math.min(1.12, Math.min(w / 1440, h / 820)));
+    const mono = 'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
+    const total = c.totalGates || 8;
+    const finished = !!c.finished;
+    const gateNo = Math.min((c.gateIndex || 0) + 1, total);
+    const gateName = c.nextGate?.name || 'FINISH';
+
+    const line1 = finished
+      ? `COURSE COMPLETE · ${c.medal || 'GOLD'} MEDAL · ${this._fmtRaceTime(c.elapsed)}`
+      : `GATE ${gateNo} / ${total} · ${gateName}`;
+    const timer = this._fmtRaceTime(c.elapsed);
+    const dist = c.nextGate ? `${(c.distToNextM / 1000).toFixed(1)} KM` : '—';
+    const brg = c.nextGate ? ` · ${String(Math.round(c.bearingToNextDeg)).padStart(3, '0')}°` : '';
+    const line2 = finished ? 'F6 PHOTO MODE · S SNAPSHOT' : `${timer} · ${dist}${brg}`;
+
+    ctx.save();
+    ctx.textBaseline = 'middle';
+    ctx.font = `700 ${Math.round(12 * s)}px ${mono}`;
+    const tw = ctx.measureText(line1).width;
+    ctx.font = `${Math.round(9 * s)}px ${mono}`;
+    const tw2 = ctx.measureText(line2).width;
+    const bw = Math.max(228 * s, Math.max(tw, tw2) + 46 * s);
+    const bh = finished ? 44 * s : 46 * s;
+    const bx = w * 0.5 - bw * 0.5;
+    const by = cockpit ? 8 * s : 58 * s;
+    const accent = finished ? AMBER : '#38ffe0';
+
+    roundRect(ctx, bx, by, bw, bh, 6 * s);
+    ctx.fillStyle = finished ? 'rgba(26, 18, 4, 0.82)' : 'rgba(3, 14, 12, 0.72)';
+    ctx.fill();
+    ctx.strokeStyle = finished ? 'rgba(255, 196, 107, 0.72)' : 'rgba(56, 255, 224, 0.52)';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = accent;
+    ctx.font = `700 ${Math.round(12 * s)}px ${mono}`;
+    ctx.fillText(line1, w * 0.5, by + bh * (finished ? 0.5 : 0.36));
+    if (!finished) {
+      ctx.fillStyle = 'rgba(196, 240, 228, 0.86)';
+      ctx.font = `${Math.round(9 * s)}px ${mono}`;
+      ctx.fillText(line2, w * 0.5, by + bh * 0.72);
+    }
+    ctx.restore();
+  }
+
+  // -------------------------------------------------------------------------
+  // Feature 32: weapon follow-cam optical-pod banner
+  // -------------------------------------------------------------------------
+  _drawWeaponCamBanner(t) {
+    const wc = t.weaponCam;
+    if (!wc || !wc.active || !(wc.tracking || wc.lingering)) return;
+    const ctx = this.ctx;
+    const w = this.w;
+    const h = this.h;
+    const cockpit = t.mode === 'cockpit';
+    const s = cockpit
+      ? Math.max(0.58, Math.min(1.12, Math.min(w / 1600, h / 900) * 0.88))
+      : Math.max(0.76, Math.min(1.12, Math.min(w / 1440, h / 820)));
+    const mono = 'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
+
+    const roundel = wc.lingering ? 'IMPACT · LINGER' : (wc.label || 'ORDNANCE').split(' ')[0];
+    const telemetry = wc.lingering
+      ? 'WPN CAM · IMPACT · LINGER'
+      : `WPN CAM · ${roundel} · ${Math.round(wc.speedKts || 0)} KT · ${Math.round(wc.altFt || 0).toLocaleString()} FT`;
+
+    ctx.save();
+    ctx.textBaseline = 'middle';
+    ctx.font = `700 ${Math.round(10 * s)}px ${mono}`;
+    const tw = ctx.measureText(telemetry).width;
+    const bw = tw + 54 * s;
+    const bh = 22 * s;
+    const bx = w * 0.5 - bw * 0.5;
+    const by = cockpit ? 60 * s : 112 * s;
+
+    roundRect(ctx, bx, by, bw, bh, 4 * s);
+    ctx.fillStyle = 'rgba(20, 4, 4, 0.7)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 107, 94, 0.55)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    const pulse = 0.55 + 0.45 * Math.sin(this._t * 7);
+    ctx.fillStyle = `rgba(255, 107, 94, ${pulse.toFixed(2)})`;
+    ctx.beginPath();
+    ctx.arc(bx + 14 * s, by + bh * 0.5, 3 * s, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255, 214, 206, 0.95)';
+    ctx.font = `700 ${Math.round(10 * s)}px ${mono}`;
+    ctx.fillText(telemetry, w * 0.5 + 6 * s, by + bh * 0.5 + 0.5);
     ctx.restore();
   }
 }

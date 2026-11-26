@@ -138,6 +138,16 @@ export const WIND = {
   breeze: { label: 'BREEZE · 12 KT', speed: 6.2, gustiness: 0.35, turbulence: 0.32 },
   windy: { label: 'WINDY · 24 KT', speed: 12.4, gustiness: 0.65, turbulence: 0.72 },
   gale: { label: 'GALE · 40 KT', speed: 20.5, gustiness: 1.0, turbulence: 1.35 },
+  // Feature 30: Vipava burja, the NE katabatic wind that pours off the Nanos
+  // plateau. It keeps a fixed heading instead of veering with time.
+  // Blows FROM NE (045 deg) TOWARD SW (225 deg): windX < 0, windZ > 0.
+  burja: {
+    label: 'BURJA · 42 KT NE',
+    speed: 21.6,
+    gustiness: 1.0,
+    turbulence: 1.55,
+    dirRad: Math.PI * 0.75,
+  },
 };
 
 export const THEATERS = {

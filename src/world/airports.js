@@ -337,15 +337,19 @@ export function buildAirport(ap, weatherRef) {
   }
   group.add(tGroup);
 
-  // PAPI
+  // PAPI: 4-lamp glideslope bar beside the touchdown zone on the approach end
+  // (two white upper / two red lower lamps). Registered so the night animation
+  // can brighten them without touching the shared runway materials.
   const papiColors = [0xffffff, 0xffffff, 0xff3322, 0xff3322];
+  const papi = [];
   for (let i = 0; i < 4; i++) {
-    const m = new THREE.Mesh(
-      new THREE.BoxGeometry(2.2, 1.1, 3),
-      new THREE.MeshBasicMaterial({ color: papiColors[i], toneMapped: false }),
-    );
+    const mat = new THREE.MeshBasicMaterial({
+      color: papiColors[i], toneMapped: false, transparent: true, opacity: 0.9,
+    });
+    const m = new THREE.Mesh(new THREE.BoxGeometry(2.2, 1.1, 3), mat);
     m.position.set(L * 0.28, 0.7, -Wd / 2 - 16 - i * 8);
     group.add(m);
+    papi.push({ mesh: m, material: mat });
   }
 
   // approach light bars
@@ -356,6 +360,35 @@ export function buildAirport(ap, weatherRef) {
     );
     bar.position.set(-L / 2 - 60 - i * 45, 0.5, 0);
     group.add(bar);
+  }
+
+  // Sequenced flashing approach strobes ("the rabbit"): six lamps marching
+  // inward from 620 m to 120 m off the heading approach threshold. They sit far
+  // outside the flattened runway platform, so each one is grounded on the real
+  // terrain sample (converted from the airport's rotated local frame to world
+  // metres) instead of on the group's flat elevation.
+  const rotY = Math.PI / 2 - (ap.heading * Math.PI) / 180;
+  const cosR = Math.cos(rotY);
+  const sinR = Math.sin(rotY);
+  const RABBIT_NEAR = 120;
+  const RABBIT_FAR = 620;
+  const RABBIT_COUNT = 6;
+  const rabbit = [];
+  for (let i = 0; i < RABBIT_COUNT; i++) {
+    const dist = RABBIT_NEAR + (i * (RABBIT_FAR - RABBIT_NEAR)) / (RABBIT_COUNT - 1);
+    const lx = -(L / 2 + dist);
+    const lz = 0;
+    const wx = ap.x + cosR * lx + sinR * lz;
+    const wz = ap.z - sinR * lx + cosR * lz;
+    const groundY = (Number.isFinite(terrainHeight(wx, wz)) ? terrainHeight(wx, wz) : ap.elevation) + 1.5;
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0xfff6e0, toneMapped: false, transparent: true, opacity: 0.95,
+    });
+    const mast = new THREE.Mesh(new THREE.BoxGeometry(1.2, 5, 1.2), mat);
+    mast.position.set(lx, groundY - ap.elevation + 2.5, lz);
+    group.add(mast);
+    // `order` 0 = nearest the threshold; the far lamp flashes first.
+    rabbit.push({ mesh: mast, material: mat, order: RABBIT_COUNT - 1 - i });
   }
 
   const _sockUp = new THREE.Vector3(0, 1, 0);
@@ -381,22 +414,38 @@ export function buildAirport(ap, weatherRef) {
       (nz + nx * flapH) * horiz + 0.04 * (1 - horiz),
     ).normalize();
     sockPivot.quaternion.setFromUnitVectors(_sockUp, _sockDir);
-    const op = 0.25 + night * 0.75;
+    const op = Math.min(1, 0.3 + night * 0.7);
     lightMat.opacity = op;
     redMat.opacity = op;
     greenMat.opacity = op;
+
+    // PAPI lamps stay crisp in poor weather and glow harder after dusk.
+    const papiOp = Math.min(1, 0.6 + night * 0.4);
+    for (const p of papi) p.material.opacity = papiOp;
+
+    // "The rabbit": six approach strobes firing in rapid inward sequence
+    // (2 Hz cycle) from the outer lamp toward the threshold.
+    const cycle = (time * 2) % 1;
+    for (const r of rabbit) {
+      const local = (cycle - r.order * 0.1 + 1) % 1;
+      const on = local < 0.13;
+      r.mesh.visible = on;
+      r.material.opacity = on ? 0.45 + 0.55 * night : 0.15;
+    }
   };
 
   group.userData.airport = ap;
+  group.userData.papi = papi;
+  group.userData.rabbit = rabbit;
   return group;
 }
 
 export class AirportSystem {
   constructor(scene, preset) {
-    this.scene = scene;
-    this.preset = preset;
-    this.group = new THREE.Group();
-    this.scene.add(this.group);
+    this.scene = scene || null;
+    this.preset = preset || {};
+    this.group = this.scene ? new THREE.Group() : null;
+    if (this.group) this.scene.add(this.group);
     this.built = new Map();
     this.windX = 0;
     this.windZ = 0;
@@ -404,23 +453,47 @@ export class AirportSystem {
     this.night = 0;
   }
 
-  update(dt, camera, weather, sky) {
-    this.windX = weather.state.windX;
-    this.windZ = weather.state.windZ;
-    this.windSpeed = weather.state.windSpeed;
-    this.windTime = weather.state.time || 0;
-    this.windGust = weather.state.gust || 0;
-    this.night = sky.night;
+  /**
+   * Two call shapes are supported:
+   *   update(dt, camera, weather, sky)   — the world/main.js loop, where
+   *                                        night comes from the sky model.
+   *   update(dt, cameraPos, night)       — Feature 31 headless form.
+   */
+  update(dt, camera = null, weather = null, sky = null) {
+    let nightArg = 0;
+    let weatherState = weather && weather.state ? weather.state : null;
+    if (typeof weather === 'number') {
+      nightArg = weather;
+      weatherState = null;
+      sky = null;
+    }
 
-    const near = airportsNear(camera.position.x, camera.position.z, 2)
+    if (weatherState) {
+      this.windX = weatherState.windX;
+      this.windZ = weatherState.windZ;
+      this.windSpeed = weatherState.windSpeed;
+      this.windTime = weatherState.time || 0;
+      this.windGust = weatherState.gust || 0;
+    }
+    const skyNight = sky && Number.isFinite(sky.night) ? sky.night : null;
+    this.night = skyNight !== null ? skyNight : (Number.isFinite(nightArg) ? Math.max(0, Math.min(1, nightArg)) : 0);
+
+    // Headless-safe: no group (null scene) or no DOM means no meshes to drive.
+    if (!this.group || typeof document === 'undefined') return;
+
+    const pos = camera && camera.position ? camera.position : camera;
+    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.z)) return;
+
+    const radius = this.preset.airportRadius ?? 45000;
+    const near = airportsNear(pos.x, pos.z, 2)
       .filter((ap) => {
-        const dx = ap.x - camera.position.x;
-        const dz = ap.z - camera.position.z;
-        return Math.hypot(dx, dz) < this.preset.airportRadius;
+        const dx = ap.x - pos.x;
+        const dz = ap.z - pos.z;
+        return Math.hypot(dx, dz) < radius;
       })
       .sort((a, b) => {
-        const da = (a.x - camera.position.x) ** 2 + (a.z - camera.position.z) ** 2;
-        const db = (b.x - camera.position.x) ** 2 + (b.z - camera.position.z) ** 2;
+        const da = (a.x - pos.x) ** 2 + (a.z - pos.z) ** 2;
+        const db = (b.x - pos.x) ** 2 + (b.z - pos.z) ** 2;
         return da - db;
       })
       .slice(0, 3);
@@ -456,7 +529,7 @@ export class AirportSystem {
    */
   clear() {
     for (const [id, g] of this.built) {
-      this.group.remove(g);
+      this.group?.remove(g);
       disposeGroup(g);
     }
     this.built.clear();
@@ -464,7 +537,8 @@ export class AirportSystem {
 
   dispose() {
     this.clear();
-    this.group.removeFromParent();
+    this.group?.removeFromParent();
+    this.group = null;
   }
 }
 

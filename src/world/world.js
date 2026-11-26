@@ -7,7 +7,11 @@ import { VegetationSystem } from './vegetation.js';
 import { RoadNetwork } from './roadnet.js';
 import { InlandWaterSystem } from './water.js';
 import { LandmarkSystem } from './landmarks.js';
+import { RoadTrafficSystem } from './traffic_roads.js';
 import { terrainHeight, slopeAt, airportNear, airportsNear } from './terrain.js';
+
+// Vehicle budget per quality preset (mirrors traffic_roads.js).
+const TRAFFIC_BUDGET = { low: 120, medium: 220, high: 320 };
 
 export class World {
   constructor(scene, preset) {
@@ -23,6 +27,10 @@ export class World {
     // Iconic real-world landmarks (churches, bridges, dams, masts, castles,
     // lighthouses) re-grounded on the active DEM when the theater is Vipava.
     this.landmarks = new LandmarkSystem(scene);
+    // Feature 31: two instanced pools of headlight/taillight streaks that keep
+    // the H4 expressway and valley arteries alive at night. Roads are handed
+    // over by main.js once the baked OSM extract has loaded.
+    this.roadTraffic = new RoadTrafficSystem(scene, preset);
     // Optional offshore carrier group; main.js attaches one once it is placed.
     this.carrier = null;
   }
@@ -36,6 +44,16 @@ export class World {
     this.roads.preset = preset;
     this.buildings._needsRebuild = true;
     this.vegetation._lastX = Infinity;
+    // Traffic pools are sized once; follow the new budget without ever
+    // exceeding the allocated instance slots (a smaller quality stays safe).
+    const traffic = this.roadTraffic;
+    if (traffic) {
+      traffic.preset = preset;
+      const pool = traffic.headMesh ? traffic.headMesh.instanceMatrix.count : Infinity;
+      const budget = TRAFFIC_BUDGET[String(preset.name || 'medium').toLowerCase()] || 220;
+      traffic.maxVehicles = Math.min(budget, pool);
+      if (traffic.roads.length > 0) traffic._spawnVehicles();
+    }
   }
 
   setTheater(name) {
@@ -54,7 +72,9 @@ export class World {
     this.roads.update(camera);
     this.vegetation.update(dt, camera, sky);
     this.inlandWater.update(dt, sky);
-    this.landmarks.update(dt);
+    this.landmarks.update(dt, sky.night);
+    // Feature 31: night lights on the H4/Vipava arteries, culled at 22 km.
+    this.roadTraffic.update(dt, camera.position, sky.night);
   }
 
   heightAt(x, z) {

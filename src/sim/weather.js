@@ -28,6 +28,10 @@ export class WeatherSystem {
     this._gustPulse = 0;
     this._gustTarget = 0;
     this._nextGust = 2.5;
+    // Presets such as the Vipava burja pin the wind direction instead of
+    // letting it veer freely, so seed the heading from the preset.
+    this._syncWindTarget();
+    if (this._lockedDir != null) this.windAngle = this._lockedDir;
     this._applyTarget(1);
   }
 
@@ -43,7 +47,10 @@ export class WeatherSystem {
     if (!WIND[name]) return;
     this.windPresetName = name;
     this._syncWindTarget();
-    if (instant) this._applyTarget(1);
+    if (instant) {
+      if (this._lockedDir != null) this.windAngle = this._lockedDir;
+      this._applyTarget(1);
+    }
   }
 
   _syncWindTarget() {
@@ -53,6 +60,9 @@ export class WeatherSystem {
     this.target.turbulence = windCfg.turbulence != null
       ? Math.max(windCfg.turbulence, wp.turbulence * 0.5)
       : wp.turbulence;
+    // A preset that names dirRad holds a fixed heading (burja: NE 045 deg);
+    // every other preset keeps the historical slow veer.
+    this._lockedDir = Number.isFinite(windCfg.dirRad) ? windCfg.dirRad : null;
   }
 
   _applyTarget(t) {
@@ -73,8 +83,17 @@ export class WeatherSystem {
     const t = 1 - Math.pow(0.001, dt);
     this._applyTarget(t);
 
-    // slowly veering base wind direction
-    this.windAngle += dt * 0.0055;
+    // Base wind direction: freely veering, unless the preset pins it (burja).
+    if (this._lockedDir != null) {
+      // Katabatic flow holds ~045 deg with a subtle +/-0.12 rad gusting veer.
+      const veer = Math.sin(this.state.time * 0.21) * 0.07
+        + Math.sin(this.state.time * 0.53 + 1.7) * 0.05;
+      let d = (this._lockedDir + veer) - this.windAngle;
+      d = Math.atan2(Math.sin(d), Math.cos(d));
+      this.windAngle += d * (1 - Math.exp(-1.6 * dt));
+    } else {
+      this.windAngle += dt * 0.0055;
+    }
 
     // dynamic rolling gusts (organic swell & decay every 3-10 seconds)
     this._gustPhase += dt;
@@ -147,7 +166,16 @@ export class WeatherSystem {
     const alongGust = (n1 * 0.65 + n2 * 0.35) * gustScale + this.state.gustSpeed * 0.55;
     const crossGust = crossN * gustScale * 0.55;
 
-    const baseMag = (this.state.windSpeed * blFactor * midShear) + jetExtra + alongGust;
+    // Vipava burja: short, hard katabatic pulses riding the locked NE flow.
+    // Squared positive noise gives crisp spikes rather than a smooth swell.
+    let burjaPulse = 0;
+    if (this.windPresetName === 'burja') {
+      const p1 = Math.max(0, noise2(advX * 0.0026 + t * 0.55, advZ * 0.0026 - t * 0.31, 317));
+      const p2 = Math.max(0, noise2(advX * 0.0091 - t * 0.7, advZ * 0.0091 + 12, 319));
+      burjaPulse = (p1 * p1 * 7.5 + p2 * p2 * 3.5) * (0.6 + this.state.gust);
+    }
+
+    const baseMag = (this.state.windSpeed * blFactor * midShear) + jetExtra + alongGust + burjaPulse;
     out.x = cosA * baseMag - sinA * crossGust;
     out.z = sinA * baseMag + cosA * crossGust;
 
