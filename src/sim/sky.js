@@ -1,6 +1,6 @@
 // Sky dome, sun/moon, stars, atmospheric lighting and fog.
 import * as THREE from 'three';
-import { CONFIG } from '../config.js';
+import { CONFIG, THEATERS } from '../config.js';
 import { clamp, smoothstep, lerp } from '../world/noise.js';
 
 const _sun = new THREE.Vector3();
@@ -47,6 +47,11 @@ export class SkySystem {
     this._flash = 0;
     this._lastFlash = 0;
     this.flash = 0;
+    this.theater = 'temperate';
+  }
+
+  setTheater(name) {
+    this.theater = THEATERS[name] ? name : 'temperate';
   }
 
   _makeDome() {
@@ -173,11 +178,16 @@ export class SkySystem {
     const hor = horizonNight.clone().lerp(horizonDusk, smoothstep(-0.25, 0.0, _sun.y))
       .lerp(horizonDay, smoothstep(0.02, 0.32, _sun.y));
 
-    // overcast pushes colours toward grey
+    // overcast pushes colours toward grey; desert theater adds warm dust-haze tint
     const overcast = weather.state.overcast;
     const grey = new THREE.Color(0x8a9299);
     zen.lerp(grey, overcast * 0.7);
     hor.lerp(grey, overcast * 0.55);
+
+    const th = THEATERS[this.theater] || THEATERS.temperate;
+    if (th.horizonTint != null && dayT > 0.05) {
+      hor.lerp(new THREE.Color(th.horizonTint), 0.34 * dayT * (1 - overcast * 0.4));
+    }
 
     this.skyColor.copy(zen);
     this.horizonColor.copy(hor);
@@ -209,15 +219,18 @@ export class SkySystem {
     const dayAmb = new THREE.Color(0x9fc6e4);
     const nightAmb = new THREE.Color(0x1b2b4a);
     const amb = nightAmb.clone().lerp(dayAmb, dayT);
-    const groundAmb = new THREE.Color(0x24301f).lerp(new THREE.Color(0x5d5b45), dayT);
+    const groundAmb = new THREE.Color(0x24301f).lerp(new THREE.Color(th.groundAmb || 0x5d5b45), dayT);
     this.hemi.color.copy(amb);
     this.hemi.groundColor.copy(groundAmb);
     this.hemi.intensity = lerp(0.30, 1.35, dayT) * (1 - overcast * 0.15);
 
-    // fog color = horizon, warmer at dusk, lighter with overcast
+    // fog color = horizon, warmer at dusk, warm desert dust haze in desert theater
     const fogCol = hor.clone().lerp(sunCol, duskT * 0.18);
+    if (th.fogTint != null && dayT > 0.05) {
+      fogCol.lerp(new THREE.Color(th.fogTint), 0.28 * dayT);
+    }
     this.scene.fog.color.copy(fogCol);
-    this.scene.fog.density = weather.state.fog * (1 + overcast * 0.6);
+    this.scene.fog.density = weather.state.fog * (1 + overcast * 0.6) * (th.hazeBoost || 1.0);
 
     this.dome.position.copy(camera.position);
     this.dome.rotation.y = 0;

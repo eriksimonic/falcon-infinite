@@ -139,3 +139,20 @@ export const WIND = {
   windy: { label: 'WINDY · 24 KT', speed: 12.4, gustiness: 0.65, turbulence: 0.72 },
   gale: { label: 'GALE · 40 KT', speed: 20.5, gustiness: 1.0, turbulence: 1.35 },
 };
+
+export const THEATERS = {
+  temperate: {
+    label: 'TEMPERATE',
+    fogTint: null,
+    hazeBoost: 1.0,
+    horizonTint: null,
+    groundAmb: 0x5d5b45,
+  },
+  desert: {
+    label: 'DESERT STRIKE',
+    fogTint: 0xd9b88c,
+    hazeBoost: 1.35,
+    horizonTint: 0xe6c79c,
+    groundAmb: 0x8a6d48,
+  },
+};

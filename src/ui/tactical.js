@@ -447,45 +447,81 @@ export class TacticalOverlay {
 
     // ------------------------------------------------------------- GUN
     if (selected === 'GUN') {
-      const r = 25 * s;
-      const gy = cy + r * 0.55;
+      const tel = state.telemetry || {};
+      const isExternal = !!tel.mode && tel.mode !== 'cockpit';
+      const r = (isExternal ? 14 : 25) * s;
+      const gy = cy + (isExternal ? 0 : r * 0.55);
       ctx.save();
-      ctx.strokeStyle = GREEN;
-      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = isExternal ? GREEN_DIM : GREEN;
+      ctx.lineWidth = isExternal ? 1.0 : 1.2;
 
-      if (typeof ctx.setLineDash === 'function') ctx.setLineDash([3 * s, 4 * s]);
-      ctx.beginPath();
-      ctx.arc(cx, gy, r, 0, TAU);
-      ctx.stroke();
-      if (typeof ctx.setLineDash === 'function') ctx.setLineDash([]);
-
-      ctx.beginPath();
-      ctx.moveTo(cx - r * 1.75, cy - r * 1.25);
-      ctx.lineTo(cx - r * 0.48, gy);
-      ctx.moveTo(cx + r * 1.75, cy - r * 1.25);
-      ctx.lineTo(cx + r * 0.48, gy);
-      ctx.stroke();
-
-      ctx.beginPath();
-      ctx.moveTo(cx - 7 * s, gy);
-      ctx.lineTo(cx - 2 * s, gy);
-      ctx.moveTo(cx + 2 * s, gy);
-      ctx.lineTo(cx + 7 * s, gy);
-      ctx.moveTo(cx, gy - 5 * s);
-      ctx.lineTo(cx, gy + 5 * s);
-      ctx.stroke();
-
-      for (const off of [-r * 0.62, 0, r * 0.62]) {
+      if (isExternal) {
+        // Follow-camera micro-HUD: subtle segmented level wings + minimal aim pip
+        // so the center view of the aircraft stays clean and unobstructed.
+        const rollRad = (num(tel.roll, 0) * Math.PI) / 180;
+        const pitchOff = clamp(num(tel.pitch, 0), -18, 18) * 1.4 * s;
+        ctx.save();
+        ctx.translate(cx, cy + pitchOff);
+        ctx.rotate(-rollRad);
+        ctx.strokeStyle = 'rgba(157,255,192,0.34)';
+        ctx.lineWidth = 1.0;
         ctx.beginPath();
-        ctx.moveTo(cx + off, gy - r);
-        ctx.lineTo(cx + off, gy - r + 4 * s);
+        ctx.moveTo(-42 * s, 0);
+        ctx.lineTo(-18 * s, 0);
+        ctx.lineTo(-18 * s, 3.5 * s);
+        ctx.moveTo(42 * s, 0);
+        ctx.lineTo(18 * s, 0);
+        ctx.lineTo(18 * s, 3.5 * s);
         ctx.stroke();
-      }
+        ctx.restore();
 
-      ctx.font = `700 ${Math.round(9 * s)}px ${MONO}`;
-      ctx.textAlign = 'center';
-      ctx.fillStyle = GREEN_DIM;
-      ctx.fillText('GUN', cx, gy + r + 10 * s);
+        // Micro boresight cross
+        ctx.strokeStyle = 'rgba(157,255,192,0.58)';
+        ctx.beginPath();
+        ctx.moveTo(cx - 8 * s, gy);
+        ctx.lineTo(cx - 3 * s, gy);
+        ctx.moveTo(cx + 3 * s, gy);
+        ctx.lineTo(cx + 8 * s, gy);
+        ctx.moveTo(cx, gy - 6 * s);
+        ctx.lineTo(cx, gy - 2.5 * s);
+        ctx.moveTo(cx, gy + 2.5 * s);
+        ctx.lineTo(cx, gy + 6 * s);
+        ctx.stroke();
+      } else {
+        if (typeof ctx.setLineDash === 'function') ctx.setLineDash([3 * s, 4 * s]);
+        ctx.beginPath();
+        ctx.arc(cx, gy, r, 0, TAU);
+        ctx.stroke();
+        if (typeof ctx.setLineDash === 'function') ctx.setLineDash([]);
+
+        ctx.beginPath();
+        ctx.moveTo(cx - r * 1.75, cy - r * 1.25);
+        ctx.lineTo(cx - r * 0.48, gy);
+        ctx.moveTo(cx + r * 1.75, cy - r * 1.25);
+        ctx.lineTo(cx + r * 0.48, gy);
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(cx - 7 * s, gy);
+        ctx.lineTo(cx - 2 * s, gy);
+        ctx.moveTo(cx + 2 * s, gy);
+        ctx.lineTo(cx + 7 * s, gy);
+        ctx.moveTo(cx, gy - 5 * s);
+        ctx.lineTo(cx, gy + 5 * s);
+        ctx.stroke();
+
+        for (const off of [-r * 0.62, 0, r * 0.62]) {
+          ctx.beginPath();
+          ctx.moveTo(cx + off, gy - r);
+          ctx.lineTo(cx + off, gy - r + 4 * s);
+          ctx.stroke();
+        }
+
+        ctx.font = `700 ${Math.round(9 * s)}px ${MONO}`;
+        ctx.textAlign = 'center';
+        ctx.fillStyle = GREEN_DIM;
+        ctx.fillText('GUN', cx, gy + r + 10 * s);
+      }
 
       // Lead computing pipper for an airborne, moving locked target.
       const t = state.lockedTarget;

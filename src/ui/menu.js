@@ -17,11 +17,15 @@ export class UI {
     this.crashReason = this.$('crash-reason');
     this.crashSub = this.$('crash-sub');
 
+    this.mission = 'free';
+    this.theater = 'temperate';
     this.weather = 'few';
     this.wind = 'auto';
     this.quality = 'medium';
     this.hour = 15.5;
 
+    this._bindPills('opt-mission', (v) => { this.mission = v; this.cb.onMission?.(v); });
+    this._bindPills('opt-theater', (v) => { this.theater = v; this.cb.onTheater?.(v); });
     this._bindPills('opt-weather', (v) => { this.weather = v; this.cb.onWeather?.(v); });
     this._bindPills('opt-wind', (v) => { this.wind = v; this.cb.onWind?.(v); });
     this._bindPills('opt-quality', (v) => { this.quality = v; this.cb.onQuality?.(v); });

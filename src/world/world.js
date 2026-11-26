@@ -29,6 +29,14 @@ export class World {
     this.vegetation._lastX = Infinity;
   }
 
+  setTheater(name) {
+    this.terrain.setTheater(name);
+    if (this.vegetation && this.vegetation.group) {
+      // Sparse arid theater: dim vegetation slightly in desert mode
+      this.vegetation.group.visible = name !== 'desert';
+    }
+  }
+
   update(dt, camera, sky, weather) {
     this.terrain.update(dt, camera);
     this.terrain.setAtmosphere(sky.sunDir, sky.sunColor, sky.skyColor);

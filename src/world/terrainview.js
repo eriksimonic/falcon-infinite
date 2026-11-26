@@ -6,16 +6,31 @@ import { CONFIG } from '../config.js';
 
 const _cam = new THREE.Vector3();
 
-const PAL = {
-  sand: new THREE.Color(0xd9c69c).convertSRGBToLinear(),
-  grassLow: new THREE.Color(0x86a05e).convertSRGBToLinear(),
-  grassHigh: new THREE.Color(0xa7b874).convertSRGBToLinear(),
-  forest: new THREE.Color(0x4a6b3d).convertSRGBToLinear(),
-  rock: new THREE.Color(0x8a8377).convertSRGBToLinear(),
-  rockDark: new THREE.Color(0x67625a).convertSRGBToLinear(),
-  snow: new THREE.Color(0xf2f5f6).convertSRGBToLinear(),
-  dirt: new THREE.Color(0xa18b64).convertSRGBToLinear(),
-  seabed: new THREE.Color(0x30473f).convertSRGBToLinear(),
+const PALETTES = {
+  temperate: {
+    sand: new THREE.Color(0xd9c69c).convertSRGBToLinear(),
+    grassLow: new THREE.Color(0x86a05e).convertSRGBToLinear(),
+    grassHigh: new THREE.Color(0xa7b874).convertSRGBToLinear(),
+    forest: new THREE.Color(0x4a6b3d).convertSRGBToLinear(),
+    rock: new THREE.Color(0x8a8377).convertSRGBToLinear(),
+    rockDark: new THREE.Color(0x67625a).convertSRGBToLinear(),
+    snow: new THREE.Color(0xf2f5f6).convertSRGBToLinear(),
+    dirt: new THREE.Color(0xa18b64).convertSRGBToLinear(),
+    seabed: new THREE.Color(0x30473f).convertSRGBToLinear(),
+    snowLineBase: 1280,
+  },
+  desert: {
+    sand: new THREE.Color(0xd8b989).convertSRGBToLinear(),
+    grassLow: new THREE.Color(0xc9a36f).convertSRGBToLinear(),
+    grassHigh: new THREE.Color(0xb88b58).convertSRGBToLinear(),
+    forest: new THREE.Color(0x6e7346).convertSRGBToLinear(), // dry scrub / river oases
+    rock: new THREE.Color(0x9a7756).convertSRGBToLinear(),
+    rockDark: new THREE.Color(0x745842).convertSRGBToLinear(),
+    snow: new THREE.Color(0xd9c3a5).convertSRGBToLinear(),   // pale arid limestone peaks
+    dirt: new THREE.Color(0xa87c4f).convertSRGBToLinear(),
+    seabed: new THREE.Color(0x3a524a).convertSRGBToLinear(),
+    snowLineBase: 1650,
+  },
 };
 
 function distanceToRect(px, pz, x, z, size) {
@@ -24,32 +39,32 @@ function distanceToRect(px, pz, x, z, size) {
   return Math.hypot(dx, dz);
 }
 
-function vertexColor(h, slope, x, z, out) {
+function vertexColor(h, slope, x, z, out, pal = PALETTES.temperate) {
   const n = fbm01(x * 0.00042, z * 0.00042, 3, 881);
   const fine = hash2(Math.floor(x * 0.05), Math.floor(z * 0.05), 71);
-  const snowLine = 1280 + fbm01(x * 0.0006, z * 0.0009, 2, 991) * 260;
+  const snowLine = pal.snowLineBase + fbm01(x * 0.0006, z * 0.0009, 2, 991) * 260;
 
   if (h < -1) {
-    out.copy(PAL.seabed);
+    out.copy(pal.seabed);
   } else if (h < 2.4) {
-    out.copy(PAL.sand);
+    out.copy(pal.sand);
   } else {
-    out.copy(PAL.grassLow).lerp(PAL.grassHigh, n);
-    // forest patches
+    out.copy(pal.grassLow).lerp(pal.grassHigh, n);
+    // forest / irrigated oasis patches
     const forest = smoothstep(0.52, 0.74, fbm01(x * 0.0011, z * 0.0011, 3, 1201));
-    if (slope < 0.55) out.lerp(PAL.forest, forest * 0.8);
+    if (slope < 0.55) out.lerp(pal.forest, forest * (pal === PALETTES.desert ? 0.35 : 0.8));
     // dry / dirt in low flat basins
     const dry = smoothstep(0.62, 0.84, fbm01(x * 0.00022, z * 0.00022, 2, 1311));
-    out.lerp(PAL.dirt, dry * 0.35);
+    out.lerp(pal.dirt, dry * (pal === PALETTES.desert ? 0.55 : 0.35));
   }
 
   // rock on steep slopes
   const rockT = smoothstep(0.38, 0.72, slope);
-  if (h > 1) out.lerp(PAL.rock, rockT * 0.92);
-  // high altitude rock then snow
+  if (h > 1) out.lerp(pal.rock, rockT * 0.92);
+  // high altitude rock then snow/limestone
   if (h > 700) {
-    out.lerp(PAL.rockDark, smoothstep(700, 1150, h) * 0.65);
-    out.lerp(PAL.snow, smoothstep(snowLine, snowLine + 320, h) * (1 - clamp((slope - 0.7) * 1.6, 0, 1)));
+    out.lerp(pal.rockDark, smoothstep(700, 1150, h) * 0.65);
+    out.lerp(pal.snow, smoothstep(snowLine, snowLine + 320, h) * (1 - clamp((slope - 0.7) * 1.6, 0, 1)));
   }
   // subtle per-vertex tonal noise
   const v = 0.9 + fine * 0.2;
@@ -84,6 +99,23 @@ export class TerrainView {
     this._lastUpdate = 0;
 
     this._leafPool = [];
+    this.theater = 'temperate';
+  }
+
+  setTheater(name) {
+    const next = PALETTES[name] ? name : 'temperate';
+    if (next === this.theater) return;
+    this.theater = next;
+    // Clear existing cached tiles so terrain seamlessly repaints in the new theater palette.
+    for (const mesh of this.tiles.values()) {
+      this.group.remove(mesh);
+      mesh.geometry.dispose();
+    }
+    this.tiles.clear();
+    this._stale.clear();
+    this.pending.length = 0;
+    this.lastBuildX = Infinity;
+    this.lastBuildZ = Infinity;
   }
 
   /** Force a rebuild of the visible quadtree (used at boot). */
@@ -205,7 +237,7 @@ export class TerrainView {
         normals[idx * 3 + 2] = -dz * inv;
 
         const slope = Math.hypot(dx, dz);
-        vertexColor(h, slope, wx, wz, color);
+        vertexColor(h, slope, wx, wz, color, PALETTES[this.theater] || PALETTES.temperate);
         colors[idx * 3] = color.r;
         colors[idx * 3 + 1] = color.g;
         colors[idx * 3 + 2] = color.b;

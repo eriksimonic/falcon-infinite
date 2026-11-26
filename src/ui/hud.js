@@ -56,7 +56,7 @@ export class HUD {
     this.canvas.style.display = v ? 'block' : 'none';
   }
 
-  update(dt, t) {
+  update(dt, t, tactical = null) {
     if (!this.visible || !t) return;
     this._t += dt;
     this._acc += dt;
@@ -64,10 +64,10 @@ export class HUD {
     if (!modeChanged && this._acc < 1 / 30) return;
     this._acc = 0;
     this._lastMode = t.mode;
-    this.draw(t);
+    this.draw(t, tactical);
   }
 
-  draw(t) {
+  draw(t, tactical = null) {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.w, this.h);
     if (!t) return;
@@ -75,6 +75,9 @@ export class HUD {
       this.drawCockpitHUD(t);
     } else {
       this.drawExternalHUD(t);
+    }
+    if (tactical && tactical.overlay) {
+      tactical.overlay.draw(ctx, this.w, this.h, tactical);
     }
   }
 
@@ -238,6 +241,24 @@ export class HUD {
       ctx.fillStyle = flash ? primaryCol : 'rgba(255, 180, 160, 0.72)';
       ctx.textAlign = 'center';
       ctx.fillText(warnText, cx, wy + wh * 0.5 + 0.5);
+    }
+
+    // Subtle micro level-horizon reference in follow/external view (non-intrusive)
+    if (t.mode !== 'cockpit') {
+      ctx.save();
+      const mcx = w * 0.5;
+      const mcy = h * 0.47 + Math.max(-24 * s, Math.min(24 * s, (t.pitch / 20) * 24 * s));
+      ctx.translate(mcx, mcy);
+      ctx.rotate((-t.roll * Math.PI) / 180);
+      ctx.strokeStyle = 'rgba(141, 255, 180, 0.24)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(-48 * s, 0);
+      ctx.lineTo(-22 * s, 0);
+      ctx.moveTo(22 * s, 0);
+      ctx.lineTo(48 * s, 0);
+      ctx.stroke();
+      ctx.restore();
     }
 
     // 4. Bottom-center compact Flight Instrument Dock -----------------------
