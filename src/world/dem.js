@@ -303,3 +303,55 @@ export function _resetVipavaOSMCache() {
   _osmPromise = null;
   _osmData = null;
 }
+
+// ---------------------------------------------------------------------------
+// Baked OpenStreetMap inland water (rivers & lakes)
+// ---------------------------------------------------------------------------
+
+let _waterPromise = null;
+let _waterData = null;
+
+/**
+ * Load the baked OSM inland water extract for the Vipava theater:
+ * `{ rivers: [{ w, pts: [[x, z], ...] }], lakes: [[[x, z], ...], ...] }`.
+ *
+ * The payload is fetched once and cached in memory; any failure (missing file,
+ * offline, malformed JSON) resolves to `null` so a theater switch simply shows
+ * no inland water instead of breaking boot. Failed loads are not cached.
+ *
+ * @param {string} url
+ * @returns {Promise<{rivers: Array, lakes: Array}|null>}
+ */
+export async function loadVipavaWater(url = './media/vipava_water.json') {
+  if (_waterData) return _waterData;
+  if (_waterPromise) return _waterPromise;
+
+  _waterPromise = (async () => {
+    try {
+      if (typeof fetch !== 'function') throw new Error('fetch is unavailable');
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`water HTTP ${resp.status}`);
+      const json = await resp.json();
+      if (!json || typeof json !== 'object') throw new Error('water payload is not an object');
+      _waterData = {
+        rivers: Array.isArray(json.rivers) ? json.rivers : [],
+        lakes: Array.isArray(json.lakes) ? json.lakes : [],
+      };
+      return _waterData;
+    } catch {
+      return null;
+    } finally {
+      // Only successful payloads stay cached; clear the in-flight promise so a
+      // failed load can be retried after a later theater switch.
+      _waterPromise = null;
+    }
+  })();
+
+  return _waterPromise;
+}
+
+/** Test / tooling hook: forget the cached inland water payload. */
+export function _resetVipavaWaterCache() {
+  _waterPromise = null;
+  _waterData = null;
+}

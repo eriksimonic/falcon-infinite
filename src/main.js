@@ -29,7 +29,7 @@ import { TacticalOverlay } from './ui/tactical.js';
 import { KneeboardMap } from './ui/kneeboard.js';
 import { UI } from './ui/menu.js';
 import { spawnPoint, airportNear, airportsNear, setActiveDEM, setCustomAirports, terrainHeight } from './world/terrain.js';
-import { loadVipavaDEM, loadVipavaOSM } from './world/dem.js';
+import { loadVipavaDEM, loadVipavaOSM, loadVipavaWater } from './world/dem.js';
 import { settlementsNear } from './world/settlements.js';
 import { clamp } from './world/noise.js';
 
@@ -275,12 +275,14 @@ class App {
     if (name === 'vipava') {
       let dem = null;
       let osm = null;
+      let water = null;
       try {
         dem = await loadVipavaDEM(
           th.demUrl || './media/vipava_dem.png',
           th.metaUrl || './media/vipava_meta.json',
         );
         osm = await loadVipavaOSM();
+        water = await loadVipavaWater();
       } catch (err) {
         console.warn('VIPAVA · dataset load failed, keeping procedural terrain', err);
       }
@@ -293,6 +295,9 @@ class App {
         setCustomAirports(customAirports);
         this.world.buildings.setCustomBuildings(osm?.buildings || null);
         this.world.roads.setCustomRoads(osm?.roads || null);
+        // Real OSM rivers/lakes are draped on the freshly active DEM, so the
+        // water has to be built after setActiveDEM/setCustomAirports above.
+        this.world.inlandWater.setWaterData(water);
         // Ajdovscina Airfield (LJAJ) sits at the DEM centre and runs East-West:
         // start on the RWY 09 threshold, nose east into the sunrise.
         const ljaj = customAirports?.find((ap) => ap.id === 'LJAJ' || ap.code === 'LJAJ')
@@ -314,6 +319,7 @@ class App {
         setCustomAirports(null);
         this.world.buildings.setCustomBuildings(null);
         this.world.roads.setCustomRoads(null);
+        this.world.inlandWater.setWaterData(null);
         if (this._proceduralSpawn) this.spawn = this._proceduralSpawn;
       }
     } else {
@@ -321,6 +327,7 @@ class App {
       setCustomAirports(null);
       this.world.buildings.setCustomBuildings(null);
       this.world.roads.setCustomRoads(null);
+      this.world.inlandWater.setWaterData(null);
       if (this._proceduralSpawn) this.spawn = this._proceduralSpawn;
       this.carrier.placeNear(this.spawn.x, this.spawn.z);
     }

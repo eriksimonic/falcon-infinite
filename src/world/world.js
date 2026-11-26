@@ -5,6 +5,7 @@ import { AirportSystem } from './airports.js';
 import { BuildingSystem } from './buildings.js';
 import { VegetationSystem } from './vegetation.js';
 import { RoadNetwork } from './roadnet.js';
+import { InlandWaterSystem } from './water.js';
 import { terrainHeight, slopeAt, airportNear, airportsNear } from './terrain.js';
 
 export class World {
@@ -16,6 +17,8 @@ export class World {
     this.buildings = new BuildingSystem(scene, preset);
     this.vegetation = new VegetationSystem(scene, preset);
     this.roads = new RoadNetwork(scene, preset);
+    // Real OSM rivers & lakes, draped over the active terrain (Vipava theater).
+    this.inlandWater = new InlandWaterSystem(scene);
     // Optional offshore carrier group; main.js attaches one once it is placed.
     this.carrier = null;
   }
@@ -46,6 +49,7 @@ export class World {
     this.buildings.update(dt, camera, sky);
     this.roads.update(camera);
     this.vegetation.update(dt, camera, sky);
+    this.inlandWater.update(dt, sky);
   }
 
   heightAt(x, z) {
