@@ -8,8 +8,9 @@
 - **Commands**:
   - `npm run dev` — Vite dev server (`http://127.0.0.1:5173`, auto-enables MCP browser bridge)
   - `npm run build` — Production bundle (`dist/`, includes `dist/media/sfx/`)
-  - `npm test` — Runs all **12 headless Node test suites** (`tests/*_test.mjs`)
+  - `npm test` — Runs all **16 headless Node test suites** (`tests/*_test.mjs`)
   - `npm run mcp` — Runs the local stdio MCP server (`mcp/server.mjs`, HTTP bridge on `127.0.0.1:5179`)
+  - `npm run wso` — Runs the real-time AI WSO / Co-Pilot (`mcp/wso_copilot.mjs`) connected to the local MCP server
 
 ---
 
@@ -88,23 +89,26 @@ hermes chat -Q --oneshot --yolo \
 
 ---
 
-## 4. Unfinished Business & Next Roadmap Ideas
+## 4. Wave 5 & 6 Completed Roadmap Items (Features 14–18)
 
-### High-Priority Next Items (Discussed with User)
-1. **Ultra-Fast AI WSO / Co-Pilot over MCP**:
-   - The MCP server (`mcp/server.mjs`) and browser bridge (`src/core/mcp_bridge.js`) are already built and tested.
-   - Next step: design a lightweight real-time AI Co-Pilot runner (using an ultra-fast model like Gemini Flash-Lite or a fast local model) connected to `mcp/server.mjs` that watches `get_telemetry` and acts as a real WSO/AWACS: calling threats via `send_radio`, popping flares on SAM launch, managing autopilot/route, or running automated flight-test scenarios.
-2. **ILS HUD Needles & Kneeboard Diversion Steerpoint Wiring**:
-   - `ILSComputer` (`src/aircraft/autopilot.js`) is wired for callouts & touchdown grading, and `t.ils` is passed to `HUD`, but visual **localizer & glideslope needles** are not yet drawn on the HUD when `t.ils.active === true`.
-   - `KneeboardMap.pickAirportAt()` selects a diversion airport and shows a toast, and can be wired to override the active steerpoint when no combat objective is active (or in Free Flight).
-3. **Additional Non-Combat Polish (from Feature Brainstorm)**:
-   - **Offshore Aircraft Carrier Group** (Nimitz-class carrier with Fresnel meatball, arresting wires, steam catapult).
-   - **Tower / Ground Flyby Camera with Doppler Audio** + 30-second instant replay buffer.
-   - **Cockpit Polish**: AoA indexer lights beside HUD combiner, Master Caution lamp, night cockpit backlighting, and canopy raindrop streaks.
-   - **Dynamic Cloud-Entry Mist Wash & Tire Touchdown Smoke Puffs**.
-   - **Code-Splitting** (optional): Vite warns `dist/assets/index-*.js` is ~910 kB; dynamic imports or `manualChunks` for `three` can split vendor vs app cleanly.
+All previously listed missing components have now been implemented, integrated, and validated (`16/16` test suites passing, warning-free split Vite build):
+1. **Ultra-Fast AI WSO / Co-Pilot over MCP (`mcp/wso_copilot.mjs`, `npm run wso`, `tests/wso_test.mjs`)**:
+   - Zero-dependency stdio JSON-RPC 2.0 MCP client + deterministic real-time WSO engine (`< 2 ms` tick): auto-flare defense on SAM launch, deduplicated threat/pull-up/bingo-fuel radio callouts, `patrol`/`cruise`/`evade` scenario automation, and optional non-blocking LLM advisor hook (`WSO_LLM_URL`/`WSO_LLM_KEY`).
+   - Live bridge (`src/core/mcp_bridge.js` + `mcp/server.mjs`) updated with `vsFpm` telemetry and `'flyby'` camera mode support.
+2. **ILS HUD Needles & Kneeboard Diversion Steerpoint Wiring (`src/ui/hud.js`, `src/main.js`)**:
+   - Cockpit HUD renders F-16 localizer & glideslope needles + scale dots + `ILS RWY XX · X.X NM`; External HUD renders a minimal non-intrusive ILS pill preserving the unobstructed center viewport.
+   - Clicking an airport (or `CVN71` carrier) on the Kneeboard (`K`) sets `_divertAirport`, overriding both the active steerpoint (in Free Flight / when no combat steerpoint is active) and the tuned ILS runway.
+3. **Offshore Nimitz-Class Aircraft Carrier Group (`src/world/carrier.js`, `src/world/world.js`, `tests/carrier_test.mjs`)**:
+   - Procedural `CVN-71` placed deterministically in offshore water with a landable `18.5 m` flight deck, animated 3D FLOLS meatball + HUD meatball cue, 4 arresting wires (with wheel-height deck rest and wire grading), and bow steam catapult launch (`82 m/s` in `2.2 s`).
+4. **Tower / Ground Flyby Camera with Doppler Audio + 30-Second Instant Replay (`src/aircraft/aircraft.js`, `src/core/audio.js`, `src/aircraft/replay.js`, `tests/replay_test.mjs`)**:
+   - Added `'flyby'` camera mode (`C`) with auto-reanchoring telephoto tripod tracking and radial-velocity Doppler pitch shift in `SimAudio`.
+   - Zero-GC 30-second ring buffer (`ReplaySystem`) toggled with `F2` (`F4` cycles `1× / 0.5× / 2×` speed), syncing F-16 exterior visuals, AGL/VS telemetry, and HUD replay banner.
+5. **Cockpit Polish, Cloud-Entry Mist, Tire Touchdown Smoke & Code-Splitting (`src/aircraft/cockpit.js`, `src/sim/clouds.js`, `src/sim/vfx.js`, `vite.config.js`, `tests/cockpit_test.mjs`)**:
+   - 3D AoA indexer lights beside HUD combiner, flashing Master Caution lamp, night cockpit backlighting, and airspeed-scaled canopy raindrop streaks.
+   - Dynamic cloud-entry radial mist wash (`CloudSystem.getCloudDensity` -> HUD) and pooled tire touchdown / catapult steam puffs (`CombatVFX.spawnTireSmoke`).
+   - `vite.config.js` splits `three` into `vendor-three` (`353 kB` app + `592 kB` vendor, zero chunk-size warnings).
 
 ### Known Minor Quirks / Notes
-- All feature specs live in `docs/features/` (`README.md`, `01`–`11`, `12a`, `12b`) — keep new feature specs in the same numbering sequence (`13-...`).
+- All feature specs live in `docs/features/` (`README.md`, `01`–`18`) — keep new feature specs in the same numbering sequence (`19-...`).
 - User strongly prefers **follow/chase camera** as primary view: always keep the external HUD clean and minimal (micro-HUD style) so nothing overpowers the aircraft and world view.
 - If `pi` API key is refreshed later, `pi --model alibaba-plan/deepseek-v4.1-flash-1017` can also be used, otherwise keep using `hermes chat -Q --oneshot --yolo -m deepseek-v4.1-flash-1017`.

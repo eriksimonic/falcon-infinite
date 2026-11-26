@@ -8,6 +8,7 @@ import { CombatAudio } from './core/combat_audio.js';
 import { BitchingBetty } from './core/betty.js';
 import { attachMcpBridge } from './core/mcp_bridge.js';
 import { World } from './world/world.js';
+import { CarrierGroup } from './world/carrier.js';
 import { TimeSystem } from './sim/time.js';
 import { WeatherSystem } from './sim/weather.js';
 import { SkySystem } from './sim/sky.js';
@@ -16,6 +17,8 @@ import { CombatVFX } from './sim/vfx.js';
 import { FuelSystem, TankerSystem } from './sim/fuel.js';
 import { AirTrafficSystem } from './sim/traffic.js';
 import { Aircraft } from './aircraft/aircraft.js';
+import { updateF16Visual } from './aircraft/f16.js';
+import { ReplaySystem } from './aircraft/replay.js';
 import { AutopilotSystem, ILSComputer } from './aircraft/autopilot.js';
 import { EjectionSystem } from './aircraft/ejection.js';
 import { WeaponSystem } from './combat/weapons.js';
@@ -79,6 +82,11 @@ class App {
     this._fuelState = null;
     this._tankerState = null;
     this._ilsState = null;
+    this._divertAirport = null;
+    this._meatballState = null;
+    this._cloudMist = 0;
+    this._rwrHighest = 'NONE';
+    this._replayActive = false;
     this._flameoutNotified = false;
     on('ils:callout', (ev) => {
       if (this.mode === 'fly' && ev && ev.text) {
@@ -118,6 +126,11 @@ class App {
 
     this.spawn = this.chooseSpawn();
     this.world = new World(this.scene, this.preset);
+    // Offshore carrier group. Its deck elevation is published through
+    // world.heightAt() so the jet lands, taxis and catapults like any runway.
+    this.carrier = new CarrierGroup(this.scene);
+    this.carrier.placeNear(this.spawn.x, this.spawn.z);
+    this.world.carrier = this.carrier;
     this.aircraft = new Aircraft(this.scene, this.world);
     this.camera = this.aircraft.camera;
     this.camera.aspect = window.innerWidth / window.innerHeight;
@@ -140,6 +153,7 @@ class App {
     this.ejection = new EjectionSystem(this.scene);
     this.traffic = new AirTrafficSystem(this.scene);
     this.kneeboard = new KneeboardMap();
+    this.replay = new ReplaySystem();
     this.hud = new HUD(document.getElementById('hud'));
     this.hud.setVisible(false);
 
@@ -150,9 +164,10 @@ class App {
         const f = this.aircraft.flight;
         const picked = this.kneeboard.pickAirportAt(
           e.clientX, e.clientY, window.innerWidth, window.innerHeight,
-          f, this.world.airportsNear(f.position.x, f.position.z, 3),
+          f, this._kneeboardAirports(f),
         );
         if (picked) {
+          this._divertAirport = picked;
           this.audio.click();
           this.ui.toast(`DIVERT · ${picked.code} ${picked.name.toUpperCase()}`);
         }
@@ -252,6 +267,14 @@ class App {
     this.ui.toast('THEATER · ' + th.label);
   }
 
+  /** Airports shown on / pickable from the kneeboard: nearest fields + carrier deck. */
+  _kneeboardAirports(flight) {
+    const airports = this.world.airportsNear(flight.position.x, flight.position.z, 3);
+    const deck = this.carrier ? this.carrier.getDeckPoint() : null;
+    if (deck) airports.push(deck);
+    return airports;
+  }
+
   _startActiveMission(spawn) {
     this.weapons.reset();
     this.vfx.reset();
@@ -262,6 +285,8 @@ class App {
     this.ejection.reset();
     this.traffic.reset(this.aircraft.flight);
     this.kneeboard.clearTrack();
+    this._divertAirport = null;
+    this.replay.reset();
     this._playerHits = 0;
     this._flameoutNotified = false;
     this._lockedTarget = null;
@@ -298,6 +323,17 @@ class App {
       if (this.uiHidden) this.ui.setATC('');
       return;
     }
+    if (code === 'F2') {
+      e.preventDefault();
+      this.toggleReplay();
+      return;
+    }
+    if (code === 'F4') {
+      if (!this.replay.playing) return;
+      e.preventDefault();
+      this.ui.toast('REPLAY SPEED · ' + this.replay.cycleSpeed() + '×');
+      return;
+    }
     if (code === 'KeyM') {
       this.muted = !this.muted;
       this.audio.setMuted(this.muted);
@@ -318,6 +354,49 @@ class App {
       else if (this.mode === 'pause') this.resume();
       return;
     }
+  }
+
+  /** F2: start / stop the instant replay. F4 cycles its playback rate. */
+  toggleReplay() {
+    if (this.replay.playing) {
+      const snap = this.replay.stopPlayback();
+      this._replayActive = false;
+      // Restore the live airframe exactly where it was when playback started.
+      if (snap) this.replay.applyToFlight(this.aircraft.flight, snap);
+      this._syncAircraftModel();
+      this.ui.toast('REPLAY · LIVE');
+      return;
+    }
+    if (this.mode !== 'fly') return;
+    if (!this.replay.startPlayback(30, this.aircraft.flight)) {
+      this.ui.toast('REPLAY · NO HISTORY YET');
+      return;
+    }
+    this._replayActive = true;
+    // A cockpit view replays inside the pilot's head; switch out so the run is visible.
+    if (this.aircraft.mode === 'cockpit') this.aircraft.setMode('chase');
+    this.ui.toast('REPLAY · 30s (F2 EXIT · F4 SPEED)');
+  }
+
+  _stepReplay(simDt) {
+    const sample = this.replay.stepPlayback(simDt);
+    if (!sample) return;
+    const f = this.aircraft.flight;
+    this.replay.applyToFlight(f, sample);
+    // Replay bypasses flight.update(), so refresh the derived values the HUD
+    // and visual layer read every frame.
+    f.agl = Math.max(0, f.position.y - this.world.heightAt(f.position.x, f.position.z));
+    f.verticalSpeed = f.velocity.y;
+    this._syncAircraftModel();
+    updateF16Visual(this.aircraft.model, f, simDt, this.aircraft.mode, this.ready);
+    this.aircraft._updateCamera(simDt, this.input, true);
+    // Loop the recorded window until F2 exits.
+    if (sample.done) this.replay.playTime = 0;
+  }
+
+  _syncAircraftModel() {
+    this.aircraft.model.position.copy(this.aircraft.flight.position);
+    this.aircraft.model.quaternion.copy(this.aircraft.flight.quaternion);
   }
 
   startFlight() {
@@ -579,24 +658,57 @@ class App {
       }
     }
 
+    this._replayActive = fly && this.replay.playing && this.replay.count >= 2;
+
     if (fly) {
-      this.aircraft.update(simDt, cmd, this.weather, this.input, true);
-      this.weather.night = this.sky.night;
       const f = this.aircraft.flight;
-      if (f.touchdown > 0.2) {
-        this.audio.thump(clamp(f.touchdown / 5, 0.15, 1));
-        const g = this.ils.gradeTouchdown(f.touchdown, f.rollDeg);
-        this.ui.toast(`TOUCHDOWN · ${g.grade} (${Math.round(g.fpm)} FPM)`);
-      }
-      if (this.ejection.active) {
-        const ej = this.ejection.update(simDt, this.world, this.weather);
-        if (ej && ej.cameraPos && ej.lookAt) {
-          this.camera.position.copy(ej.cameraPos);
-          this.camera.up.set(0, 1, 0);
-          this.camera.lookAt(ej.lookAt);
+      if (this._replayActive) {
+        // Playback drives the airframe; live physics, weapons and damage are
+        // skipped so the recorded run plays back untouched.
+        this._stepReplay(simDt);
+      } else {
+        const alerts = {
+          night: this.sky.night,
+          rain: this.weather.state.rain,
+          lowFuel: !!this._fuelState?.bingo,
+          rwrThreat: this._rwrHighest === 'LOCK' || this._rwrHighest === 'LAUNCH',
+          flameout: !!this._fuelState?.empty,
+          time: this.time.hour,
+        };
+        this.aircraft.update(simDt, cmd, this.weather, this.input, true, alerts);
+        this.weather.night = this.sky.night;
+
+        // Carrier operations: arresting wires, steam catapult, FLOLS meatball.
+        const cRes = this.carrier.update(simDt, f, this.weather);
+        this._meatballState = cRes.meatball;
+        if (cRes.newlyCaughtWire > 0) {
+          this.ui.toast(`CARRIER · OK ${cRes.newlyCaughtWire}-WIRE!`);
+          this.audio.thump(0.75);
         }
+        if (cRes.catapultLaunched) {
+          this.ui.toast('CATAPULT · LAUNCH!');
+          this.vfx.spawnTireSmoke(f.position, 1.4);
+        }
+
+        if (f.touchdown > 0.2) {
+          this.audio.thump(clamp(f.touchdown / 5, 0.15, 1));
+          this.vfx.spawnTireSmoke(
+            { x: f.position.x, y: f.position.y - 1.4, z: f.position.z },
+            clamp(f.touchdown / 3, 0.5, 1.4),
+          );
+          const g = this.ils.gradeTouchdown(f.touchdown, f.rollDeg);
+          this.ui.toast(`TOUCHDOWN · ${g.grade} (${Math.round(g.fpm)} FPM)`);
+        }
+        if (this.ejection.active) {
+          const ej = this.ejection.update(simDt, this.world, this.weather);
+          if (ej && ej.cameraPos && ej.lookAt) {
+            this.camera.position.copy(ej.cameraPos);
+            this.camera.up.set(0, 1, 0);
+            this.camera.lookAt(ej.lookAt);
+          }
+        }
+        if (f.crashed && this.mode === 'fly' && !this.ejection.active) this.onCrash();
       }
-      if (f.crashed && this.mode === 'fly' && !this.ejection.active) this.onCrash();
     } else if (menu) {
       this.aircraft.update(simDt, NEUTRAL_CMD, this.weather, this.input, false);
     } else if (this.mode === 'crash') {
@@ -613,75 +725,77 @@ class App {
     if (fly) {
       const f = this.aircraft.flight;
       // Combat updates: target lock, firing, ballistics, SAM AI, missions, VFX
-      this._lockedTarget = this.targets.findLockTarget(f, this.weapons.selected);
-      const triggerHeld = this.input.isDown('Space')
-        || (this.aircraft.mode === 'cockpit' && this.input.pointerLocked && (this.input.mouse.buttons & 1));
-      if (triggerHeld && !f.crashed) {
-        const fired = this.weapons.fire(f, this._lockedTarget);
-        if (fired.fired) {
-          if (fired.type === 'GUN') {
-            this.combatAudio.cannonShot();
-            this.vfx.triggerMuzzleFlash(f);
-          } else if (fired.type === 'AIM9') {
-            this.combatAudio.missileLaunch();
-            this.ui.toast('FOX 2 · AIM-9 AWAY');
-          } else if (fired.type === 'MK82') {
-            this.combatAudio.bombRelease();
-            this.ui.toast('PICKLE · MK-82 AWAY');
-          }
-        }
-      }
-
-      const wEvents = this.weapons.update(simDt, f, this.world, this.targets.targets, this._lockedTarget);
-      for (const ev of wEvents) {
-        if (ev.kind === 'trail') {
-          this.vfx.spawnTrail(ev.position, ev.color, ev.size);
-        } else if (ev.kind === 'impact') {
-          const scale = ev.weapon === 'MK82' ? 2.2 : (ev.weapon === 'AIM9' ? 1.5 : 0.45);
-          this.vfx.spawnExplosion(ev.position, scale);
-          const dist = Math.hypot(
-            ev.position.x - f.position.x,
-            ev.position.y - f.position.y,
-            ev.position.z - f.position.z,
-          );
-          if (ev.weapon !== 'GUN' || ev.hitTargetId) this.combatAudio.explosion(dist);
-          const destroyed = this.targets.applyImpact(ev);
-          if (destroyed.length > 0) {
-            this.missions.notifyDestroyed(destroyed);
-            for (const d of destroyed) {
-              this.vfx.spawnExplosion(d.position, 2.5);
-              if (d.kind !== 'BANDIT') this.vfx.spawnSmokePlume(d.position, 90);
-              this.ui.toast(d.kind === 'BANDIT' ? `SPLASH · ${d.label}` : `SHACK · ${d.label}`);
+      if (!this._replayActive) {
+        this._lockedTarget = this.targets.findLockTarget(f, this.weapons.selected);
+        const triggerHeld = this.input.isDown('Space')
+          || (this.aircraft.mode === 'cockpit' && this.input.pointerLocked && (this.input.mouse.buttons & 1));
+        if (triggerHeld && !f.crashed) {
+          const fired = this.weapons.fire(f, this._lockedTarget);
+          if (fired.fired) {
+            if (fired.type === 'GUN') {
+              this.combatAudio.cannonShot();
+              this.vfx.triggerMuzzleFlash(f);
+            } else if (fired.type === 'AIM9') {
+              this.combatAudio.missileLaunch();
+              this.ui.toast('FOX 2 · AIM-9 AWAY');
+            } else if (fired.type === 'MK82') {
+              this.combatAudio.bombRelease();
+              this.ui.toast('PICKLE · MK-82 AWAY');
             }
           }
         }
-      }
 
-      const tOut = this.targets.update(simDt, f, this.world, this.weapons.flares);
-      this._rwrContacts = tOut.rwrContacts || [];
-      for (const m of this.targets.enemyMissiles) {
-        if (Math.random() < 0.45) this.vfx.spawnTrail(m.position, 0xf2e8dc, 2.2);
-      }
-      for (const ev of tOut.events || []) {
-        if (ev.kind === 'playerHit') {
-          this._playerHits++;
-          this.vfx.spawnExplosion(ev.position, 1.8);
-          this.combatAudio.explosion(25);
-          this.missions.notifyPlayerHit();
-          if (this._playerHits >= 2) {
-            f._crash('SAM IMPACT — AIRFRAME DESTROYED');
-            this.onCrash();
-          } else {
-            this.ui.toast('WARNING · SAM PROXIMITY HIT — DEFEND & FLARE!');
+        const wEvents = this.weapons.update(simDt, f, this.world, this.targets.targets, this._lockedTarget);
+        for (const ev of wEvents) {
+          if (ev.kind === 'trail') {
+            this.vfx.spawnTrail(ev.position, ev.color, ev.size);
+          } else if (ev.kind === 'impact') {
+            const scale = ev.weapon === 'MK82' ? 2.2 : (ev.weapon === 'AIM9' ? 1.5 : 0.45);
+            this.vfx.spawnExplosion(ev.position, scale);
+            const dist = Math.hypot(
+              ev.position.x - f.position.x,
+              ev.position.y - f.position.y,
+              ev.position.z - f.position.z,
+            );
+            if (ev.weapon !== 'GUN' || ev.hitTargetId) this.combatAudio.explosion(dist);
+            const destroyed = this.targets.applyImpact(ev);
+            if (destroyed.length > 0) {
+              this.missions.notifyDestroyed(destroyed);
+              for (const d of destroyed) {
+                this.vfx.spawnExplosion(d.position, 2.5);
+                if (d.kind !== 'BANDIT') this.vfx.spawnSmokePlume(d.position, 90);
+                this.ui.toast(d.kind === 'BANDIT' ? `SPLASH · ${d.label}` : `SHACK · ${d.label}`);
+              }
+            }
           }
         }
-      }
 
-      const prevRadioHead = this._missionSnap?.radio?.[this._missionSnap.radio.length - 1]?.text;
-      this._missionSnap = this.missions.update(simDt, f, this.targets.targets, this._rwrContacts);
-      const nextRadioHead = this._missionSnap?.radio?.[this._missionSnap.radio.length - 1]?.text;
-      if (nextRadioHead && nextRadioHead !== prevRadioHead) {
-        this.combatAudio.radioBeep();
+        const tOut = this.targets.update(simDt, f, this.world, this.weapons.flares);
+        this._rwrContacts = tOut.rwrContacts || [];
+        for (const m of this.targets.enemyMissiles) {
+          if (Math.random() < 0.45) this.vfx.spawnTrail(m.position, 0xf2e8dc, 2.2);
+        }
+        for (const ev of tOut.events || []) {
+          if (ev.kind === 'playerHit') {
+            this._playerHits++;
+            this.vfx.spawnExplosion(ev.position, 1.8);
+            this.combatAudio.explosion(25);
+            this.missions.notifyPlayerHit();
+            if (this._playerHits >= 2) {
+              f._crash('SAM IMPACT — AIRFRAME DESTROYED');
+              this.onCrash();
+            } else {
+              this.ui.toast('WARNING · SAM PROXIMITY HIT — DEFEND & FLARE!');
+            }
+          }
+        }
+
+        const prevRadioHead = this._missionSnap?.radio?.[this._missionSnap.radio.length - 1]?.text;
+        this._missionSnap = this.missions.update(simDt, f, this.targets.targets, this._rwrContacts);
+        const nextRadioHead = this._missionSnap?.radio?.[this._missionSnap.radio.length - 1]?.text;
+        if (nextRadioHead && nextRadioHead !== prevRadioHead) {
+          this.combatAudio.radioBeep();
+        }
       }
 
       const vfxState = this.vfx.update(simDt, f, this.weather, this.camera);
@@ -692,23 +806,26 @@ class App {
 
       const glocState = this.tactical.update(simDt, f);
 
-      // Wave 3 systems: Tanker, Fuel, Traffic/Wingman, ILS, Kneeboard & Bitching Betty
-      const wasTankerContact = !!this._tankerState?.contact;
-      this._tankerState = this.tanker.update(simDt, f);
-      if (this._tankerState?.contact && !wasTankerContact) {
-        this.combatAudio.boomContact();
-        this.ui.toast('TANKER · BOOM CONTACT — FUEL FLOWING');
+      if (!this._replayActive) {
+        // Wave 3 systems: Tanker, Fuel, Traffic/Wingman, ILS, Kneeboard & Bitching Betty
+        const wasTankerContact = !!this._tankerState?.contact;
+        this._tankerState = this.tanker.update(simDt, f);
+        if (this._tankerState?.contact && !wasTankerContact) {
+          this.combatAudio.boomContact();
+          this.ui.toast('TANKER · BOOM CONTACT — FUEL FLOWING');
+        }
+        this._fuelState = this.fuel.update(simDt, f, !!this._tankerState?.contact);
+        if (this._fuelState.bingoTriggered) {
+          this.ui.toast('BINGO FUEL · ' + Math.round(this._fuelState.fuelLb) + ' LB');
+        }
+        if (this._fuelState.empty && !this._flameoutNotified) {
+          this._flameoutNotified = true;
+          this.ui.toast('FLAMEOUT · OUT OF FUEL');
+        }
+        this.traffic.update(simDt, f, this.weather);
+        this.kneeboard.recordPosition(f.position.x, f.position.z);
       }
-      this._fuelState = this.fuel.update(simDt, f, !!this._tankerState?.contact);
-      if (this._fuelState.bingoTriggered) {
-        this.ui.toast('BINGO FUEL · ' + Math.round(this._fuelState.fuelLb) + ' LB');
-      }
-      if (this._fuelState.empty && !this._flameoutNotified) {
-        this._flameoutNotified = true;
-        this.ui.toast('FLAMEOUT · OUT OF FUEL');
-      }
-      this.traffic.update(simDt, f, this.weather);
-      this.kneeboard.recordPosition(f.position.x, f.position.z);
+      this.replay.record(simDt, f);
 
       let rwrHighest = 'NONE';
       const rank = { NONE: 0, SEARCH: 1, LOCK: 2, LAUNCH: 3 };
@@ -716,6 +833,7 @@ class App {
         const st = c.isMissile ? 'LAUNCH' : (c.state || 'SEARCH');
         if ((rank[st] || 0) > rank[rwrHighest]) rwrHighest = st;
       }
+      this._rwrHighest = rwrHighest;
       this.combatAudio.update(simDt, {
         weapon: this.weapons.selected,
         hasLock: !!this._lockedTarget,
@@ -725,7 +843,7 @@ class App {
       });
 
       const t = this.aircraft.telemetry(this.weather, this.time, this.sky);
-      this._ilsState = this.ils.update(simDt, f, t.airport);
+      this._ilsState = this.ils.update(simDt, f, this._divertAirport || t.airport);
       this.betty.update(simDt, {
         onGround: f.onGround,
         crashed: f.crashed,
@@ -746,6 +864,32 @@ class App {
       t.refueling = !!this._fuelState?.refueling;
       t.autopilot = this.autopilot.mode;
       t.ils = this._ilsState;
+      t.meatball = this._meatballState;
+      t.cloudMist = this._cloudMist;
+      t.replaying = this._replayActive;
+      t.replayRate = this.replay.playbackRate;
+      t.replayTime = this.replay.playTime;
+      t.replayDuration = this.replay.duration;
+
+      // Kneeboard diversion: a picked airport becomes the active steerpoint on
+      // free flight (or whenever the mission has none of its own).
+      const divert = this._divertAirport
+        && (!this._missionSnap?.steerpoint || this._missionSnap.status === 'FREE')
+        ? {
+          x: this._divertAirport.x,
+          z: this._divertAirport.z,
+          label: 'DIV ' + this._divertAirport.code,
+          kind: 'DIVERT',
+        }
+        : null;
+      const steerpoint = divert || this._missionSnap?.steerpoint || null;
+      const missionState = divert ? { ...this._missionSnap, steerpoint } : this._missionSnap;
+
+      // Cloud-entry mist washes the view; smooth it so deck entry is not a pop.
+      const mistTarget = this.clouds.getCloudDensity(this.camera.position, this.weather);
+      this._cloudMist += (mistTarget - this._cloudMist) * (1 - Math.exp(-2.5 * simDt));
+      if (mistTarget === 0 && this._cloudMist < 0.002) this._cloudMist = 0;
+
       this.camera.updateMatrixWorld();
       this.hud.update(simDt, t, {
         overlay: this.tactical,
@@ -754,10 +898,10 @@ class App {
           flight: f,
           heading: t.heading,
           heightAt: (x, z) => this.world.heightAt(x, z),
-          airports: this.world.airportsNear(f.position.x, f.position.z, 3),
+          airports: this._kneeboardAirports(f),
           targets: this.targets.targets,
           tanker: this._tankerState,
-          steerpoint: this._missionSnap?.steerpoint || null,
+          steerpoint,
           windDir: t.windDir,
           windKts: t.windKts,
         } : null,
@@ -767,7 +911,7 @@ class App {
         lockedTarget: this._lockedTarget,
         targets: this.targets.targets,
         rwrContacts: this._rwrContacts,
-        mission: this._missionSnap,
+        mission: missionState,
       });
       this.audio.update(simDt, {
         throttle: this.aircraft.flight.throttle,
@@ -785,6 +929,7 @@ class App {
         beta: this.aircraft.flight.beta,
         turbulence: this.aircraft.flight.turbulence,
         altitude: this.aircraft.flight.position.y,
+        doppler: this.aircraft.dopplerRatio,
       });
       this._atcTimer -= simDt;
       if (this._atcTimer <= 0) {

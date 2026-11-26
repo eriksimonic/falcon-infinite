@@ -16,6 +16,8 @@ export class World {
     this.buildings = new BuildingSystem(scene, preset);
     this.vegetation = new VegetationSystem(scene, preset);
     this.roads = new RoadNetwork(scene, preset);
+    // Optional offshore carrier group; main.js attaches one once it is placed.
+    this.carrier = null;
   }
 
   setPreset(preset) {
@@ -47,7 +49,13 @@ export class World {
   }
 
   heightAt(x, z) {
-    return terrainHeight(x, z);
+    const h = terrainHeight(x, z);
+    // A carrier deck is walkable/landable ground wherever it floats above the sea.
+    if (this.carrier) {
+      const deck = this.carrier.getDeckElevation(x, z);
+      if (deck !== null && deck > h) return deck;
+    }
+    return h;
   }
 
   slopeAt(x, z) {

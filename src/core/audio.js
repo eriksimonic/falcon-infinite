@@ -506,6 +506,9 @@ export class SimAudio {
     const beta = Math.abs(t.beta ?? 0);
     const turbIn = Math.max(0, t.turbulence ?? 0);
     const alt = Math.max(0, t.altitude ?? 0);
+    // Flyby Doppler shift: pitch the turbine/whine and resonant bands with the
+    // closing radial velocity. 1.0 (all other cameras) reproduces the old mix.
+    const doppler = clamp(t.doppler ?? 1.0, 0.72, 1.38);
 
     // Realistic turbine spool inertia (N1 fan slightly slower than N2 core).
     const ram = Math.min(0.08, speed / 2200);
@@ -552,28 +555,28 @@ export class SimAudio {
     n.rumbleGain.gain.setTargetAtTime(0.11 + n1 * 0.34 + abAmt * 0.22, now, 0.12);
 
     // 1B. Exhaust Nozzle Throat / Cavity Body (warm guttural jet resonance)
-    n.nozzleF1.frequency.setTargetAtTime(fClamp((165 + n1 * 115 + abAmt * 55) * (1 + turb * 0.9)), now, 0.10);
-    n.nozzleF2.frequency.setTargetAtTime(fClamp((330 + n1 * 210 + abAmt * 95) * (1 - turb * 0.8)), now, 0.10);
+    n.nozzleF1.frequency.setTargetAtTime(fClamp((165 + n1 * 115 + abAmt * 55) * (1 + turb * 0.9) * doppler), now, 0.10);
+    n.nozzleF2.frequency.setTargetAtTime(fClamp((330 + n1 * 210 + abAmt * 95) * (1 - turb * 0.8) * doppler), now, 0.10);
     n.nozzleGain.gain.setTargetAtTime(0.085 + n1 * 0.24 + abAmt * 0.16, now, 0.12);
 
     // 2. Mid-band jet thrust roar
-    const roarFreq = (310 + n1 * 440 + abAmt * 260) * (1 + turb * 1.4);
+    const roarFreq = (310 + n1 * 440 + abAmt * 260) * (1 + turb * 1.4) * doppler;
     n.roarBP.frequency.setTargetAtTime(fClamp(roarFreq), now, 0.10);
     n.roarGain.gain.setTargetAtTime(0.055 + n1 * 0.31 + abAmt * 0.16, now, 0.12);
 
     // 3. High-band jet shear / rushing exhaust air
-    const shearFreq = (1050 + n1 * 1400 + abAmt * 700) * (1 + turb);
+    const shearFreq = (1050 + n1 * 1400 + abAmt * 700) * (1 + turb) * doppler;
     n.shearBP.frequency.setTargetAtTime(fClamp(shearFreq), now, 0.12);
     n.shearGain.gain.setTargetAtTime(0.045 + n1 * 0.13 + abAmt * 0.08, now, 0.14);
 
     // 4. Afterburner saturated roar & shock-cell crackle
-    n.abRoarBP.frequency.setTargetAtTime(fClamp((290 + abAmt * 300) * (1 + turb * 1.6)), now, 0.09);
+    n.abRoarBP.frequency.setTargetAtTime(fClamp((290 + abAmt * 300) * (1 + turb * 1.6) * doppler), now, 0.09);
     n.abRoarGain.gain.setTargetAtTime(abAmt * (isExternal ? 0.48 : 0.36), now, 0.10);
     n.abCrackleBP.frequency.setTargetAtTime(fClamp(1750 + abAmt * 950), now, 0.09);
     n.abCrackleGain.gain.setTargetAtTime(abAmt * (isExternal ? 0.20 : 0.09), now, 0.10);
 
     // 5. Turbine spool whine (N1 fan + warm sub-harmonic + N2 core + intake howl)
-    const fanFreq = 540 + n1 * 1280;
+    const fanFreq = (540 + n1 * 1280) * doppler;
     n.fanOsc1.frequency.setTargetAtTime(fClamp(fanFreq), now, 0.08);
     n.fanOsc2.frequency.setTargetAtTime(fClamp(fanFreq * 1.0035), now, 0.08);
     n.fanSubOsc.frequency.setTargetAtTime(fClamp(fanFreq * 0.5), now, 0.08);
@@ -581,7 +584,7 @@ export class SimAudio {
     const fanCurve = 0.021 + Math.sin(clamp(n1, 0, 1) * Math.PI * 0.78) * 0.015 - abAmt * 0.008;
     n.fanGain.gain.setTargetAtTime(Math.max(0.011, fanCurve), now, 0.12);
 
-    const coreFreq = 1520 + n2 * 2200;
+    const coreFreq = (1520 + n2 * 2200) * doppler;
     n.coreOsc.frequency.setTargetAtTime(fClamp(coreFreq), now, 0.08);
     const coreCurve = 0.013 - n2 * 0.004 - abAmt * 0.003;
     n.coreGain.gain.setTargetAtTime(Math.max(0.004, coreCurve), now, 0.14);

@@ -21,7 +21,7 @@ export const BRIDGE_URL = 'http://127.0.0.1:5179';
 export const BRIDGE_VERSION = '1.0.0';
 
 const AP_MODES = ['OFF', 'ALT_HDG', 'ATT'];
-const CAMERA_MODES = ['cockpit', 'chase', 'wing', 'orbit'];
+const CAMERA_MODES = ['cockpit', 'chase', 'wing', 'orbit', 'flyby'];
 const WEAPON_TYPES = ['GUN', 'AIM9', 'MK82'];
 const RADIO_PRIORITIES = ['info', 'warn', 'urgent'];
 const MISSION_IDS = ['free', 'sead', 'strike', 'cap'];
@@ -340,6 +340,7 @@ export function buildTelemetry(app, state = {}, extra = {}) {
     mach: round(finite(raw.mach, speedMs / 340.3), 3),
     altFt: Math.round(finite(raw.altFt, pos.y * METERS_TO_FEET)),
     aglFt: Math.round(finite(raw.aglFt, finite(flight && flight.agl, pos.y) * METERS_TO_FEET)),
+    vsFpm: Math.round(finite(raw.vsFpm, finite(flight && flight.verticalSpeed, 0) * METERS_TO_FEET * 60)),
     heading: round(heading, 1),
     pitch: round(finite(raw.pitch, finite(flight && flight.pitchDeg, 0)), 1),
     roll: round(finite(raw.roll, finite(flight && flight.rollDeg, 0)), 1),

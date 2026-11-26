@@ -24,6 +24,12 @@ function wrapDeltaDeg(a, b) {
   return ((a - b + 540) % 360) - 180;
 }
 
+// Clamp a deviation to the ±1 full-scale needle range.
+function clamp1(v) {
+  if (!Number.isFinite(v)) return 0;
+  return v > 1 ? 1 : v < -1 ? -1 : v;
+}
+
 export class HUD {
   constructor(canvas) {
     this.canvas = canvas;
@@ -69,6 +75,8 @@ export class HUD {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.w, this.h);
     if (!t) return;
+    // Mist wash sits under all symbology so instruments stay crisp in cloud.
+    this._drawCloudMist(t);
     if (t.mode === 'cockpit') {
       this.drawCockpitHUD(t);
     } else {
@@ -169,6 +177,12 @@ export class HUD {
     ctx.font = `700 ${Math.round(11.5 * s)}px ${mono}`;
     ctx.textAlign = 'center';
     ctx.fillText(String(Math.round(hdg) % 360).padStart(3, '0') + '°', cx, cy + ch * 0.5 + 0.5);
+
+    // 1b. Minimal ILS approach pill (top-left) — never blocks the jet -------
+    this._drawExternalILS(ctx, t, s, mono);
+
+    // 1c. Instant replay badge, tucked below the compass strip --------------
+    this._drawReplayBanner(ctx, t, s, mono, cy + ch + 42 * s);
 
     // 2. Top-right camera mode badge ----------------------------------------
     const modeLabel = 'EXT · ' + (t.mode || 'CHASE').toUpperCase();
@@ -442,6 +456,9 @@ export class HUD {
     const brkCol = t.brake ? AMBER : 'rgba(140, 160, 150, 0.35)';
     this._drawStatusPill(ctx, sysX - 78 * s, dockY + 32 * s, 40 * s, 17 * s, flapText, flapCol, s, mono);
     this._drawStatusPill(ctx, sysX - 35 * s, dockY + 32 * s, 35 * s, 17 * s, 'BRK', brkCol, s, mono);
+
+    // Carrier FLOLS meatball on the left edge (clear of the dock/viewport)
+    this._drawMeatball(ctx, t, s, mono);
 
     ctx.restore();
   }
@@ -731,6 +748,241 @@ export class HUD {
       ctx.fillText('GEAR', cx, cy + 150 * s);
     }
 
+    // ------------------------------------------------------- ILS approach cues
+    this._drawCockpitILS(ctx, t, cx, cy, s, color);
+
+    // Carrier FLOLS meatball + instant replay badge
+    const cockpitMono = 'ui-monospace, monospace';
+    this._drawMeatball(ctx, t, s, cockpitMono);
+    this._drawReplayBanner(ctx, t, s, cockpitMono, 12 * s);
+
+    ctx.restore();
+  }
+
+  // -------------------------------------------------------------------------
+  // Shared polish overlays: cloud mist, ILS, FLOLS meatball, replay badge
+  // -------------------------------------------------------------------------
+  _drawCloudMist(t) {
+    const mist = t.cloudMist ?? 0;
+    if (!(mist > 0.02)) return;
+    const ctx = this.ctx;
+    const w = this.w;
+    const h = this.h;
+    const alpha = Math.min(0.36, mist * 0.36);
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+    const r = Math.hypot(w, h) * 0.5;
+    const grad = ctx.createRadialGradient(cx, cy, r * 0.26, cx, cy, r * 0.95);
+    grad.addColorStop(0, 'rgba(225, 236, 245, 0)');
+    grad.addColorStop(0.55, `rgba(225, 236, 245, ${(alpha * 0.35).toFixed(3)})`);
+    grad.addColorStop(1, `rgba(225, 236, 245, ${alpha.toFixed(3)})`);
+    ctx.save();
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+    ctx.restore();
+  }
+
+  _drawCockpitILS(ctx, t, cx, cy, s, color) {
+    const ils = t.ils;
+    if (!ils || !ils.active) return;
+    const locDev = clamp1(ils.locDev);
+    const gsDev = clamp1(ils.gsDev);
+    const nx = cx + locDev * 84 * s;
+    const ny = cy - gsDev * 72 * s;
+    const distNm = Number.isFinite(ils.distNm) ? ils.distNm.toFixed(1) : '--';
+
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+
+    // Four subtle reference dots framing the deviation scales
+    ctx.globalAlpha = 0.3;
+    for (const dy of [-1, 1]) {
+      ctx.beginPath();
+      ctx.arc(cx, cy + dy * 78 * s, 1.6 * s, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    for (const dx of [-1, 1]) {
+      ctx.beginPath();
+      ctx.arc(cx + dx * 96 * s, cy, 1.6 * s, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Localizer (vertical) + glideslope (horizontal) fly-to needles
+    ctx.globalAlpha = 0.95;
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(nx, cy - 64 * s);
+    ctx.lineTo(nx, cy + 64 * s);
+    ctx.moveTo(nx, cy - 64 * s);
+    ctx.lineTo(nx + 5 * s, cy - 64 * s);
+    ctx.moveTo(nx, cy + 64 * s);
+    ctx.lineTo(nx + 5 * s, cy + 64 * s);
+    ctx.moveTo(cx - 40 * s, ny);
+    ctx.lineTo(cx + 40 * s, ny);
+    ctx.stroke();
+
+    // Compact approach label below the pitch ladder
+    ctx.globalAlpha = 0.9;
+    ctx.font = `${Math.round(11 * s)}px ui-monospace, monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText(`ILS ${ils.runwayLabel || ''} · ${distNm} NM`, cx, cy + 178 * s);
+    ctx.restore();
+  }
+
+  _drawExternalILS(ctx, t, s, mono) {
+    const ils = t.ils;
+    if (!ils || !ils.active) return;
+    const locDev = clamp1(ils.locDev);
+    const gsDev = clamp1(ils.gsDev);
+    const distNm = Number.isFinite(ils.distNm) ? ils.distNm.toFixed(1) : '--';
+
+    const pw = 178 * s;
+    const ph = 46 * s;
+    const px = 20 * s;
+    const py = 14 * s;
+
+    ctx.save();
+    roundRect(ctx, px, py, pw, ph, 5 * s);
+    ctx.fillStyle = 'rgba(5, 11, 8, 0.52)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(141, 255, 180, 0.22)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = MUTED;
+    ctx.font = `600 ${Math.round(8.5 * s)}px ${mono}`;
+    ctx.fillText(`ILS ${ils.runwayLabel || ''} · ${distNm} NM`, px + 10 * s, py + 13 * s);
+
+    // Localizer mini bar
+    const locX = px + 40 * s;
+    const locY = py + 31 * s;
+    const locHalf = 24 * s;
+    ctx.strokeStyle = 'rgba(141, 255, 180, 0.30)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(locX - locHalf, locY);
+    ctx.lineTo(locX + locHalf, locY);
+    ctx.moveTo(locX, locY - 4 * s);
+    ctx.lineTo(locX, locY + 4 * s);
+    ctx.stroke();
+    ctx.fillStyle = GREEN;
+    ctx.beginPath();
+    ctx.arc(locX + locDev * locHalf, locY, 2.6 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = GREEN_DIM;
+    ctx.font = `${Math.round(7.5 * s)}px ${mono}`;
+    ctx.textAlign = 'right';
+    ctx.fillText('LOC', locX - locHalf - 4 * s, locY);
+
+    // Glideslope mini bar
+    const gsX = px + pw - 34 * s;
+    const gsY = py + 31 * s;
+    const gsHalf = 8 * s;
+    ctx.strokeStyle = 'rgba(141, 255, 180, 0.30)';
+    ctx.beginPath();
+    ctx.moveTo(gsX, gsY - gsHalf);
+    ctx.lineTo(gsX, gsY + gsHalf);
+    ctx.moveTo(gsX - 4 * s, gsY);
+    ctx.lineTo(gsX + 4 * s, gsY);
+    ctx.stroke();
+    ctx.fillStyle = GREEN;
+    ctx.beginPath();
+    ctx.arc(gsX, gsY - gsDev * gsHalf, 2.6 * s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = GREEN_DIM;
+    ctx.textAlign = 'left';
+    ctx.fillText('GS', gsX + 8 * s, gsY);
+    ctx.restore();
+  }
+
+  _drawMeatball(ctx, t, s, mono) {
+    const mb = t.meatball;
+    if (!mb || !mb.active) return;
+    const w = this.w;
+    const h = this.h;
+    const x = Math.max(46 * s, Math.min(76 * s, w * 0.055));
+    const cy = h * 0.5;
+    const offset = clamp1(mb.ballOffset);
+    const by = cy - offset * 20 * s;
+    const ballCol = Math.abs(offset) > 0.6 ? RED : AMBER;
+    const distNm = Number.isFinite(mb.distNm) ? mb.distNm.toFixed(1) : '--';
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(5, 11, 8, 0.34)';
+    roundRect(ctx, x - 26 * s, cy - 34 * s, 52 * s, 68 * s, 6 * s);
+    ctx.fill();
+
+    // Green datum line + faint vertical rails
+    ctx.strokeStyle = 'rgba(141, 255, 180, 0.72)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(x - 18 * s, cy);
+    ctx.lineTo(x + 18 * s, cy);
+    ctx.stroke();
+    ctx.strokeStyle = 'rgba(141, 255, 180, 0.20)';
+    ctx.beginPath();
+    ctx.moveTo(x - 18 * s, cy - 24 * s);
+    ctx.lineTo(x - 18 * s, cy + 24 * s);
+    ctx.moveTo(x + 18 * s, cy - 24 * s);
+    ctx.lineTo(x + 18 * s, cy + 24 * s);
+    ctx.stroke();
+
+    // The meatball
+    ctx.fillStyle = ballCol;
+    ctx.beginPath();
+    ctx.arc(x, by, 5 * s, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Carrier caption
+    ctx.fillStyle = 'rgba(186, 214, 199, 0.72)';
+    ctx.font = `600 ${Math.round(8.5 * s)}px ${mono}`;
+    ctx.textAlign = 'center';
+    ctx.fillText(`CVN-71 ${distNm}NM`, x, cy + 42 * s);
+    ctx.restore();
+  }
+
+  _drawReplayBanner(ctx, t, s, mono, y) {
+    if (!t.replaying) return;
+    const w = this.w;
+    const rate = Number(t.replayRate) || 1;
+    const time = Number(t.replayTime) || 0;
+    const dur = Number(t.replayDuration) || 0;
+    const text = `REPLAY · ${rate}× · ${time.toFixed(1)}/${dur.toFixed(1)}s`;
+    const hint = '[F2 EXIT · F4 SPEED]';
+
+    ctx.save();
+    ctx.textBaseline = 'middle';
+    ctx.font = `700 ${Math.round(11 * s)}px ${mono}`;
+    const tw = ctx.measureText(text).width;
+    ctx.font = `${Math.round(8.5 * s)}px ${mono}`;
+    const hw = ctx.measureText(hint).width;
+    const bw = Math.max(tw, hw) + 56 * s;
+    const bh = 36 * s;
+    const bx = w * 0.5 - bw * 0.5;
+
+    roundRect(ctx, bx, y, bw, bh, 5 * s);
+    ctx.fillStyle = 'rgba(26, 18, 4, 0.78)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255, 196, 107, 0.62)';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+
+    const pulse = 0.55 + 0.45 * Math.sin(this._t * 6);
+    ctx.fillStyle = `rgba(255, 196, 107, ${pulse.toFixed(2)})`;
+    ctx.beginPath();
+    ctx.arc(bx + 15 * s, y + bh * 0.5, 3.2 * s, 0, Math.PI * 2);
+    ctx.fill();
+
+    const tx = bx + bw * 0.5 + 4 * s;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = AMBER;
+    ctx.font = `700 ${Math.round(11 * s)}px ${mono}`;
+    ctx.fillText(text, tx, y + bh * 0.5 - 6 * s);
+    ctx.fillStyle = 'rgba(255, 216, 160, 0.72)';
+    ctx.font = `${Math.round(8.5 * s)}px ${mono}`;
+    ctx.fillText(hint, tx, y + bh * 0.5 + 8 * s);
     ctx.restore();
   }
 

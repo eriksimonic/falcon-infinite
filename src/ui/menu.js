@@ -86,10 +86,12 @@ const CONTROL_GROUPS = [
     title: 'VIEW & WORLD',
     cls: 'wld',
     items: [
-      [['V', 'C'], 'Cockpit / camera'],
+      [['V'], 'Cockpit view'],
+      [['C'], 'Camera cycle / flyby'],
       [['Y', 'U'], 'Weather / wind'],
       [['T'], 'Time scale'],
       [['[', ']'], 'Time − / + 1h'],
+      [['F2', 'F4'], 'Replay / replay speed'],
       [['F1', 'F3'], 'Hide UI / Perf'],
     ],
   },

@@ -563,6 +563,41 @@ export class CombatVFX {
     return slot;
   }
 
+  /**
+   * Tire touchdown / catapult steam puffs: 6-10 expanding off-white puffs
+   * sprayed outward from the contact point. Headless-safe and allocation-free
+   * (only writes into the preallocated puff pool).
+   */
+  spawnTireSmoke(position, intensity = 1) {
+    const p = position || { x: 0, y: 0, z: 0 };
+    const amt = clamp(Number.isFinite(intensity) ? intensity : 1, 0.15, 2.5);
+    const count = 6 + Math.floor(this.rng() * 5); // 6..10 puffs
+    const px = p.x || 0;
+    const py = p.y || 0;
+    const pz = p.z || 0;
+
+    for (let i = 0; i < count; i++) {
+      const ang = (i / count) * Math.PI * 2 + (this.rng() - 0.5) * 0.9;
+      const rad = 0.25 + this.rng() * 0.95;
+      const spd = (1.1 + this.rng() * 2.6) * amt;
+      // 0xd8dde2 scaled by a little per-puff shading variation.
+      const shade = 0.82 + this.rng() * 0.08;
+      this.puffs.spawn(
+        px + Math.cos(ang) * rad,
+        py + this.rng() * 0.4,
+        pz + Math.sin(ang) * rad,
+        Math.cos(ang) * spd,
+        0.5 + this.rng() * 1.5,
+        Math.sin(ang) * spd,
+        0.9 + this.rng() * 0.6,
+        (0.55 + this.rng() * 0.55) * (0.7 + amt * 0.4),
+        shade * 0.945, shade * 0.965, shade,
+        0.5, 0.6, 0.75, 2.4,
+      );
+    }
+    return count;
+  }
+
   spawnTrail(pos, color = 0xe8eef2, size = 1.6) {
     const r = ((color >> 16) & 255) / 255;
     const g = ((color >> 8) & 255) / 255;

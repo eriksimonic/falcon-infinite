@@ -11,6 +11,51 @@ const C = {
   hudGreen: '#7dff9f',
 };
 
+// ---------------------------------------------------------------------------
+// Pure cockpit indicator logic (headless-safe: no DOM / WebGL touched)
+// ---------------------------------------------------------------------------
+export function computeCockpitIndicators(flight, env = {}) {
+  const f = flight || {};
+  const e = env || {};
+
+  const aoaDeg = (f.aoa || 0) * (180 / Math.PI);
+  const gearDown = (f.gearPos ?? 0) > 0.5;
+
+  // AoA indexer: amber up-chevron = slow/high AoA, green donut = on-speed,
+  // red down-chevron = fast/low AoA. Only lit airborne with gear down.
+  let aoaState = 'off';
+  if (gearDown && !f.onGround) {
+    if (aoaDeg > 13.0) aoaState = 'slow';
+    else if (aoaDeg >= 10.0) aoaState = 'onspeed';
+    else aoaState = 'fast';
+  }
+
+  // Master caution: stall, overspeed, low fuel, RWR threat or flameout.
+  const kts = (f.speed || 0) * 1.94384;
+  const cautionActive = !!(f.stall || kts > 620 || e.lowFuel || e.rwrThreat || e.flameout);
+  const cautionFlash = cautionActive ? (Math.sin((e.time || 0) * 10) > -0.25) : false;
+
+  // Night backlighting / NVG-friendly flood.
+  const night = Math.max(0, Math.min(1, e.night || 0));
+  const panelEmissive = 0.7 + night * 1.4;
+  const floodIntensity = 1.6 + night * 2.4;
+
+  // Canopy rain streaks.
+  const rain = Math.max(0, Math.min(1, e.rain || 0));
+  const rainOpacity = rain > 0.05 ? Math.min(0.65, rain * 0.65) : 0;
+  const rainScrollSpeed = 0.6 + Math.min(3.5, (f.speed || 0) / 70);
+
+  return {
+    aoaState,
+    cautionActive,
+    cautionFlash,
+    panelEmissive,
+    floodIntensity,
+    rainOpacity,
+    rainScrollSpeed,
+  };
+}
+
 function canvasTex(w, h, draw) {
   const c = document.createElement('canvas');
   c.width = w;
@@ -281,6 +326,41 @@ function drawGauge(ctx, W, H, label, value, max, unit) {
 }
 
 // ---------------------------------------------------------------------------
+// Canopy rain streak texture (deterministic procedural streaks + droplets)
+// ---------------------------------------------------------------------------
+function drawRainStreaks(ctx, W, H) {
+  ctx.clearRect(0, 0, W, H);
+  let seed = 0x9e3779b9;
+  const rnd = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  ctx.lineCap = 'round';
+  for (let i = 0; i < 110; i++) {
+    const x = rnd() * W;
+    const y = rnd() * H;
+    const len = 16 + rnd() * 96;
+    const lean = 0.10 + rnd() * 0.16;
+    const alpha = 0.05 + rnd() * 0.20;
+    ctx.strokeStyle = `rgba(198, 226, 240, ${alpha.toFixed(3)})`;
+    ctx.lineWidth = 0.6 + rnd() * 1.9;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + len * lean, y + len);
+    ctx.stroke();
+  }
+  for (let i = 0; i < 46; i++) {
+    const x = rnd() * W;
+    const y = rnd() * H;
+    const r = 0.6 + rnd() * 2.4;
+    ctx.fillStyle = `rgba(210, 235, 246, ${(0.05 + rnd() * 0.16).toFixed(3)})`;
+    ctx.beginPath();
+    ctx.ellipse(x, y, r, r * 1.7, 0.15, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ---------------------------------------------------------------------------
 export function createCockpit() {
   const group = new THREE.Group();
   group.name = 'cockpit';
@@ -345,6 +425,20 @@ export function createCockpit() {
   // glare shield
   const glare = rbox(1.12, 0.04, 0.34, matDark, 0, 0.305, 0.12);
   panel.add(glare);
+
+  // master caution lamp on the right glare shield
+  const cautionMat = new THREE.MeshStandardMaterial({
+    color: 0x3a2606, roughness: 0.45, metalness: 0.12,
+    emissive: 0xffb020, emissiveIntensity: 0.05,
+  });
+  const masterCaution = new THREE.Group();
+  masterCaution.position.set(0.26, 0.33, 0.24);
+  panel.add(masterCaution);
+  masterCaution.add(rbox(0.078, 0.052, 0.02, matScreenEdge, 0, 0, 0));
+  const cautionLamp = new THREE.Mesh(new THREE.BoxGeometry(0.056, 0.032, 0.014), cautionMat);
+  cautionLamp.name = 'masterCaution';
+  cautionLamp.position.set(0, 0, 0.013);
+  masterCaution.add(cautionLamp);
 
   // HUD control panel
   const hudPanel = rbox(0.34, 0.12, 0.03, matLight, 0, 0.22, 0.05);
@@ -441,6 +535,54 @@ export function createCockpit() {
   hud.add(rbox(0.018, 0.16, 0.018, hudFrameMat, -0.15, -0.21, 0.018));
   hud.add(rbox(0.018, 0.16, 0.018, hudFrameMat, 0.15, -0.21, 0.018));
 
+  // ---- AoA indexer (beside the left HUD combiner strut) ------------------
+  const aoaIndexer = new THREE.Group();
+  aoaIndexer.position.set(-0.19, 1.13, -3.35);
+  group.add(aoaIndexer);
+  aoaIndexer.add(rbox(0.075, 0.17, 0.026, matScreenEdge, 0, 0, 0));
+
+  const aoaLampMat = (hex) => new THREE.MeshStandardMaterial({
+    color: 0x111310, roughness: 0.42, metalness: 0.08,
+    emissive: hex, emissiveIntensity: 0.05,
+  });
+  const chevronShape = new THREE.Shape();
+  chevronShape.moveTo(0, 0.018);
+  chevronShape.lineTo(0.02, -0.013);
+  chevronShape.lineTo(-0.02, -0.013);
+  chevronShape.closePath();
+  const chevronGeo = new THREE.ShapeGeometry(chevronShape);
+
+  const aoaUp = new THREE.Mesh(chevronGeo, aoaLampMat(0xffaa22));
+  aoaUp.name = 'aoaUp';
+  aoaUp.position.set(0, 0.053, 0.021);
+
+  const aoaMid = new THREE.Mesh(new THREE.TorusGeometry(0.015, 0.0055, 6, 16), aoaLampMat(0x33ff77));
+  aoaMid.name = 'aoaMid';
+  aoaMid.position.set(0, 0, 0.021);
+
+  const aoaDown = new THREE.Mesh(chevronGeo, aoaLampMat(0xff3322));
+  aoaDown.name = 'aoaDown';
+  aoaDown.rotation.z = Math.PI;
+  aoaDown.position.set(0, -0.053, 0.021);
+
+  aoaIndexer.add(aoaUp, aoaMid, aoaDown);
+
+  // ---- canopy rain overlay ---------------------------------------------
+  const rainTex = canvasTex(256, 256, drawRainStreaks);
+  rainTex.tex.wrapS = THREE.RepeatWrapping;
+  rainTex.tex.wrapT = THREE.RepeatWrapping;
+  const rainMat = new THREE.MeshBasicMaterial({
+    map: rainTex.tex, transparent: true, opacity: 0,
+    depthWrite: false, side: THREE.DoubleSide, toneMapped: false,
+  });
+  const canopyRain = new THREE.Mesh(new THREE.PlaneGeometry(0.88, 0.54), rainMat);
+  canopyRain.name = 'canopyRain';
+  canopyRain.position.set(0, 0.97, -3.02);
+  canopyRain.rotation.x = -0.34;
+  canopyRain.visible = false;
+  canopyRain.renderOrder = 4;
+  group.add(canopyRain);
+
   // ---- consoles ----------------------------------------------------------
   const consoleTexture = canvasTex(512, 256, drawConsoles);
   const consoleMat = new THREE.MeshBasicMaterial({ map: consoleTexture.tex, toneMapped: false });
@@ -536,19 +678,56 @@ export function createCockpit() {
     stall: false, heading: 0, airport: null, windDir: 0, windKts: 0,
   };
 
+  const indEnv = {
+    night: 0, rain: 0, lowFuel: false, rwrThreat: false, flameout: false, time: 0,
+  };
+
   function update(dt, flight, env) {
     acc += dt;
+    const f = flight || {};
     // animate throttle / stick / pedals every frame
-    throttle.rotation.x = -0.45 + flight.throttle * 0.55;
-    stick.rotation.x = (flight.controls?.pitch || 0) * 0.18;
-    stick.rotation.z = -(flight.controls?.roll || 0) * 0.14;
-    pedals[0].rotation.y = (flight.controls?.yaw || 0) * 0.12;
-    pedals[1].rotation.y = (flight.controls?.yaw || 0) * 0.12;
+    throttle.rotation.x = -0.45 + (f.throttle || 0) * 0.55;
+    stick.rotation.x = (f.controls?.pitch || 0) * 0.18;
+    stick.rotation.z = -(f.controls?.roll || 0) * 0.14;
+    pedals[0].rotation.y = (f.controls?.yaw || 0) * 0.12;
+    pedals[1].rotation.y = (f.controls?.yaw || 0) * 0.12;
+
+    // ---- live pilot feedback (per frame, never throttled) -----------------
+    const e = env || {};
+    indEnv.night = e.night ?? 0;
+    indEnv.rain = e.rain ?? 0;
+    indEnv.lowFuel = !!(e.lowFuel ?? f.lowFuel);
+    indEnv.rwrThreat = !!(e.rwrThreat ?? f.rwrThreat);
+    indEnv.flameout = !!(e.flameout ?? f.flameout);
+    indEnv.time = e.time ?? acc;
+    const ind = computeCockpitIndicators(f, indEnv);
+
+    // AoA indexer lamps (amber up / green donut / red down)
+    const lampOn = 2.6;
+    const lampOff = 0.05;
+    aoaUp.material.emissiveIntensity = ind.aoaState === 'slow' ? lampOn : lampOff;
+    aoaMid.material.emissiveIntensity = ind.aoaState === 'onspeed' ? lampOn : lampOff;
+    aoaDown.material.emissiveIntensity = ind.aoaState === 'fast' ? lampOn : lampOff;
+
+    // master caution (bright amber while flashing, dim glow when active)
+    cautionMat.emissiveIntensity = ind.cautionFlash ? 3.2 : (ind.cautionActive ? 0.4 : 0.05);
+
+    // night backlighting + NVG-friendly interior flood
+    matPanel.emissiveIntensity = ind.panelEmissive;
+    matDark.emissiveIntensity = ind.panelEmissive * 0.85;
+    light.intensity = ind.floodIntensity;
+
+    // canopy raindrop streaks
+    canopyRain.visible = ind.rainOpacity > 0.01;
+    if (canopyRain.visible) {
+      rainMat.opacity = ind.rainOpacity;
+      rainTex.tex.offset.y = (((rainTex.tex.offset.y - ind.rainScrollSpeed * dt) % 1) + 1) % 1;
+    }
 
     screenAcc += dt;
     if (screenAcc < 0.1) return;
     screenAcc = 0;
-    if (!env) return;
+    if (!env || !flight) return;
 
     tmpTelemetry.roll = flight.rollDeg;
     tmpTelemetry.pitch = flight.pitchDeg;
@@ -575,5 +754,9 @@ export function createCockpit() {
     }
   }
 
-  return { group, update, hudGlass: glass, mfdL, mfdR, screenL, screenR };
+  return {
+    group, update, hudGlass: glass, mfdL, mfdR, screenL, screenR,
+    aoaIndexer, aoaUp, aoaMid, aoaDown,
+    masterCaution: cautionLamp, canopyRain,
+  };
 }

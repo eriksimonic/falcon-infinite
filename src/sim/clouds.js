@@ -335,6 +335,53 @@ export class CloudSystem {
     this.stats = { puffs: n, clusters };
   }
 
+  /**
+   * Smooth deterministic horizontal density field (0..1) used for the
+   * cloud-entry mist wash. Bilinear value noise over the hash2 lattice so the
+   * transition into and out of cloud is never steppy.
+   */
+  _mistNoise(x, z) {
+    const scale = 1 / 850;
+    const fx = x * scale;
+    const fz = z * scale;
+    const ix = Math.floor(fx);
+    const iz = Math.floor(fz);
+    const ux = fx - ix;
+    const uz = fz - iz;
+    const sx = ux * ux * (3 - 2 * ux);
+    const sz = uz * uz * (3 - 2 * uz);
+    const a = hash2(ix, iz, 4242);
+    const b = hash2(ix + 1, iz, 4242);
+    const c = hash2(ix, iz + 1, 4242);
+    const d = hash2(ix + 1, iz + 1, 4242);
+    const ab = a + (b - a) * sx;
+    const cd = c + (d - c) * sx;
+    return ab + (cd - ab) * sz;
+  }
+
+  /**
+   * Cloud-entry mist density at a world position: 0 in clear air or outside the
+   * cloud deck, smoothly rising to 1 inside a thick overcast band.
+   */
+  getCloudDensity(pos, weather) {
+    if (!pos) return 0;
+    const st = weather && weather.state ? weather.state : null;
+    if (!st) return 0;
+    const coverage = clamp(st.clouds ?? st.coverage ?? 0, 0, 1);
+    if (coverage <= 0.02) return 0;
+
+    const base = clamp(st.cloudBase ?? 1600, 1150, 2100);
+    const thickness = 750;
+    const t = ((pos.y || 0) - base) / thickness;
+    if (t <= 0 || t >= 1) return 0;
+
+    const vert = smoothstep(0, 0.22, t) * (1 - smoothstep(0.78, 1, t));
+    if (vert <= 0) return 0;
+
+    const wisp = this._mistNoise(pos.x || 0, pos.z || 0);
+    return clamp(coverage * vert * (0.55 + 0.75 * wisp), 0, 1);
+  }
+
   update(dt, camera, weather, sky) {
     this._weather = weather;
     this._time += dt;

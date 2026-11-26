@@ -164,7 +164,7 @@ const TOOLS = [
     description:
       'Switch weather (clear/few/scattered/overcast/storm), wind (auto/calm/breeze/windy/gale), ' +
       'theater (temperate/desert), time of day (hour 0..24), time scale (1/5/20/60/300), ' +
-      'or camera (cockpit/chase/wing/orbit).',
+      'or camera (cockpit/chase/wing/orbit/flyby).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -173,7 +173,7 @@ const TOOLS = [
         theater: { type: 'string', enum: ['temperate', 'desert'] },
         hour: { type: 'number', minimum: 0, maximum: 24, description: 'Simulated local hour; 24 wraps to 0.' },
         timeScale: { type: 'number', enum: [1, 5, 20, 60, 300] },
-        camera: { type: 'string', enum: ['cockpit', 'chase', 'wing', 'orbit'] },
+        camera: { type: 'string', enum: ['cockpit', 'chase', 'wing', 'orbit', 'flyby'] },
       },
       additionalProperties: false,
     },

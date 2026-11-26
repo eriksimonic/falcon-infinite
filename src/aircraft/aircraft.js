@@ -13,6 +13,9 @@ const _q = new THREE.Quaternion();
 const _e = new THREE.Euler();
 const _lookQ = new THREE.Quaternion();
 const _m = new THREE.Matrix4();
+const _fbRight = new THREE.Vector3();
+const _fbUp = new THREE.Vector3();
+const _fbTmp = new THREE.Vector3();
 
 export class Aircraft {
   constructor(scene, world) {
@@ -37,6 +40,11 @@ export class Aircraft {
     this.chasePitch = 0;
     this.chaseDist = CONFIG.camera.chaseDistance;
     this.orbitAngle = 0;
+    // Telephoto flyby camera anchor + Doppler shift fed to the engine audio.
+    this.dopplerRatio = 1.0;
+    this._flybyAnchor = new THREE.Vector3();
+    this._flybyAnchored = false;
+    this._cockpitAlerts = null;
     this._camPos = new THREE.Vector3();
     this._camInit = false;
     this._shake = 0;
@@ -59,7 +67,10 @@ export class Aircraft {
     this.beacon.position.set(0, 0.90, 1.55);
     this.model.add(this.beacon);
 
-    this._env = { airport: null, windX: 0, windZ: 0 };
+    this._env = {
+      airport: null, windX: 0, windZ: 0,
+      night: 0, rain: 0, lowFuel: false, rwrThreat: false, flameout: false, time: 0,
+    };
     this._state = { time: 0 };
   }
 
@@ -78,6 +89,8 @@ export class Aircraft {
   setMode(mode) {
     this.mode = mode;
     this._camInit = false;
+    this._flybyAnchored = false;
+    this.dopplerRatio = 1.0;
     if (mode === 'cockpit') {
       this.camera.fov = CONFIG.camera.cockpitFov;
     } else {
@@ -87,7 +100,7 @@ export class Aircraft {
   }
 
   nextMode() {
-    const order = ['cockpit', 'chase', 'wing', 'orbit'];
+    const order = ['cockpit', 'chase', 'wing', 'orbit', 'flyby'];
     const i = order.indexOf(this.mode);
     this.setMode(order[(i + 1) % order.length]);
     return this.mode;
@@ -98,10 +111,12 @@ export class Aircraft {
     return this.mode;
   }
 
-  update(dt, cmd, weather, input, started) {
+  update(dt, cmd, weather, input, started, cockpitAlerts = null) {
     const flight = this.flight;
     flight.update(dt, cmd, this.world, weather);
     this._state.time += dt;
+
+    if (cockpitAlerts) this._cockpitAlerts = cockpitAlerts;
 
     this.model.position.copy(flight.position);
     this.model.quaternion.copy(flight.quaternion);
@@ -141,6 +156,17 @@ export class Aircraft {
     } else {
       env.airport = null;
     }
+
+    // Cockpit environmental cues (night backlighting, canopy rain, master
+    // caution). Alerts from main.js win; otherwise fall back to weather/sky.
+    const alerts = cockpitAlerts || this._cockpitAlerts;
+    env.night = clamp(alerts?.night ?? night, 0, 1);
+    env.rain = clamp(alerts?.rain ?? weather?.state?.rain ?? 0, 0, 1);
+    env.lowFuel = !!alerts?.lowFuel;
+    env.rwrThreat = !!alerts?.rwrThreat;
+    env.flameout = !!alerts?.flameout;
+    env.time = this._state.time;
+
     this.cockpit.update(dt, flight, env);
 
     this._updateCamera(dt, input, started);
@@ -151,6 +177,9 @@ export class Aircraft {
     const cam = this.camera;
     const pos = flight.position;
     const q = flight.quaternion;
+
+    // Only the telephoto flyby rig produces a Doppler shift for the engine audio.
+    if (this.mode !== 'flyby') this.dopplerRatio = 1.0;
 
     if (!started) {
       // slow showcase orbit behind the menu
@@ -269,6 +298,40 @@ export class Aircraft {
       cam.lookAt(_v2);
       cam.fov = CONFIG.camera.externalFov;
       cam.updateProjectionMatrix();
+      return;
+    }
+
+    if (this.mode === 'flyby') {
+      // Tripod planted ahead of the jet: the aircraft flies at the camera,
+      // punches past it, then the anchor reseats for the next pass.
+      _fbRight.set(1, 0, 0).applyQuaternion(q);
+      _fbUp.set(0, 1, 0).applyQuaternion(q);
+      const anchor = this._flybyAnchor;
+
+      const passed = this._flybyAnchored && _fbTmp.copy(pos).sub(anchor).dot(flight.forward) > 320;
+      const tooFar = this._flybyAnchored && _fbTmp.copy(pos).sub(anchor).length() > 900;
+      if (!this._flybyAnchored || passed || tooFar) {
+        const ahead = clamp(flight.speed * 2.1, 110, 340);
+        anchor.copy(pos)
+          .addScaledVector(flight.forward, ahead)
+          .addScaledVector(_fbRight, 26)
+          .addScaledVector(_fbUp, 10);
+        const gh = this.world.heightAt(anchor.x, anchor.z) + 6;
+        if (anchor.y < gh) anchor.y = gh;
+        this._flybyAnchored = true;
+      }
+
+      cam.position.copy(anchor);
+      cam.up.set(0, 1, 0);
+      cam.lookAt(pos);
+      cam.fov = 38;
+      cam.updateProjectionMatrix();
+
+      // Radial closing speed (positive = inbound) -> engine Doppler pitch.
+      _fbTmp.copy(anchor).sub(pos);
+      const dist = _fbTmp.length();
+      const vToward = dist > 1e-3 ? _fbTmp.multiplyScalar(1 / dist).dot(flight.velocity) : 0;
+      this.dopplerRatio = clamp(340 / Math.max(120, 340 - vToward), 0.74, 1.36);
     }
   }
 
