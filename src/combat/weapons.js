@@ -32,8 +32,8 @@ export const WEAPONS = {
     fuseRadius: 18,
     navConstant: 3.5,
     maxLateralAccel: 400, // ~40 g structural limit
-    damage: 100,
-    splashRadius: 24,
+    damage: 120,
+    splashRadius: 32,
     ttl: 14,
   },
   MK82: {
@@ -41,8 +41,9 @@ export const WEAPONS = {
     cooldown: 0.45,
     ejectSpeed: 2.5, // m/s downward ejection
     drag: 1e-4, // low aerodynamic drag coefficient (per m/s)
-    damage: 140,
-    splashRadius: 55,
+    // Feature 21: a true 500 lb blast — leaves a crater-sized kill zone.
+    damage: 180,
+    splashRadius: 75,
     ttl: 90,
   },
   FLARE: {
@@ -679,12 +680,17 @@ export class WeaponSystem {
     _prevPos.copy(p.position);
 
     if (p.type === 'AIM9') {
+      // A rocket with no (live) target cannot guide: after the motor burns out
+      // gravity bends its path down so a stray round lands instead of flying
+      // dead level into infinity.
+      const guided = !!(p.target && p.target.alive !== false && p.target.position);
       if (p.age <= p.burnTime) {
         p.speed = Math.min(p.maxSpeed, p.speed + p.accel * h);
       } else {
         p.speed = Math.max(250, p.speed * (1 - 0.012 * h)); // coast
       }
       this._guide(p, h);
+      if (!guided && p.age > p.burnTime) p.velocity.y -= G * h;
       if (p.velocity.lengthSq() > 1e-6) p.velocity.setLength(p.speed);
       p.position.addScaledVector(p.velocity, h);
 

@@ -257,6 +257,64 @@ function run(vfx, seconds, flight, wx, camera = null, dt = 1 / 60) {
   ok(mf.muzzleTimer === 0 && !mf.muzzle.mesh.visible, 'muzzle flash ends after ~0.06 s');
 }
 
+// ------------------------- 4b. Feature 21 multi-stage blast visibility
+{
+  const vfx = new CombatVFX(null);
+  const wx = weather(0, 0, 0.1);
+  const zero = makeFlight({ speed: 0, onGround: true });
+  const slot = vfx.spawnExplosion(new THREE.Vector3(0, 0, 0), 4.5);
+
+  ok(slot.duration === 5.5, '21: explosion lingers 5.5 s', String(slot.duration));
+  ok(!!slot.fireball && !!slot.fireballMat, '21: pooled fireball shell exists');
+  ok(slot.fireballMat.blending === THREE.NormalBlending,
+    '21: fireball uses normal blending (daylight-visible)');
+  ok(slot.fireballMat.color.getHex() === 0xff5a18, '21: fireball is orange-red 0xff5a18',
+    '0x' + slot.fireballMat.color.getHex().toString(16));
+  ok(slot.coreMat.color.getHex() === 0xfff0b8,
+    '21: incandescent core stays white-yellow 0xfff0b8');
+
+  const first = vfx.update(1 / 60, zero, wx, null);
+  ok(vfx.sparks.count >= 20 && vfx.sparks.count <= 28,
+    '21: detonation throws 20–28 hot sparks', String(vfx.sparks.count));
+  ok(vfx.puffs.count >= 14, '21: detonation bursts 14 smoke puffs',
+    String(vfx.puffs.count));
+  ok(first.activeExplosions === 1, '21: explosion active on the first frame');
+
+  // Shockwave ring reaches a very large radius inside its 1.35 s life.
+  run(vfx, 0.6, zero, wx, null, 1 / 120);
+  ok(slot.ring.visible && slot.ring.scale.x > 4.5 * 10,
+    '21: shockwave ring expands past 45 m', slot.ring.scale.x.toFixed(1) + ' m');
+  ok(slot.fireball.visible, '21: fireball still burning at 0.6 s');
+
+  // Past 1.2 s the blast must still be a big, particle-rich event.
+  const mid = run(vfx, 0.7, zero, wx, null, 1 / 60);
+  ok(mid.last.activeExplosions >= 1, '21: blast still active past 1.2 s',
+    't=' + slot.t.toFixed(2) + 's');
+  ok(mid.last.activeParticles >= 25, '21: >= 25 smoke/spark particles past 1.2 s',
+    String(mid.last.activeParticles));
+  ok(slot.fireball.visible && slot.fireball.scale.x > 4.5 * 8,
+    '21: fireball expands to ~50 m for a Mk-82', slot.fireball.scale.x.toFixed(1) + ' m');
+  ok(slot.core.visible, '21: incandescent core keeps glowing at ~1.3 s');
+
+  // Lingering smoke column: the blast is not gone at 3 s either.
+  const late = run(vfx, 2.2, zero, wx, null, 1 / 60);
+  ok(late.last.activeExplosions === 1, '21: explosion lingers past 3 s');
+  ok(late.last.activeParticles >= 10, '21: mushroom column keeps smoking past 3 s',
+    String(late.last.activeParticles));
+
+  // ... and it completes cleanly at duration, with all meshes stood down.
+  run(vfx, 3, zero, wx, null, 1 / 60);
+  ok(vfx.activeExplosions === 0, '21: explosion completes after its duration');
+  ok(!slot.core.visible && !slot.ring.visible && !slot.fireball.visible,
+    '21: all explosion meshes hidden after expiry');
+  ok(slot.fireballMat.opacity === 0 && slot.coreMat.opacity === 0 && slot.ringMat.opacity === 0,
+    '21: all explosion opacities zeroed after expiry');
+
+  // No per-frame allocation: the fireball is part of the fixed pool.
+  ok(vfx.explosions.length === 12 && vfx.group.children.length > 0,
+    '21: fireball is pooled, not created per blast');
+}
+
 // --------------------------------------------------------------- 5. reset()
 {
   const vfx = new CombatVFX(null);

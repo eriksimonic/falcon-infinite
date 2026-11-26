@@ -279,6 +279,7 @@ class App {
     this.weapons.reset();
     this.vfx.reset();
     this.targets.clear();
+    this.world.buildings.resetDamage();
     this.autopilot.disengage();
     this.fuel.reset();
     this.tanker.reset(spawn);
@@ -750,8 +751,14 @@ class App {
           if (ev.kind === 'trail') {
             this.vfx.spawnTrail(ev.position, ev.color, ev.size);
           } else if (ev.kind === 'impact') {
-            const scale = ev.weapon === 'MK82' ? 2.2 : (ev.weapon === 'AIM9' ? 1.5 : 0.45);
+            const scale = ev.weapon === 'MK82' ? 4.5 : (ev.weapon === 'AIM9' ? 2.8 : 0.65);
             this.vfx.spawnExplosion(ev.position, scale);
+            // Feature 21: rising smoke columns that linger after the fireball.
+            if (ev.weapon === 'MK82') {
+              this.vfx.spawnSmokePlume(ev.position, 28);
+            } else if (ev.weapon === 'AIM9') {
+              this.vfx.spawnSmokePlume(ev.position, 12);
+            }
             const dist = Math.hypot(
               ev.position.x - f.position.x,
               ev.position.y - f.position.y,
@@ -759,6 +766,15 @@ class App {
             );
             if (ev.weapon !== 'GUN' || ev.hitTargetId) this.combatAudio.explosion(dist);
             const destroyed = this.targets.applyImpact(ev);
+            // Feature 20/21: the same blast levels any city in the kill zone.
+            const bRes = this.world.buildings.applyBlast(ev.position, ev.splashRadius, ev.damage);
+            for (let i = 0; i < Math.min(3, bRes.positions.length); i++) {
+              this.vfx.spawnSmokePlume(bRes.positions[i], 55);
+            }
+            if (bRes.destroyedCount > 0 && destroyed.length === 0) {
+              this.ui.toast('IMPACT · ' + bRes.destroyedCount
+                + (bRes.destroyedCount > 1 ? ' STRUCTURES DESTROYED' : ' STRUCTURE DESTROYED'));
+            }
             if (destroyed.length > 0) {
               this.missions.notifyDestroyed(destroyed);
               for (const d of destroyed) {

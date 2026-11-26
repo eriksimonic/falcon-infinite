@@ -362,9 +362,30 @@ function heightSampler(x, z, R) {
 // Buildings are only kept on dry land. No airport test is needed here: sites
 // are already cleared by padRadius + 400 + 0.8*R, and every footprint stays
 // inside R of the centre.
-function pushBuilding(list, heightAt, x, z, w, d, h, rot, color, kind) {
+//
+// `reliefMax` rejects a footprint whose four rotated corners span more than
+// that many metres of terrain, so wide blocks never bridge a hillside at a
+// silly angle. Buildings that are accepted keep y = ground at their centre:
+// the renderer grounds each corner itself.
+function pushBuilding(list, heightAt, x, z, w, d, h, rot, color, kind, reliefMax = Infinity) {
   const y = heightAt(x, z);
   if (y < 1.5) return false;
+  if (reliefMax < Infinity) {
+    const c = Math.cos(rot);
+    const s = Math.sin(rot);
+    const hw = w * 0.5;
+    const hd = d * 0.5;
+    let lo = y;
+    let hi = y;
+    for (let i = 0; i < 4; i++) {
+      const su = (i & 1) ? hw : -hw;
+      const sv = (i & 2) ? hd : -hd;
+      const hc = heightAt(x + su * c - sv * s, z + su * s + sv * c);
+      if (hc < lo) lo = hc;
+      if (hc > hi) hi = hc;
+    }
+    if (hi - lo > reliefMax) return false;
+  }
   list.push({
     x: r2(x),
     z: r2(z),
@@ -399,10 +420,10 @@ function pickColor(rng, kind) {
 function layoutMetro(x, z, R, rng, heightAt) {
   const rot = rng() * Math.PI;
   const frame = makeFrame(x, z, rot);
-  const pitch = 82 + rng() * 50; // street centre spacing, 82..132 m
-  const streetW = 9 + rng() * 5;
-  const avenueW = 18 + rng() * 8;
-  const avenueEvery = 4 + ((rng() * 3) | 0);
+  const pitch = 86 + rng() * 46; // street centre spacing, 86..132 m
+  const streetW = 9 + rng() * 4;
+  const avenueW = 19 + rng() * 7; // boulevards are wide enough for a median
+  const avenueEvery = 3 + ((rng() * 3) | 0);
   const lineW = (i) => (i % avenueEvery === 0 ? avenueW : streetW);
   const n = Math.ceil(R / pitch) + 1;
 
@@ -416,18 +437,41 @@ function layoutMetro(x, z, R, rng, heightAt) {
     addRoad(roads, frame, -half, u, half, u, w);
   }
 
-  const target = 300 + ((rng() * 221) | 0); // 300..520, inside the 260..520 contract
+  // Beltway: a 16-sided perimeter ring outside the mid-rise ring. It ties the
+  // outer blocks together and gives the city a definite edge instead of a
+  // ragged fade-out of grid streets.
+  const ringR = R * (0.74 + rng() * 0.07);
+  const ringW = 15 + rng() * 7;
+  const ringSides = 16;
+  const ring = [];
+  for (let k = 0; k < ringSides; k++) {
+    const a = (k / ringSides) * Math.PI * 2;
+    ring.push({ u: Math.cos(a) * ringR, v: Math.sin(a) * ringR });
+  }
+  for (let k = 0; k < ringSides; k++) {
+    const p0 = ring[k];
+    const p1 = ring[(k + 1) % ringSides];
+    addRoad(roads, frame, p0.u, p0.v, p1.u, p1.v, ringW);
+  }
+  const ringClear = ringW * 0.5 + pitch * 0.36;
+
+  const target = 380 + ((rng() * 121) | 0); // 380..500, inside the 260..520 contract
+  const indAng = rng() * Math.PI * 2; // bearing of the industrial sector
+  const cbdR = R * 0.3; // downtown core
+  const midR = R * 0.64; // mid-rise ring
   const cands = [];
   for (let i = -n; i < n; i++) {
     for (let j = -n; j < n; j++) {
       const cu = (i + 0.5) * pitch;
       const cv = (j + 0.5) * pitch;
       const dist = len(cu, cv);
-      if (dist > R * 0.92) continue;
+      if (dist > R * 0.93) continue;
+      // Nothing is built on the beltway corridor.
+      if (Math.abs(dist - ringR) < ringClear) continue;
 
       // Some blocks stay parks / open ground: the street grid keeps its shape
       // but no buildings fill the block.
-      const parkChance = dist < R * 0.35 ? 0.02 : 0.07;
+      const parkChance = dist < cbdR ? 0.015 : dist < midR ? 0.05 : 0.085;
       if (rng() < parkChance) continue;
 
       const bw = pitch - (lineW(i) + lineW(i + 1)) * 0.5;
@@ -437,10 +481,22 @@ function layoutMetro(x, z, R, rng, heightAt) {
       const innerD = bd - 2 * margin;
       if (innerW < 12 || innerD < 12) continue;
 
-      const core = dist < R * 0.35;
-      const mid = !core && dist < R * 0.7;
-      const cols = core ? 2 + (rng() < 0.55 ? 1 : 0) : mid ? 2 : 1 + (rng() < 0.5 ? 1 : 0);
-      const rows = core ? 2 + (rng() < 0.45 ? 1 : 0) : mid ? 2 : 1;
+      const core = dist < cbdR;
+      const mid = !core && dist < midR;
+      let dAng = Math.abs(Math.atan2(cv, cu) - indAng);
+      if (dAng > Math.PI) dAng = Math.PI * 2 - dAng;
+      // One outer wedge is zoned industrial, the rest of the fringe stays
+      // residential: warehouses only ever appear downwind of the houses.
+      const industrial = !core && dist > R * 0.52 && dAng < 0.62;
+
+      const cols = core ? 2 + (rng() < 0.6 ? 1 : 0)
+        : industrial ? 1
+          : mid ? 2
+            : 1 + (rng() < 0.5 ? 1 : 0);
+      const rows = core ? 2 + (rng() < 0.5 ? 1 : 0)
+        : industrial ? 1 + (rng() < 0.55 ? 1 : 0)
+          : mid ? 2
+            : 1;
 
       for (let a = 0; a < cols; a++) {
         for (let b = 0; b < rows; b++) {
@@ -455,26 +511,23 @@ function layoutMetro(x, z, R, rng, heightAt) {
           let kind;
 
           if (core) {
-            const t = Math.max(0.05, 1 - dist / (R * 0.35));
-            h = 20 + 100 * Math.pow(t, 1.2) * (0.55 + rng() * 0.7);
-            h = Math.min(120, h);
-            kind = h > 52 ? 'tower' : h > 26 ? 'apartment' : 'shop';
-            w = Math.min(lotW * 0.88, Math.max(w, 18 + rng() * 14));
-            d = Math.min(lotD * 0.88, Math.max(d, 16 + rng() * 12));
+            const t = Math.max(0.06, 1 - dist / cbdR);
+            h = 26 + 122 * Math.pow(t, 1.15) * (0.55 + rng() * 0.8);
+            h = Math.min(165, h);
+            kind = h > 56 ? 'tower' : h > 22 ? 'apartment' : 'shop';
+            w = Math.min(lotW * 0.9, Math.max(w, 19 + rng() * 15));
+            d = Math.min(lotD * 0.9, Math.max(d, 17 + rng() * 13));
+          } else if (industrial) {
+            w = Math.min(lotW * 0.95, 22 + rng() * 22);
+            d = Math.min(lotD * 0.95, 15 + rng() * 18);
+            h = 6 + rng() * 8;
+            kind = rng() < 0.62 ? 'industrial' : 'shed';
           } else if (mid) {
-            h = 8 + rng() * 19;
-            kind = h > 20 ? 'apartment' : rng() < 0.55 ? 'shop' : 'house';
+            h = 9 + rng() * 20;
+            kind = h > 21 ? 'apartment' : rng() < 0.6 ? 'shop' : 'house';
           } else {
-            const industrial = dist > R * 0.76 && rng() < 0.2;
-            if (industrial) {
-              w = Math.min(lotW * 0.94, 20 + rng() * 22);
-              d = Math.min(lotD * 0.94, 14 + rng() * 18);
-              h = 5 + rng() * 7;
-              kind = rng() < 0.5 ? 'industrial' : 'shed';
-            } else {
-              h = 4 + rng() * 6.5;
-              kind = rng() < 0.8 ? 'house' : rng() < 0.5 ? 'shop' : 'shed';
-            }
+            h = 4 + rng() * 6.5;
+            kind = rng() < 0.78 ? 'house' : rng() < 0.5 ? 'shop' : 'shed';
           }
 
           // 90 degree variety, with a few degrees of natural slop.
@@ -501,13 +554,44 @@ function layoutMetro(x, z, R, rng, heightAt) {
     }
   }
 
+  // Landmarks: three signature towers inside the CBD. They are ordinary lots
+  // with a forced height, so the skyline always has a recognisable peak.
+  const corePool = [];
+  for (let k = 0; k < cands.length; k++) {
+    const c = cands[k];
+    if (len(c.u, c.v) < R * 0.24 && c.w > 18 && c.d > 16) corePool.push(k);
+  }
+  const marks = Math.min(3, corePool.length);
+  for (let k = 0; k < marks; k++) {
+    const c = cands[corePool[Math.floor((k * (corePool.length - 1)) / Math.max(1, marks))]];
+    c.h = Math.max(c.h, 108 + rng() * 52);
+    c.kind = 'tower';
+    c.color = pickColor(rng, 'tower');
+    c.priority = -1.5 + rng() * 0.4;
+  }
+
   cands.sort((a, b) => a.priority - b.priority);
   const buildings = [];
   for (const c of cands) {
     if (buildings.length >= target) break;
     if (len(c.u, c.v) > R * 0.93) continue;
     const p = frame.toWorld(c.u, c.v);
-    pushBuilding(buildings, heightAt, p.x, p.z, c.w, c.d, c.h, -rot + c.rotOff, c.color, c.kind);
+    const relief = 1.6 + Math.hypot(c.w, c.d) * 0.11;
+    if (pushBuilding(buildings, heightAt, p.x, p.z, c.w, c.d, c.h, -rot + c.rotOff, c.color, c.kind, relief)) {
+      c.used = true;
+    }
+  }
+  // Contract floor: if slope rejection cost us too many lots, fill the rest
+  // from the slopes we normally refuse so the 260-building minimum holds.
+  if (buildings.length < 260) {
+    for (const c of cands) {
+      if (buildings.length >= 260) break;
+      if (c.used) continue;
+      const p = frame.toWorld(c.u, c.v);
+      if (pushBuilding(buildings, heightAt, p.x, p.z, c.w, c.d, c.h, -rot + c.rotOff, c.color, c.kind, Infinity)) {
+        c.used = true;
+      }
+    }
   }
   return { buildings, roads };
 }
@@ -658,7 +742,20 @@ function layoutTown(x, z, R, rng, heightAt) {
   for (const c of cands) {
     if (buildings.length >= target) break;
     const p = frame.toWorld(c.u, c.v);
-    pushBuilding(buildings, heightAt, p.x, p.z, c.w, c.d, c.h, -rot + c.rotOff, c.color, c.kind);
+    const relief = 1.6 + Math.hypot(c.w, c.d) * 0.11;
+    if (pushBuilding(buildings, heightAt, p.x, p.z, c.w, c.d, c.h, -rot + c.rotOff, c.color, c.kind, relief)) {
+      c.used = true;
+    }
+  }
+  if (buildings.length < 70) {
+    for (const c of cands) {
+      if (buildings.length >= 70) break;
+      if (c.used) continue;
+      const p = frame.toWorld(c.u, c.v);
+      if (pushBuilding(buildings, heightAt, p.x, p.z, c.w, c.d, c.h, -rot + c.rotOff, c.color, c.kind, Infinity)) {
+        c.used = true;
+      }
+    }
   }
   return { buildings, roads };
 }
@@ -744,8 +841,22 @@ function layoutVillage(x, z, R, rng, heightAt) {
   const buildings = [];
   for (const c of cands) {
     if (buildings.length >= target) break;
+    if (len(c.u, c.v) > R * 0.9) continue;
     const p = frame.toWorld(c.u, c.v);
-    pushBuilding(buildings, heightAt, p.x, p.z, c.w, c.d, c.h, -rot + c.rotOff, c.color, c.kind);
+    const relief = 1.2 + Math.hypot(c.w, c.d) * 0.12;
+    if (pushBuilding(buildings, heightAt, p.x, p.z, c.w, c.d, c.h, -rot + c.rotOff, c.color, c.kind, relief)) {
+      c.used = true;
+    }
+  }
+  if (buildings.length < 18) {
+    for (const c of cands) {
+      if (buildings.length >= 18) break;
+      if (c.used) continue;
+      const p = frame.toWorld(c.u, c.v);
+      if (pushBuilding(buildings, heightAt, p.x, p.z, c.w, c.d, c.h, -rot + c.rotOff, c.color, c.kind, Infinity)) {
+        c.used = true;
+      }
+    }
   }
   return { buildings, roads };
 }

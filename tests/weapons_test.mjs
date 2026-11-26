@@ -174,7 +174,7 @@ function strafeBurst(world, pos, diveDeg, speed, shots = 10) {
     const dz = impact.position.z - ccip.z;
     const miss = Math.hypot(dx, dz);
     ok(miss < 12, 'MK82 lands within 12 m of CCIP pipper', miss.toFixed(2) + ' m');
-    ok(impact.damage === 140 && impact.splashRadius === 55, 'MK82 damage/splash values');
+    ok(impact.damage === 180 && impact.splashRadius === 75, 'MK82 damage/splash values');
     ok(impact.hitTargetId === null, 'no target id for terrain impact');
   }
 
@@ -213,7 +213,7 @@ function strafeBurst(world, pos, diveDeg, speed, shots = 10) {
   if (hit) {
     ok(hit.weapon === 'AIM9', 'hit event weapon is AIM9');
     ok(hit.hitTargetId === 't1', 'hit event carries target id');
-    ok(hit.damage === 100 && hit.splashRadius === 24, 'AIM9 damage/splash values');
+    ok(hit.damage === 120 && hit.splashRadius === 32, 'AIM9 damage/splash values');
   }
   ok(trails > 5, 'AIM9 emits throttled smoke trail events', String(trails));
 
@@ -439,6 +439,68 @@ function mk82Drop({
   ok(hi2200.trails > 5, '13A: falling Mk-82 emits trail events', String(hi2200.trails));
   ok(hi4500.trails > hi2200.trails, '13A: longer fall emits more trail events',
     hi4500.trails + ' vs ' + hi2200.trails);
+}
+
+// ------------------------ 8. Feature 21 blast data & unguided rocket descent
+{
+  ok(WEAPONS.MK82.damage >= 160, '21: Mk-82 damage >= 160', String(WEAPONS.MK82.damage));
+  ok(WEAPONS.MK82.splashRadius >= 70, '21: Mk-82 splashRadius >= 70',
+    String(WEAPONS.MK82.splashRadius));
+  ok(WEAPONS.AIM9.damage >= 120, '21: AIM-9 damage >= 120', String(WEAPONS.AIM9.damage));
+  ok(WEAPONS.AIM9.splashRadius >= 30, '21: AIM-9 splashRadius >= 30',
+    String(WEAPONS.AIM9.splashRadius));
+
+  // A Mk-82 impact event always carries its full blast payload.
+  {
+    const ws = new WeaponSystem(null);
+    ws.selectWeapon('MK82');
+    const flight = makeFlight({ pos: [0, 900, 0], vel: [0, 0, -220] });
+    ws.fire(flight);
+    let impact = null;
+    for (let i = 0; i < 60 * 20 && !impact; i++) {
+      const ev = ws.update(1 / 60, flight, flatWorld)
+        .find((e) => e.kind === 'impact' && e.weapon === 'MK82');
+      if (ev) impact = ev;
+    }
+    ok(!!impact, '21: Mk-82 impact event raised');
+    if (impact) {
+      ok(impact.kind === 'impact' && impact.weapon === 'MK82'
+        && Number.isFinite(impact.position.x) && Number.isFinite(impact.position.y)
+        && Number.isFinite(impact.position.z),
+      '21: Mk-82 impact carries kind/weapon/finite position');
+      ok(impact.hitTargetId === null, '21: Mk-82 terrain impact has null hitTargetId');
+      ok(impact.damage === WEAPONS.MK82.damage
+        && impact.splashRadius === WEAPONS.MK82.splashRadius,
+      '21: Mk-82 impact carries damage + splashRadius');
+    }
+  }
+
+  // An unlocked AIM-9 must eventually fall out of the sky instead of coasting
+  // dead level forever.
+  {
+    const ws = new WeaponSystem(null);
+    ws.selectWeapon('AIM9');
+    const flight = makeFlight({ pos: [0, 500, 0], vel: [0, 0, -250] });
+    const shot = ws.fire(flight, null);
+    ok(shot.fired === true && shot.targetId === null, '21: stray AIM-9 launches unlocked');
+
+    let impact = null;
+    let minAlt = Infinity;
+    for (let i = 0; i < 60 * 14 && !impact; i++) {
+      const ev = ws.update(1 / 60, flight, flatWorld, [])
+        .find((e) => e.kind === 'impact' && e.weapon === 'AIM9');
+      if (ev) impact = ev;
+      else if (ws.projectiles.length) minAlt = Math.min(minAlt, ws.projectiles[0].position.y);
+    }
+    ok(!!impact, '21: unlocked AIM-9 drops onto the terrain',
+      impact ? '' : 'min altitude ' + minAlt.toFixed(1) + ' m');
+    if (impact) {
+      ok(impact.position.y <= 0.01, '21: stray AIM-9 impact sits on the ground',
+        impact.position.y.toFixed(3));
+      ok(impact.damage === 120 && impact.splashRadius === 32,
+        '21: AIM-9 impact carries damage + splashRadius');
+    }
+  }
 }
 
 // ------------------------------------------------------------ summary

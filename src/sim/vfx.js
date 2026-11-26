@@ -14,7 +14,20 @@ const RIBBON_SEGMENTS = 36;
 const RIBBON_ALPHA = 0.55;
 const BOOM_COOLDOWN = 4;
 const MAX_EXPLOSIONS = 12;
-const MAX_PLUMES = 8;
+// Feature 21: explosions are a multi-stage effect, not a 0.45 s flash.
+// A big fire is unmistakable from 5 km away: a normal-blended orange fireball
+// shell (the part that survives daylight), an additive incandescent core, an
+// expanding condensation ring, and a rising charcoal/orange smoke column.
+const EXPLOSION_DURATION = 5.5;
+const CORE_TIME = 1.8;
+const FIREBALL_TIME = 1.8;
+const RING_TIME = 1.35;
+const SMOKE_COLUMN_TIME = 2.4;
+const INITIAL_SMOKE_PUFFS = 14;
+const HOT_SMOKE_PUFFS = 5; // of the initial burst, ember-lit
+const SPARK_MIN = 20;
+const SPARK_MAX = 28;
+const MAX_PLUMES = 16; // a single Mk-82 blast can claim 4 (impact + 3 rubble columns)
 const PUFF_CAPACITY = 1400;
 const SPARK_CAPACITY = 420;
 const GUN_PORT = new THREE.Vector3(-0.75, 0.25, -2.5);
@@ -415,7 +428,7 @@ export class CombatVFX {
   _buildExplosions() {
     for (let i = 0; i < MAX_EXPLOSIONS; i++) {
       const coreMat = new THREE.MeshBasicMaterial({
-        color: 0xfff0b4,
+        color: 0xfff0b8,
         transparent: true,
         opacity: 0,
         depthWrite: false,
@@ -441,10 +454,25 @@ export class CombatVFX {
       ring.renderOrder = 6;
       this.group.add(ring);
 
+      // Opaque-ish orange-red shell. Additive fire vanishes against a bright
+      // sky; this one is normal-blended so the blast reads in daylight too.
+      const fireballMat = new THREE.MeshBasicMaterial({
+        color: 0xff5a18,
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        blending: THREE.NormalBlending,
+      });
+      const fireball = new THREE.Mesh(this._coreGeo, fireballMat);
+      fireball.frustumCulled = false;
+      fireball.visible = false;
+      fireball.renderOrder = 5;
+      this.group.add(fireball);
+
       this.explosions.push({
         active: false,
         t: 0,
-        duration: 4,
+        duration: EXPLOSION_DURATION,
         scale: 1,
         smokeTimer: 0,
         pos: new THREE.Vector3(),
@@ -452,6 +480,8 @@ export class CombatVFX {
         coreMat,
         ring,
         ringMat,
+        fireball,
+        fireballMat,
       });
     }
   }
@@ -504,15 +534,16 @@ export class CombatVFX {
 
     slot.active = true;
     slot.t = 0;
-    slot.duration = 4;
+    slot.duration = EXPLOSION_DURATION;
     slot.scale = s;
     slot.smokeTimer = 0;
     slot.pos.set(pos.x || 0, pos.y || 0, pos.z || 0);
     slot.core.visible = true;
     slot.ring.visible = true;
+    slot.fireball.visible = true;
 
-    // 12–18 gravity-arcing hot embers.
-    const sparks = 12 + Math.floor(this.rng() * 7);
+    // 20–28 gravity-arcing hot embers and debris.
+    const sparks = SPARK_MIN + Math.floor(this.rng() * (SPARK_MAX - SPARK_MIN + 1));
     for (let i = 0; i < sparks; i++) {
       const theta = this.rng() * Math.PI * 2;
       const phi = this.rng() * 2 - 1;
@@ -530,8 +561,11 @@ export class CombatVFX {
       );
     }
 
-    // A first dark smoke burst; the rest is emitted while the fireball lives.
-    for (let i = 0; i < 4; i++) this._emitExplosionSmoke(slot, true);
+    // Dense detonation burst; the rest of the column is emitted while the
+    // fireball is still hot (see update()).
+    for (let i = 0; i < INITIAL_SMOKE_PUFFS; i++) {
+      this._emitExplosionSmoke(slot, true, i >= INITIAL_SMOKE_PUFFS - HOT_SMOKE_PUFFS);
+    }
 
     return slot;
   }
@@ -726,27 +760,43 @@ export class CombatVFX {
       e.t += dt;
       const t = e.t;
 
-      // Core fireball: rapid expansion, quadratic fade over 0.45 s.
-      const coreT = t / 0.45;
+      // Incandescent core: additive white-yellow, expands to ~11x scale.
+      const coreT = t / CORE_TIME;
       if (coreT < 1) {
         const ease = 1 - (1 - coreT) * (1 - coreT);
         e.core.visible = true;
         e.core.position.copy(e.pos);
-        const cs = e.scale * (0.8 + 7.5 * ease);
+        const cs = e.scale * (0.9 + 10.1 * ease);
         e.core.scale.set(cs, cs, cs);
-        e.coreMat.opacity = 0.95 * (1 - coreT) * (1 - coreT);
+        e.coreMat.opacity = 0.95 * Math.pow(1 - coreT, 1.55);
       } else {
         e.core.visible = false;
         e.coreMat.opacity = 0;
       }
 
-      // Ground-hugging shockwave ring.
-      const ringT = t / 0.75;
+      // Normal-blended orange-red fireball shell, slightly slower to bloom and
+      // the part that stays readable against a bright daytime sky.
+      const fbT = t / FIREBALL_TIME;
+      if (fbT < 1) {
+        const ease = 1 - Math.pow(1 - fbT, 1.7);
+        const rise = fbT < 0.12 ? fbT / 0.12 : 1;
+        e.fireball.visible = true;
+        e.fireball.position.set(e.pos.x, e.pos.y + 0.08 * e.scale * ease, e.pos.z);
+        const fs = e.scale * (0.7 + 10.3 * ease);
+        e.fireball.scale.set(fs, fs, fs);
+        e.fireballMat.opacity = 0.92 * rise * Math.pow(1 - fbT, 1.25);
+      } else {
+        e.fireball.visible = false;
+        e.fireballMat.opacity = 0;
+      }
+
+      // Ground-hugging condensation shockwave ring.
+      const ringT = t / RING_TIME;
       if (ringT < 1) {
         const ease = 1 - (1 - ringT) * (1 - ringT);
         e.ring.visible = true;
         e.ring.position.set(e.pos.x, e.pos.y + 0.6, e.pos.z);
-        const rs = e.scale * (1 + 17 * ease);
+        const rs = e.scale * (0.5 + 23.5 * ease);
         e.ring.scale.set(rs, rs, rs);
         e.ringMat.opacity = 0.82 * (1 - ringT) * (1 - ringT);
       } else {
@@ -754,12 +804,12 @@ export class CombatVFX {
         e.ringMat.opacity = 0;
       }
 
-      // Bolling smoke while the fireball is still hot.
-      if (t < 0.95) {
+      // Bolling smoke column while the fireball is still hot.
+      if (t < SMOKE_COLUMN_TIME) {
         e.smokeTimer -= dt;
-        while (e.smokeTimer <= 0 && t < 0.95) {
-          e.smokeTimer += 0.115;
-          this._emitExplosionSmoke(e, false);
+        while (e.smokeTimer <= 0 && t < SMOKE_COLUMN_TIME) {
+          e.smokeTimer += 0.085;
+          this._emitExplosionSmoke(e, false, false);
         }
       }
 
@@ -767,8 +817,10 @@ export class CombatVFX {
         e.active = false;
         e.core.visible = false;
         e.ring.visible = false;
+        e.fireball.visible = false;
         e.coreMat.opacity = 0;
         e.ringMat.opacity = 0;
+        e.fireballMat.opacity = 0;
         continue;
       }
       activeExplosions++;
@@ -838,8 +890,10 @@ export class CombatVFX {
       e.t = 0;
       e.core.visible = false;
       e.ring.visible = false;
+      e.fireball.visible = false;
       e.coreMat.opacity = 0;
       e.ringMat.opacity = 0;
+      e.fireballMat.opacity = 0;
     }
     this._explosionCursor = 0;
 
@@ -942,24 +996,47 @@ export class CombatVFX {
     this.muzzle.mesh.quaternion.copy(flight.quaternion);
   }
 
-  _emitExplosionSmoke(e, initial) {
+  _emitExplosionSmoke(e, initial = false, hot = false) {
     const s = Math.min(e.scale, 4);
     const spread = (initial ? 1.6 : 2.6) * s;
     const ang = this.rng() * Math.PI * 2;
     const rad = this.rng() * spread;
     const life = 3.0 + this.rng() * 2.5;
+
+    if (hot) {
+      // Ember-lit puff at the fireball surface: burning fuel, not soot.
+      const k = 0.82 + this.rng() * 0.18;
+      this.puffs.spawn(
+        e.pos.x + Math.cos(ang) * rad * 0.55,
+        e.pos.y + 0.7 * s + this.rng() * 1.2 * s,
+        e.pos.z + Math.sin(ang) * rad * 0.55,
+        Math.cos(ang) * (1.5 + this.rng() * 2.2),
+        3.0 + this.rng() * 3.0,
+        Math.sin(ang) * (1.5 + this.rng() * 2.2),
+        life * 0.62,
+        (2.2 + this.rng() * 2.4) * Math.max(0.6, s),
+        1.0 * k, 0.38 * k, 0.08 * k,
+        0.7, 3.4, 0.7, 2.2,
+      );
+      return;
+    }
+
+    // Charcoal puffs. Emissions later in the column start higher and rise
+    // harder, which builds the classic stem-and-cap mushroom.
+    const column = initial ? 0 : clamp(e.t / SMOKE_COLUMN_TIME, 0, 1);
+    const base = initial ? 0.8 * s : (1.2 + 5.5 * column) * s;
     const shade = 0.09 + this.rng() * 0.07;
     this.puffs.spawn(
       e.pos.x + Math.cos(ang) * rad,
-      e.pos.y + 0.8 * s + this.rng() * 1.6 * s,
+      e.pos.y + base + this.rng() * 1.6 * s,
       e.pos.z + Math.sin(ang) * rad,
       Math.cos(ang) * (1 + this.rng() * 1.5),
-      2.2 + this.rng() * 2.4,
+      2.2 + this.rng() * 2.4 + (initial ? 0 : 2.0 * column),
       Math.sin(ang) * (1 + this.rng() * 1.5),
       life,
       (2.0 + this.rng() * 2.2) * Math.max(0.6, s),
       shade, shade * 0.97, shade * 0.92,
-      0.62, 2.4, 0.7, 2.1,
+      0.62, 2.4 + 1.6 * column, 0.7, 2.1,
     );
   }
 
