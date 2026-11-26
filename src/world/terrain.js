@@ -194,7 +194,69 @@ function buildAirport(cx, cz) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Real-world airports (baked theater metadata).
+//
+// A baked theater hands us the actual fields instead of the procedural grid.
+// While a custom set is active every query (airportsNear / airportNear /
+// terrainHeight) answers from it alone, so no invented runway lands in the
+// real valley. setCustomAirports(null) restores the procedural world exactly.
+// ---------------------------------------------------------------------------
+let _customAirports = null;
+
+/**
+ * Install a baked airport list (or null to restore procedural airports).
+ *
+ * Each entry is normalised to the same shape `buildAirport` produces for the
+ * procedural grid, with its own pad/blend radii derived from runway length.
+ *
+ * @param {Array<object>|null} list
+ * @returns {Array<object>|null} the normalised list, or null
+ */
+export function setCustomAirports(list) {
+  if (!Array.isArray(list) || list.length === 0) {
+    _customAirports = null;
+    return null;
+  }
+  _customAirports = list.map((ap) => {
+    const length = Number(ap.length) || 0;
+    return {
+      id: ap.id ?? ap.code,
+      code: ap.code ?? ap.id,
+      name: ap.name || '',
+      x: Number(ap.x) || 0,
+      z: Number(ap.z) || 0,
+      // Sea-level fields still need a solid pad above the water plane.
+      elevation: Math.max(3, Number(ap.elevation) || 0),
+      heading: Number(ap.heading) || 0,
+      length,
+      width: Number(ap.width) || 45,
+      padRadius: length * 0.5 + 140,
+      blend: length * 0.5 + 320,
+      kind: length >= 2400 ? 'intl' : 'regional',
+    };
+  });
+  return _customAirports;
+}
+
+/** Currently installed baked airports, or null for the procedural grid. */
+export function getCustomAirports() {
+  return _customAirports;
+}
+
 export function airportsNear(x, z, cellRadius = 1) {
+  if (_customAirports !== null) {
+    // One extra cell of slack so a field just past the camera's cell edge
+    // still shows up (the demo box is only 100 km across).
+    const reach = (cellRadius + 1) * AIRPORT_GRID;
+    const out = [];
+    for (const ap of _customAirports) {
+      const dx = ap.x - x;
+      const dz = ap.z - z;
+      if (dx * dx + dz * dz <= reach * reach) out.push(ap);
+    }
+    return out;
+  }
   const cx = Math.floor(x / AIRPORT_GRID);
   const cz = Math.floor(z / AIRPORT_GRID);
   const out = [];
@@ -209,6 +271,20 @@ export function airportsNear(x, z, cellRadius = 1) {
 
 /** Nearest airport within `maxDist` metres, or null. */
 export function airportNear(x, z, maxDist = 30000) {
+  if (_customAirports !== null) {
+    let best = null;
+    let bestD = maxDist * maxDist;
+    for (const ap of _customAirports) {
+      const dx = ap.x - x;
+      const dz = ap.z - z;
+      const d = dx * dx + dz * dz;
+      if (d < bestD) {
+        bestD = d;
+        best = ap;
+      }
+    }
+    return best;
+  }
   const cellRadius = Math.max(1, Math.ceil(maxDist / AIRPORT_GRID));
   let best = null;
   let bestD = maxDist * maxDist;
@@ -227,6 +303,15 @@ export function airportNear(x, z, maxDist = 30000) {
 /** Terrain height including flattened airport pads. */
 export function terrainHeight(x, z) {
   let h = baseHeight(x, z);
+  if (_customAirports !== null) {
+    for (const ap of _customAirports) {
+      const d = Math.hypot(x - ap.x, z - ap.z);
+      if (d >= ap.blend) continue;
+      const t = 1 - smoothstep(ap.padRadius, ap.blend, d);
+      h = h + (ap.elevation - h) * t;
+    }
+    return h;
+  }
   const cx = Math.floor(x / AIRPORT_GRID);
   const cz = Math.floor(z / AIRPORT_GRID);
   for (let dx = -1; dx <= 1; dx++) {

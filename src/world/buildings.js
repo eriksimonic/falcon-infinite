@@ -34,6 +34,10 @@ const CUSTOM_SETTLEMENT_ID = 'vipava-osm';
 const CUSTOM_SETTLEMENT_RADIUS = 22000; // covers the whole 100 km DEM valley core
 const DEM_HALF = 50000; // the baked DEM owns +-50 km; procedural cities outside it stay
 const CUSTOM_KINDS = ['house', 'apartment', 'industrial', 'tower'];
+// LJAJ (Ajdovscina) is a true East-West strip at the DEM centre: RWY 09/27 runs
+// along +-X. Nothing built by OSM may sit on the pavement or the graded strip.
+const LJAJ_RUNWAY_HALF_LENGTH_M = 960; // 1800 m runway + 60 m overrun either end
+const LJAJ_RUNWAY_HALF_WIDTH_M = 95;   // 36 m runway + shoulders/apron clearance
 
 // Roof/wall palettes matching settlements.js, so baked buildings read as the
 // same architecture as their procedural neighbours.
@@ -717,6 +721,8 @@ export class BuildingSystem {
       const rot = Number(item[5]);
       if (!Number.isFinite(x) || !Number.isFinite(z) || !Number.isFinite(rot)) continue;
       if (!(w > 0) || !(d > 0) || !(h > 0)) continue;
+      // Never drop an OSM building on the real Ajdovscina runway (RWY 09/27).
+      if (Math.abs(x) < LJAJ_RUNWAY_HALF_LENGTH_M && Math.abs(z) < LJAJ_RUNWAY_HALF_WIDTH_M) continue;
       const kind = CUSTOM_KINDS[Math.floor(Number(item[6])) | 0] || 'house';
       const palette = CUSTOM_PALETTE[kind];
       buildings.push({

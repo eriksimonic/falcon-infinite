@@ -15,6 +15,12 @@ import {
   baseHeight,
   setActiveDEM,
   getActiveDEM,
+  terrainHeight,
+  setCustomAirports,
+  getCustomAirports,
+  airportsNear,
+  airportNear,
+  smoothstep,
 } from '../src/world/terrain.js';
 
 const failures = [];
@@ -226,6 +232,89 @@ throws(() => new HeightmapDEM({ width: 2, height: 2, pixels: new Uint8Array(8) }
   'short RGBA buffer did not throw');
 throws(() => new HeightmapDEM({ width: 2, height: 2, pixels: new Float32Array(3) }),
   'short Float32Array did not throw');
+
+// ---------------------------------------------------------------------------
+// 6. Baked airports: LJAJ (RWY 09/27) flattens the real strip at the origin,
+//    and setCustomAirports(null) restores the procedural world exactly.
+// ---------------------------------------------------------------------------
+check(getCustomAirports() === null, 'started with custom airports installed');
+
+const proceduralTerrainOrigin = terrainHeight(0, 0);
+const proceduralTerrainFar = terrainHeight(-12345, 6789);
+const proceduralField = airportNear(0, 0, 40000);
+check(!!proceduralField, 'no procedural airport near the origin to restore');
+
+const LJAJ_RAW = {
+  id: 'LJAJ',
+  code: 'LJAJ',
+  name: 'Ajdovscina Airfield',
+  heading: 90,
+  length: 1800,
+  width: 36,
+  x: 0,
+  z: 0,
+  elevation: 112.4,
+};
+
+const installed = setCustomAirports([LJAJ_RAW]);
+check(getCustomAirports() === installed, 'getCustomAirports did not return the installed list');
+check(Array.isArray(installed) && installed.length === 1, 'setCustomAirports did not return one airport');
+const ljaj = installed[0];
+check(ljaj.id === 'LJAJ' && ljaj.code === 'LJAJ', 'LJAJ id/code lost while normalising');
+check(ljaj.name === 'Ajdovscina Airfield', 'LJAJ name lost while normalising');
+check(ljaj.heading === 90, `LJAJ heading is not 90 (${ljaj.heading})`);
+check(ljaj.x === 0 && ljaj.z === 0, 'LJAJ is not at the DEM origin');
+near(ljaj.padRadius, 1800 * 0.5 + 140, 1e-9, 'padRadius formula');
+near(ljaj.blend, 1800 * 0.5 + 320, 1e-9, 'blend formula');
+check(ljaj.kind === 'regional', `1800 m field should be regional (${ljaj.kind})`);
+
+// The pad is dead flat on the pavement, both along and across RWY 09/27.
+near(terrainHeight(0, 0), 112.4, 1e-3, 'LJAJ pad did not flatten the origin');
+near(terrainHeight(300, 0), 112.4, 1e-3, 'LJAJ pad not flat along the runway');
+near(terrainHeight(-820, 0), 112.4, 1e-3, 'LJAJ RWY 09 threshold not flat');
+near(terrainHeight(0, 40), 112.4, 1e-3, 'LJAJ pad not flat across the runway');
+
+// Outside the pad the smoothstep blend mixes back to the DEM/base height.
+const dMid = (ljaj.padRadius + ljaj.blend) / 2;
+const tMid = 1 - smoothstep(ljaj.padRadius, ljaj.blend, dMid);
+const expectedMid = baseHeight(dMid, 0) + (112.4 - baseHeight(dMid, 0)) * tMid;
+near(terrainHeight(dMid, 0), expectedMid, 1e-9, 'LJAJ blend ring does not mix smoothly');
+check(baseHeight(dMid, 0) !== 112.4, 'blend-ring sample is a degenerate reference');
+check(terrainHeight(ljaj.blend + 500, 0) === baseHeight(ljaj.blend + 500, 0),
+  'terrain past the custom blend radius is not untouched');
+
+// Custom airports are what the world reports while they are installed.
+const customNear = airportsNear(0, 0, 1);
+check(customNear.length === 1 && customNear[0].id === 'LJAJ', 'airportsNear did not report custom LJAJ');
+check(airportNear(0, 0, 5000)?.id === 'LJAJ', 'airportNear did not return custom LJAJ');
+check(airportNear(5000, 0, 1000) === null, 'airportNear ignored maxDist for custom airports');
+
+// A second, far field exercises the (cellRadius + 1) * AIRPORT_GRID reach.
+const installed2 = setCustomAirports([
+  LJAJ_RAW,
+  { ...LJAJ_RAW, id: 'LIPQ', code: 'LIPQ', name: 'Trieste Friuli Intl', x: 40000, z: 0, length: 3000, elevation: 7.4 },
+]);
+check(installed2[1].kind === 'intl', `3000 m field should be intl (${installed2[1].kind})`);
+near(installed2[1].elevation, 7.4, 1e-9, 'custom elevation changed');
+near(terrainHeight(40000, 0), 7.4, 1e-3, 'LIPQ pad did not flatten');
+check(!airportsNear(0, 0, 1).some((a) => a.id === 'LIPQ'), 'airportsNear reach is too wide');
+check(airportsNear(0, 0, 3).some((a) => a.id === 'LIPQ'), 'airportsNear reach is too narrow');
+
+// Sea-level fields are lifted to the 3 m pad floor.
+const seaLevel = setCustomAirports([{ ...LJAJ_RAW, id: 'LJPZ', elevation: -1.3 }])[0];
+check(seaLevel.elevation === 3, `sea-level pad floor wrong (${seaLevel.elevation})`);
+
+// Back to procedural: byte-identical terrain and the invented fields return.
+setCustomAirports(null);
+check(getCustomAirports() === null, 'setCustomAirports(null) did not clear the custom list');
+check(terrainHeight(0, 0) === proceduralTerrainOrigin,
+  'procedural terrainHeight at the origin not restored exactly');
+check(terrainHeight(-12345, 6789) === proceduralTerrainFar,
+  'procedural terrainHeight in a fresh area not restored exactly');
+check(airportNear(0, 0, 40000)?.id === proceduralField.id,
+  'procedural airports not restored by setCustomAirports(null)');
+check(airportsNear(0, 0, 1).every((a) => a.id !== 'LJAJ' && a.id !== 'LIPQ'),
+  'custom airports survived setCustomAirports(null)');
 
 // ---------------------------------------------------------------------------
 // Summary

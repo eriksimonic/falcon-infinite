@@ -100,7 +100,8 @@ def ll_to_xz(lat, lon):
     return round((lon - LON0) * M_PER_DEG_LON), round(-(lat - LAT0) * M_PER_DEG_LAT)
 
 airports = [
-    {"id": "LJAJ", "code": "LJAJ", "name": "Ajdovscina Airfield", "ll": (45.8878, 13.8869), "heading": 74, "length": 1800, "width": 36},
+    # LJAJ is a true East-West strip (RWY 09/27): 09 points at the sunrise.
+    {"id": "LJAJ", "code": "LJAJ", "name": "Ajdovscina Airfield", "ll": (45.8878, 13.8869), "heading": 90, "length": 1800, "width": 36},
     {"id": "LJPO", "code": "LJPO", "name": "Postojna Airfield", "ll": (45.7544, 14.1939), "heading": 100, "length": 1600, "width": 34},
     {"id": "LJDI", "code": "LJDI", "name": "Divaca Airfield", "ll": (45.6761, 13.9947), "heading": 120, "length": 1500, "width": 32},
     {"id": "LIPQ", "code": "LIPQ", "name": "Trieste Friuli Intl", "ll": (45.8275, 13.4722), "heading": 90, "length": 3000, "width": 45},

@@ -538,7 +538,8 @@ check(ruinSys.destroyed.size === ruinBlast.destroyedCount,
 // 11. Baked OSM city: virtual settlement registered, hittable, then reverted
 // ---------------------------------------------------------------------------
 const customSys = new BuildingSystem(null, HEADLESS_PRESET);
-const custom = customSys.setCustomBuildings([[0, 0, 20, 16, 35, 0.2, 3]]);
+// Off the LJAJ runway strip (|x| < 960, |z| < 95): OSM buildings there are dropped.
+const custom = customSys.setCustomBuildings([[3200, 1500, 20, 16, 35, 0.2, 3]]);
 check(!!custom, 'setCustomBuildings returned nothing');
 check(customSys.customSettlement === custom, 'customSettlement was not stored');
 check(custom.id === 'vipava-osm', `custom settlement id is ${custom.id}`);
@@ -549,7 +550,7 @@ check(customSys.stats.destroyed === 0, 'custom settlement started with damage');
 
 const cb = custom.buildings[0];
 check(cb.kind === 'tower', `kindCode 3 decoded as ${cb.kind}`);
-check(cb.x === 0 && cb.z === 0 && cb.w === 20 && cb.d === 16 && cb.h === 35,
+check(cb.x === 3200 && cb.z === 1500 && cb.w === 20 && cb.d === 16 && cb.h === 35,
   'custom building dimensions were mangled');
 check(Math.abs(cb.rot - 0.2) < 1e-9, 'custom building rotation was mangled');
 check(typeof cb.color === 'number', 'custom building has no palette colour');
@@ -564,7 +565,7 @@ const cTo = { x: cb.x, y: cMidY, z: cb.z };
 const cHit = customSys.hitBuilding(cFrom, cTo);
 check(!!cHit, 'hitBuilding missed the baked OSM tower');
 if (cHit) {
-  check(cHit.key === 'vipava-osm:0:0', `hitBuilding key is ${cHit.key}`);
+  check(cHit.key === 'vipava-osm:3200:1500', `hitBuilding key is ${cHit.key}`);
   check(cHit.building === cb, 'hitBuilding returned the wrong baked building');
   check(cHit.settlement === custom, 'hitBuilding returned the wrong settlement');
   check(cHit.y > cg.base + 1 && cHit.y <= cg.top + 1,
@@ -575,13 +576,13 @@ if (cHit) {
 const chip = customSys.applyBlast({ x: cb.x, y: cMidY, z: cb.z }, 6, 18);
 check(chip.damagedCount >= 1, 'GUN did not chip the baked building');
 check(chip.destroyedCount === 0, 'GUN levelled the baked building in one round');
-check(customSys.buildingHp.has('vipava-osm:0:0'), 'baked building HP not accumulated');
+check(customSys.buildingHp.has('vipava-osm:3200:1500'), 'baked building HP not accumulated');
 
 const level = customSys.applyBlast({ x: cb.x, y: cMidY, z: cb.z }, 30, 180);
 check(level.destroyedCount >= 1, 'heavy blast did not level the baked building');
-check(customSys.collapsing.has('vipava-osm:0:0'), 'baked building did not start collapsing');
+check(customSys.collapsing.has('vipava-osm:3200:1500'), 'baked building did not start collapsing');
 customSys.update(5);
-check(customSys.destroyed.has('vipava-osm:0:0'), 'baked building never became rubble');
+check(customSys.destroyed.has('vipava-osm:3200:1500'), 'baked building never became rubble');
 check(customSys.getRuinFirePoints().length === 1, 'baked ruin did not smoulder');
 
 const insideCustom = customSys._settlementsNear(0, 0, 6000);
@@ -599,9 +600,19 @@ const afterHit = customSys.hitBuilding(cFrom, cTo);
 check(!afterHit || afterHit.settlement.id !== 'vipava-osm',
   'hitBuilding still reports the removed baked city');
 
-const reapplied = customSys.setCustomBuildings([[12, 12, 10, 9, 8, 0, 0]]);
+const reapplied = customSys.setCustomBuildings([[3320, 1560, 10, 9, 8, 0, 0]]);
 check(!!reapplied && reapplied.buildings.length === 1, 'setCustomBuildings could not be re-applied');
 check(reapplied && reapplied.buildings[0].kind === 'house', 'kindCode 0 decoded as a non-house');
+
+// The LJAJ runway strip (RWY 09/27) rejects OSM buildings; neighbours survive.
+const strip = customSys.setCustomBuildings([
+  [0, 0, 20, 16, 10, 0, 0],
+  [-320, 20, 20, 16, 10, 0, 0],
+  [959, -94, 20, 16, 10, 0, 0],
+  [3200, 1500, 20, 16, 10, 0, 0],
+]);
+check(!!strip && strip.buildings.length === 1,
+  `runway-strip filter kept ${strip ? strip.buildings.length : -1} buildings on LJAJ`);
 customSys.setCustomBuildings(null);
 
 // ---------------------------------------------------------------------------

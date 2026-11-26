@@ -208,7 +208,8 @@ export function buildAirport(ap, weatherRef) {
 
   // hangars with curved roofs
   const hangarColors = [0xb9b6ad, 0xa6a8a3, 0xc3bda9, 0x9fa3a0];
-  const nHangars = ap.kind === 'international' ? 5 : ap.kind === 'regional' ? 3 : 2;
+  const isIntl = ap.kind === 'international' || ap.kind === 'intl';
+  const nHangars = isIntl ? 5 : ap.kind === 'regional' ? 3 : 2;
   for (let i = 0; i < nHangars; i++) {
     const hx = L * 0.02 + i * 78 - (nHangars - 1) * 34;
     const hz = taxiZ + 250;
@@ -234,7 +235,7 @@ export function buildAirport(ap, weatherRef) {
 
   // terminal
   if (ap.kind !== 'airfield') {
-    const tw = ap.kind === 'international' ? 160 : 90;
+    const tw = isIntl ? 160 : 90;
     const term = box(tw, 14, 42, 0xc9c6bc, L * 0.03, 7, taxiZ + 380);
     group.add(term);
     const glass = new THREE.Mesh(
@@ -447,9 +448,22 @@ export class AirportSystem {
     return airportNear(x, z, maxDist);
   }
 
-  dispose() {
-    for (const g of this.built.values()) disposeGroup(g);
+  /**
+   * Remove and dispose every built airport mesh.
+   *
+   * Keeps `this.group` (and the scene) intact so the next `update()` can build
+   * the new theater's runways — procedural fields or the baked real ones.
+   */
+  clear() {
+    for (const [id, g] of this.built) {
+      this.group.remove(g);
+      disposeGroup(g);
+    }
     this.built.clear();
+  }
+
+  dispose() {
+    this.clear();
     this.group.removeFromParent();
   }
 }

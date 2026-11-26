@@ -28,7 +28,7 @@ import { HUD } from './ui/hud.js';
 import { TacticalOverlay } from './ui/tactical.js';
 import { KneeboardMap } from './ui/kneeboard.js';
 import { UI } from './ui/menu.js';
-import { spawnPoint, airportNear, airportsNear, setActiveDEM, terrainHeight } from './world/terrain.js';
+import { spawnPoint, airportNear, airportsNear, setActiveDEM, setCustomAirports, terrainHeight } from './world/terrain.js';
 import { loadVipavaDEM, loadVipavaOSM } from './world/dem.js';
 import { settlementsNear } from './world/settlements.js';
 import { clamp } from './world/noise.js';
@@ -285,29 +285,40 @@ class App {
         console.warn('VIPAVA · dataset load failed, keeping procedural terrain', err);
       }
 
+      const customAirports = dem?.meta?.airports || null;
       if (dem) {
         setActiveDEM(dem);
+        // The real fields (LJAJ, LJPO, LJDI, LIPQ, LJPZ) replace the procedural
+        // grid, so the terrain flattens and runways are paved where they are.
+        setCustomAirports(customAirports);
         this.world.buildings.setCustomBuildings(osm?.buildings || null);
         this.world.roads.setCustomRoads(osm?.roads || null);
-        // Ajdovscina Airfield (LJAJ) sits at the DEM centre; the real airport
-        // metadata rides along for HUD / kneeboard / ILS use.
-        this.spawn = {
-          x: 0,
-          z: 0,
-          y: terrainHeight(0, 0) + CONFIG.aircraft.gearHeight + 0.02,
-          heading: 74,
-          airport: dem.meta?.airports?.[0] || null,
-        };
+        // Ajdovscina Airfield (LJAJ) sits at the DEM centre and runs East-West:
+        // start on the RWY 09 threshold, nose east into the sunrise.
+        const ljaj = customAirports?.find((ap) => ap.id === 'LJAJ' || ap.code === 'LJAJ')
+          || customAirports?.[0]
+          || null;
+        this.spawn = ljaj
+          ? this.spawnForAirport(ljaj)
+          : {
+            x: 0,
+            z: 0,
+            y: terrainHeight(0, 0) + CONFIG.aircraft.gearHeight + 0.02,
+            heading: 90,
+            airport: null,
+          };
         // Gulf of Trieste is ~28 km south of the valley, well offshore.
         this.carrier.placeNear(-24000, 28000);
       } else {
         setActiveDEM(null);
+        setCustomAirports(null);
         this.world.buildings.setCustomBuildings(null);
         this.world.roads.setCustomRoads(null);
         if (this._proceduralSpawn) this.spawn = this._proceduralSpawn;
       }
     } else {
       setActiveDEM(null);
+      setCustomAirports(null);
       this.world.buildings.setCustomBuildings(null);
       this.world.roads.setCustomRoads(null);
       if (this._proceduralSpawn) this.spawn = this._proceduralSpawn;
@@ -321,6 +332,10 @@ class App {
     this.world.buildings.rebuild(this.camera);
     this.world.roads.update(this.camera);
     this.world.vegetation.rebuild(this.camera);
+    // Swap the runway set as well: drop the old theater's asphalt, then let
+    // the system build whichever fields this theater now reports near us.
+    this.world.airports.clear();
+    this.world.airports.update(0.016, this.camera, this.weather, this.sky);
     this.ui.toast('THEATER · ' + th.label);
   }
 
