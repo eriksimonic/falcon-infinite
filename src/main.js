@@ -632,7 +632,7 @@ class App {
         }
       }
 
-      const wEvents = this.weapons.update(simDt, f, this.world, this.targets.targets);
+      const wEvents = this.weapons.update(simDt, f, this.world, this.targets.targets, this._lockedTarget);
       for (const ev of wEvents) {
         if (ev.kind === 'trail') {
           this.vfx.spawnTrail(ev.position, ev.color, ev.size);
@@ -746,6 +746,7 @@ class App {
       t.refueling = !!this._fuelState?.refueling;
       t.autopilot = this.autopilot.mode;
       t.ils = this._ilsState;
+      this.camera.updateMatrixWorld();
       this.hud.update(simDt, t, {
         overlay: this.tactical,
         kneeboard: this.kneeboard,

@@ -612,6 +612,97 @@ function makeAudioHarness() {
 }
 
 // ===========================================================================
+// 5. Feature 12B: True 3D projection for GUN, CCIP BFL, AIM-9 & matrix sync
+// ===========================================================================
+{
+  const W = 1280;
+  const H = 720;
+  const cam = new PerspectiveCamera(50, W / H, 0.1, 60000);
+  cam.position.set(0, 120, 90);
+  cam.lookAt(0, -30, -1200);
+  cam.updateProjectionMatrix();
+  let matrixUpdated = 0;
+  const origUpdate = cam.updateMatrixWorld.bind(cam);
+  cam.updateMatrixWorld = (...args) => { matrixUpdated++; return origUpdate(...args); };
+
+  const makeGeoCtx = () => {
+    const arcs = [];
+    const lines = [];
+    let cur = null;
+    const base = makeCanvas();
+    base.arc = (x, y, r) => { arcs.push({ x, y, r }); };
+    base.moveTo = (x, y) => { cur = { x, y }; };
+    base.lineTo = (x, y) => {
+      if (cur) lines.push({ x0: cur.x, y0: cur.y, x1: x, y1: y });
+      cur = { x, y };
+    };
+    return { ctx: base, arcs, lines };
+  };
+
+  const proj = (pt) => {
+    origUpdate(true);
+    const v = new Vector3(pt.x, pt.y, pt.z).project(cam);
+    return { x: (v.x * 0.5 + 0.5) * W, y: (-v.y * 0.5 + 0.5) * H };
+  };
+
+  // Follow-camera GUN pipper projects to 3D aimPoint (NOT hardcoded W*0.5, H*0.46)
+  const overlay = new TacticalOverlay();
+  const aimPt = { x: -47, y: -40, z: -260 };
+  const expectedGun = proj(aimPt);
+  const g1 = makeGeoCtx();
+  overlay.draw(g1.ctx, W, H, {
+    telemetry: { mode: 'chase', heading: 0, pitch: -4, roll: 0, position: new Vector3(0, 100, 0) },
+    camera: cam,
+    weapons: {
+      selected: 'GUN',
+      ammo: { GUN: 510, AIM9: 4, MK82: 6, FLARE: 30 },
+      boresightPoint: { valid: true, x: -30, y: -10, z: -600 },
+      gunSolution: { valid: true, aimPoint: aimPt, impactValid: true, impactPoint: aimPt, leadValid: false },
+    },
+  });
+  ok(matrixUpdated > 0, '12B: TacticalOverlay.draw calls camera.updateMatrixWorld()');
+  const gunArcHit = g1.arcs.some((a) => Math.hypot(a.x - expectedGun.x, a.y - expectedGun.y) < 2.0);
+  ok(gunArcHit, '12B: follow-cam GUN pipper projects to exact 3D aimPoint',
+    `expected (${expectedGun.x.toFixed(1)}, ${expectedGun.y.toFixed(1)})`);
+
+  // MK-82 CCIP Bomb Fall Line starts at projected ccipOrigin and ends at projected ccip
+  const ccipOrigin = { x: 0, y: 120, z: -200 };
+  const ccipImpact = { x: 45, y: 0, z: -520 };
+  const pOrig = proj(ccipOrigin);
+  const pImp = proj(ccipImpact);
+  const g2 = makeGeoCtx();
+  overlay.draw(g2.ctx, W, H, {
+    telemetry: { mode: 'chase', heading: 0, pitch: -10, roll: 0, position: new Vector3(0, 120, 0) },
+    camera: cam,
+    weapons: {
+      selected: 'MK82',
+      ammo: { GUN: 510, AIM9: 4, MK82: 6, FLARE: 30 },
+      ccipOrigin: { valid: true, ...ccipOrigin },
+      ccip: { valid: true, ...ccipImpact, timeToImpact: 2.8 },
+    },
+  });
+  const bflMatch = g2.lines.some((l) =>
+    Math.hypot(l.x0 - pOrig.x, l.y0 - pOrig.y) < 2.0 && Math.hypot(l.x1 - pImp.x, l.y1 - pImp.y) < 2.0);
+  ok(bflMatch, '12B: CCIP BFL starts at projected ccipOrigin and ends at projected ccip');
+
+  // AIM-9 seeker ring projects onto boresightPoint
+  const borePt = { x: -60, y: -20, z: -550 };
+  const pBore = proj(borePt);
+  const g3 = makeGeoCtx();
+  overlay.draw(g3.ctx, W, H, {
+    telemetry: { mode: 'chase', heading: 0, pitch: 0, roll: 0, position: new Vector3(0, 100, 0) },
+    camera: cam,
+    weapons: {
+      selected: 'AIM9',
+      ammo: { GUN: 510, AIM9: 4, MK82: 6, FLARE: 30 },
+      boresightPoint: { valid: true, ...borePt },
+    },
+  });
+  const aim9Hit = g3.arcs.some((a) => Math.hypot(a.x - pBore.x, a.y - pBore.y) < 2.0);
+  ok(aim9Hit, '12B: AIM-9 seeker ring renders at projected 3D boresightPoint');
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 console.log(`tactical checks: ${checks}, failures: ${failures.length}`);

@@ -78,6 +78,20 @@ const _right = new THREE.Vector3();
 const _eject = new THREE.Vector3();
 const Z_AXIS = new THREE.Vector3(0, 0, 1);
 
+// Dedicated scratch vectors for the gun/aim solvers, kept apart from the
+// guidance temporaries so the two can never clobber each other mid-frame.
+const _gMuzzle = new THREE.Vector3();
+const _gForward = new THREE.Vector3();
+const _gOwn = new THREE.Vector3();
+const _gPos = new THREE.Vector3();
+const _gVel = new THREE.Vector3();
+const _gPrev = new THREE.Vector3();
+const _gAim = new THREE.Vector3();
+const _gTP = new THREE.Vector3();
+const _gTV = new THREE.Vector3();
+const _gPT = new THREE.Vector3();
+const _gD = new THREE.Vector3();
+
 function clamp(v, a, b) {
   return v < a ? a : v > b ? b : v;
 }
@@ -116,6 +130,24 @@ export class WeaponSystem {
     this.flares = [];
     this.ccip = { valid: false, x: 0, y: 0, z: 0, timeToImpact: 0 };
 
+    // --- Feature 12A: exact 3D aiming state -------------------------------
+    // boresightPoint: true 3D line-of-sight along the nose/gun axis.
+    // ccipOrigin:     point on the 3D flight path the bomb fall line starts at.
+    // gunSolution:    zero-dispersion 20 mm impact / lead solution for the HUD.
+    this.boresightPoint = { valid: false, x: 0, y: 0, z: 0 };
+    this.ccipOrigin = { valid: false, x: 0, y: 0, z: 0 };
+    this.gunSolution = {
+      valid: false,
+      aimPoint: { x: 0, y: 0, z: 0 },
+      impactValid: false,
+      impactPoint: { x: 0, y: 0, z: 0 },
+      leadValid: false,
+      leadPoint: { x: 0, y: 0, z: 0 },
+      range: 0,
+      tof: 0,
+    };
+    this._resetAimState();
+
     this._cooldown = { GUN: 0, AIM9: 0, MK82: 0, FLARE: 0 };
     this._gunSide = 1;
     this._aim9Side = 1;
@@ -139,6 +171,7 @@ export class WeaponSystem {
     this._mk82Side = 1;
     this.ccip.valid = false;
     this.ccip.timeToImpact = 0;
+    this._resetAimState();
     return this;
   }
 
@@ -282,11 +315,198 @@ export class WeaponSystem {
     return { deployed: true, position: center };
   }
 
+  // -------------------------------------------------------------- gun solution
+  // Feature 12A: exact zero-dispersion gun solution. The muzzle, muzzle
+  // velocity, gravity and integrator are identical to `fire()` for 'GUN', so
+  // the returned impact point is where an actual round goes (dispersion aside).
+  computeGunSolution(flight, world, lockedTarget = null) {
+    const sol = this.gunSolution;
+    sol.valid = false;
+    sol.impactValid = false;
+    sol.leadValid = false;
+    sol.range = 0;
+    sol.tof = 0;
+
+    if (!flight || !flight.position) return sol;
+
+    const def = WEAPONS.GUN;
+    const q = flight.quaternion || _q.identity();
+    const forward = _gForward.set(0, 0, -1).applyQuaternion(q);
+    const muzzle = _gMuzzle.set(-0.75, 0.25, -2.5).applyQuaternion(q).add(flight.position);
+    const ownVel = _gOwn.set(0, 0, 0);
+    if (flight.velocity) ownVel.copy(flight.velocity);
+
+    this._setBoresight(muzzle, forward);
+
+    const pos = _gPos.copy(muzzle);
+    const vel = _gVel.copy(ownVel).addScaledVector(forward, def.muzzleSpeed);
+
+    const targetValid = !!(lockedTarget && lockedTarget.alive !== false && lockedTarget.position);
+    // Reference range: the distance along the trajectory at which `aimPoint`
+    // is reported when the round does not hit terrain first.
+    let refRange = 900;
+    if (targetValid) {
+      refRange = clamp(muzzle.distanceTo(lockedTarget.position), 120, 2200);
+    }
+
+    const step = 0.05;
+    const maxTime = def.ttl;
+    let t = 0;
+    let travelled = 0;
+    let prevTravelled = 0;
+    let captureRange = true;
+    let rangeSampleValid = false;
+    let rangeTof = 0;
+    let impactTof = 0;
+    let impactDist = 0;
+
+    while (t < maxTime - 1e-9) {
+      const h = Math.min(step, maxTime - t);
+      _gPrev.copy(pos);
+      prevTravelled = travelled;
+      const prevGh = this._heightAt(world, _gPrev.x, _gPrev.z);
+      ballisticStep(pos, vel, h, def.drag);
+      travelled += _gPrev.distanceTo(pos);
+      t += h;
+
+      // Interpolated ballistic point at the reference range.
+      if (captureRange && travelled >= refRange) {
+        const span = travelled - prevTravelled;
+        const f = span > 1e-9 ? clamp((refRange - prevTravelled) / span, 0, 1) : 0;
+        _gAim.set(
+          _gPrev.x + (pos.x - _gPrev.x) * f,
+          _gPrev.y + (pos.y - _gPrev.y) * f,
+          _gPrev.z + (pos.z - _gPrev.z) * f,
+        );
+        rangeTof = t - h + h * f;
+        rangeSampleValid = true;
+        captureRange = false;
+      }
+
+      // Exact terrain crossing with linear interpolation (matches fire()).
+      const gh = this._heightAt(world, pos.x, pos.z);
+      if (pos.y <= gh) {
+        const dy1 = _gPrev.y - prevGh;
+        const dy2 = pos.y - gh;
+        const denom = dy1 - dy2;
+        const f = denom > 1e-6 ? clamp(dy1 / denom, 0, 1) : 0;
+        const ix = _gPrev.x + (pos.x - _gPrev.x) * f;
+        const iy = _gPrev.y + (pos.y - _gPrev.y) * f;
+        const iz = _gPrev.z + (pos.z - _gPrev.z) * f;
+        sol.impactValid = true;
+        sol.impactPoint.x = ix;
+        sol.impactPoint.y = iy;
+        sol.impactPoint.z = iz;
+        impactTof = t - h + h * f;
+        impactDist = Math.hypot(ix - muzzle.x, iy - muzzle.y, iz - muzzle.z);
+        break;
+      }
+    }
+
+    // aimPoint: where the nose bore should point for the current engagement.
+    let aimTof = 0;
+    if (sol.impactValid && (!targetValid || impactDist <= refRange)) {
+      // Terrain reached first (or pure strafe): aim exactly at the impact.
+      sol.aimPoint.x = sol.impactPoint.x;
+      sol.aimPoint.y = sol.impactPoint.y;
+      sol.aimPoint.z = sol.impactPoint.z;
+      aimTof = impactTof;
+    } else if (rangeSampleValid) {
+      sol.aimPoint.x = _gAim.x;
+      sol.aimPoint.y = _gAim.y;
+      sol.aimPoint.z = _gAim.z;
+      aimTof = rangeTof;
+    } else {
+      // Fallback: last integrated point (terrain hit before the sample).
+      sol.aimPoint.x = pos.x;
+      sol.aimPoint.y = pos.y;
+      sol.aimPoint.z = pos.z;
+      aimTof = sol.impactValid ? impactTof : t;
+    }
+    sol.valid = true;
+    sol.range = Math.hypot(
+      sol.aimPoint.x - muzzle.x,
+      sol.aimPoint.y - muzzle.y,
+      sol.aimPoint.z - muzzle.z,
+    );
+    sol.tof = aimTof;
+
+    // ---------------------------------------------------- ballistic lead point
+    if (targetValid) {
+      const tp = _gTP.set(lockedTarget.position.x, lockedTarget.position.y, lockedTarget.position.z);
+      const tv = _gTV.set(0, 0, 0);
+      if (lockedTarget.velocity) {
+        tv.set(lockedTarget.velocity.x, lockedTarget.velocity.y, lockedTarget.velocity.z);
+      }
+
+      let tof = clamp(muzzle.distanceTo(tp) / def.muzzleSpeed, 0.05, 2.8);
+      for (let i = 0; i < 3; i++) {
+        // Future target position, less ownship drift, plus bullet drop.
+        _gPT.copy(tp).addScaledVector(tv, tof);
+        _gD.copy(_gPT).sub(muzzle).addScaledVector(ownVel, -tof);
+        _gD.y += 0.5 * G * tof * tof;
+        tof = clamp(_gD.length() / def.muzzleSpeed, 0.05, 2.8);
+      }
+      // Re-evaluate at the converged time of flight so the point is exact.
+      _gPT.copy(tp).addScaledVector(tv, tof);
+      _gD.copy(_gPT).sub(muzzle).addScaledVector(ownVel, -tof);
+      _gD.y += 0.5 * G * tof * tof;
+
+      sol.leadPoint.x = muzzle.x + _gD.x;
+      sol.leadPoint.y = muzzle.y + _gD.y;
+      sol.leadPoint.z = muzzle.z + _gD.z;
+      sol.leadValid = tof < 2.8 && _gD.dot(forward) > 0 && _gD.lengthSq() > 1e-6;
+      if (sol.leadValid) {
+        // The solution the pilot actually flies to: range/time to the lead point.
+        sol.range = _gD.length();
+        sol.tof = tof;
+      }
+    }
+
+    return sol;
+  }
+
+  _setBoresight(muzzle, forward) {
+    const b = this.boresightPoint;
+    b.valid = true;
+    b.x = muzzle.x + forward.x * 1200;
+    b.y = muzzle.y + forward.y * 1200;
+    b.z = muzzle.z + forward.z * 1200;
+  }
+
+  _updateBoresight(flight) {
+    const q = flight.quaternion || _q.identity();
+    _gForward.set(0, 0, -1).applyQuaternion(q);
+    _gMuzzle.set(-0.75, 0.25, -2.5).applyQuaternion(q).add(flight.position);
+    this._setBoresight(_gMuzzle, _gForward);
+  }
+
+  _resetAimState() {
+    for (const p of [this.boresightPoint, this.ccipOrigin]) {
+      p.valid = false;
+      p.x = 0;
+      p.y = 0;
+      p.z = 0;
+    }
+    const sol = this.gunSolution;
+    sol.valid = false;
+    sol.impactValid = false;
+    sol.leadValid = false;
+    sol.range = 0;
+    sol.tof = 0;
+    for (const p of [sol.aimPoint, sol.impactPoint, sol.leadPoint]) {
+      p.x = 0;
+      p.y = 0;
+      p.z = 0;
+    }
+  }
+
   // --------------------------------------------------------------------- CCIP
   computeCCIP(flight, world) {
     const def = WEAPONS.MK82;
     if (!flight || !flight.position) {
       this.ccip.valid = false;
+      this.ccipOrigin.valid = false;
       return this.ccip;
     }
 
@@ -296,6 +516,18 @@ export class WeaponSystem {
     const pos = _tmp.set(side * 2.1, -0.55, 0).applyQuaternion(q).add(flight.position);
     const vel = (flight.velocity ? flight.velocity.clone() : new THREE.Vector3());
     vel.y -= def.ejectSpeed;
+
+    // 3D origin of the bomb fall line: 1.2 s ahead along the aircraft's true
+    // flight path velocity, so the HUD line starts on the trajectory rather
+    // than at an arbitrary screen coordinate.
+    if (flight.velocity) {
+      this.ccipOrigin.valid = true;
+      this.ccipOrigin.x = flight.position.x + flight.velocity.x * 1.2;
+      this.ccipOrigin.y = flight.position.y + flight.velocity.y * 1.2;
+      this.ccipOrigin.z = flight.position.z + flight.velocity.z * 1.2;
+    } else {
+      this.ccipOrigin.valid = false;
+    }
 
     const step = 0.15;
     const maxTime = 18;
@@ -338,7 +570,7 @@ export class WeaponSystem {
   }
 
   // ------------------------------------------------------------------- update
-  update(dt, flight, world, targets = []) {
+  update(dt, flight, world, targets = [], lockedTarget = null) {
     const events = [];
     if (!(dt > 0)) return events;
     this._time += dt;
@@ -370,10 +602,25 @@ export class WeaponSystem {
 
     this._updateFlares(dt, world, events);
 
+    if (flight && flight.position) this._updateBoresight(flight);
+
+    if (this.selected === 'GUN') {
+      this.computeGunSolution(flight, world, lockedTarget);
+    } else {
+      // Stale solutions must never drive the HUD after a weapon change.
+      const sol = this.gunSolution;
+      sol.valid = false;
+      sol.impactValid = false;
+      sol.leadValid = false;
+      sol.range = 0;
+      sol.tof = 0;
+    }
+
     if (this.selected === 'MK82' && flight) {
       this.computeCCIP(flight, world);
     } else {
       this.ccip.valid = false;
+      this.ccipOrigin.valid = false;
     }
 
     return events;

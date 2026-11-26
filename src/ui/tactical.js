@@ -146,6 +146,19 @@ export class TacticalOverlay {
     const st = state && typeof state === 'object' ? state : {};
     const s = clamp(Math.min(width / 1600, height / 900), 0.62, 1.15);
 
+    // Kill the one-frame projection lag: the world matrices (and the camera's
+    // inverse world matrix) must be current before any 3D point is projected.
+    // In chase/orbit views the camera moves every frame, so projecting against
+    // last frame's matrix puts the pipper one frame behind the aircraft.
+    const cam = st.camera;
+    if (cam && typeof cam.updateMatrixWorld === 'function') {
+      try {
+        cam.updateMatrixWorld();
+      } catch (err) {
+        /* a projection-less mock camera must never break the overlay */
+      }
+    }
+
     ctx.save();
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'left';
@@ -398,25 +411,64 @@ export class TacticalOverlay {
     if (!weapons) return;
     const selected = weapons.selected;
     const camera = state.camera || null;
+    const tel = state.telemetry || {};
+    const isExternal = !!tel.mode && tel.mode !== 'cockpit';
     const cx = w * 0.5;
     const cy = h * 0.46;
+    const externalHorizon = h * 0.47;
+
+    // ------------------------------------------------ true 3D anchors (12A)
+    // Every anchor below is optional. With no camera, or with a solver that has
+    // no valid solution this frame, we fall back to the legacy fixed screen
+    // coordinates so the overlay still renders in headless/early-frame use.
+    const gunSol = weapons.gunSolution && weapons.gunSolution.valid ? weapons.gunSolution : null;
+    const bore = weapons.boresightPoint && weapons.boresightPoint.valid
+      ? weapons.boresightPoint
+      : null;
+    const boreProj = bore ? this._project(bore, camera, w, h) : null;
+    const boreVisible = !!(boreProj && !boreProj.behind);
+    const boreOnScreen = !!(boreVisible
+      && boreProj.x >= 0 && boreProj.x <= w && boreProj.y >= 0 && boreProj.y <= h);
+    const bx = boreVisible ? boreProj.x : null;
+    const by = boreVisible ? boreProj.y : null;
+
+    let gunProj = null;
+    if (gunSol && gunSol.aimPoint) {
+      const gp = this._project(gunSol.aimPoint, camera, w, h);
+      if (gp && !gp.behind) gunProj = gp;
+    }
+    const gx = gunProj ? gunProj.x : cx;
+    const gy = gunProj ? gunProj.y : cy + (isExternal ? 0 : 13.75 * s);
+    const impactValid = !!(gunSol && gunSol.impactValid);
 
     // ------------------------------------------------------------- CCIP
     const ccip = weapons.ccip;
     if (selected === 'MK82' && ccip && ccip.valid) {
       const p = this._project(ccip, camera, w, h);
       if (p && !p.behind && p.x > 0 && p.x < w && p.y > 0 && p.y < h) {
+        // The Bomb Fall Line starts on the aircraft's true 3D flight path
+        // (ccipOrigin), then the nose boresight, then the legacy centre.
+        let origin = null;
+        const co = weapons.ccipOrigin;
+        if (co && co.valid) {
+          const o = this._project(co, camera, w, h);
+          if (o && !o.behind && o.x >= 0 && o.x <= w && o.y >= 0 && o.y <= h) origin = o;
+        }
+        if (!origin && boreVisible) origin = boreProj;
+        const ox = origin ? origin.x : cx;
+        const oy = origin ? origin.y : cy;
+
         ctx.save();
         ctx.strokeStyle = 'rgba(157,255,192,0.72)';
         ctx.lineWidth = 1.2;
         if (typeof ctx.setLineDash === 'function') ctx.setLineDash([6 * s, 6 * s]);
         ctx.beginPath();
-        ctx.moveTo(cx, cy);
+        ctx.moveTo(ox, oy);
         ctx.lineTo(p.x, p.y);
         ctx.stroke();
         if (typeof ctx.setLineDash === 'function') ctx.setLineDash([]);
 
-        const rr = 13 * s;
+        const rr = (isExternal ? 11 : 13) * s;
         ctx.beginPath();
         ctx.arc(p.x, p.y, rr, 0, TAU);
         ctx.stroke();
@@ -447,23 +499,19 @@ export class TacticalOverlay {
 
     // ------------------------------------------------------------- GUN
     if (selected === 'GUN') {
-      const tel = state.telemetry || {};
-      const isExternal = !!tel.mode && tel.mode !== 'cockpit';
       const r = (isExternal ? 14 : 25) * s;
-      const gy = cy + (isExternal ? 0 : r * 0.55);
-      ctx.save();
-      ctx.strokeStyle = isExternal ? GREEN_DIM : GREEN;
-      ctx.lineWidth = isExternal ? 1.0 : 1.2;
 
       if (isExternal) {
-        // Follow-camera micro-HUD: subtle segmented level wings + minimal aim pip
-        // so the center view of the aircraft stays clean and unobstructed.
+        // Minimal micro-HUD: a segmented level horizon anchored on the true 3D
+        // boresight (ultra light so the jet stays unobstructed)...
         const rollRad = (num(tel.roll, 0) * Math.PI) / 180;
         const pitchOff = clamp(num(tel.pitch, 0), -18, 18) * 1.4 * s;
+        const wx = boreOnScreen ? bx : cx;
+        const wy = boreOnScreen ? by : externalHorizon + (boreVisible ? 0 : pitchOff);
         ctx.save();
-        ctx.translate(cx, cy + pitchOff);
+        ctx.translate(wx, wy);
         ctx.rotate(-rollRad);
-        ctx.strokeStyle = 'rgba(157,255,192,0.34)';
+        ctx.strokeStyle = 'rgba(157,255,192,0.30)';
         ctx.lineWidth = 1.0;
         ctx.beginPath();
         ctx.moveTo(-42 * s, 0);
@@ -475,87 +523,176 @@ export class TacticalOverlay {
         ctx.stroke();
         ctx.restore();
 
-        // Micro boresight cross
-        ctx.strokeStyle = 'rgba(157,255,192,0.58)';
+        // ...and the crisp ballistic gun pipper on the true 3D trajectory the
+        // rounds actually follow (tiny ring + dot + 4 short ticks).
+        const pr = 5.5 * s;
+        ctx.save();
+        ctx.strokeStyle = impactValid ? GREEN : 'rgba(157,255,192,0.72)';
+        ctx.fillStyle = impactValid ? GREEN : 'rgba(157,255,192,0.85)';
+        ctx.lineWidth = impactValid ? 1.4 : 1.0;
         ctx.beginPath();
-        ctx.moveTo(cx - 8 * s, gy);
-        ctx.lineTo(cx - 3 * s, gy);
-        ctx.moveTo(cx + 3 * s, gy);
-        ctx.lineTo(cx + 8 * s, gy);
-        ctx.moveTo(cx, gy - 6 * s);
-        ctx.lineTo(cx, gy - 2.5 * s);
-        ctx.moveTo(cx, gy + 2.5 * s);
-        ctx.lineTo(cx, gy + 6 * s);
+        ctx.arc(gx, gy, pr, 0, TAU);
         ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(gx, gy, 1.5 * s, 0, TAU);
+        ctx.fill();
+        const tick = impactValid ? 4.5 : 3.5;
+        ctx.beginPath();
+        ctx.moveTo(gx - pr - tick * s, gy);
+        ctx.lineTo(gx - pr - 0.5 * s, gy);
+        ctx.moveTo(gx + pr + 0.5 * s, gy);
+        ctx.lineTo(gx + pr + tick * s, gy);
+        ctx.moveTo(gx, gy - pr - tick * s);
+        ctx.lineTo(gx, gy - pr - 0.5 * s);
+        ctx.moveTo(gx, gy + pr + 0.5 * s);
+        ctx.lineTo(gx, gy + pr + tick * s);
+        ctx.stroke();
+        ctx.restore();
       } else {
+        // Cockpit EEGS: the pipper sits exactly on the projected 3D ballistic
+        // point, so rounds go through the reticle dot in turns / AoA / head-look.
+        ctx.save();
+        ctx.strokeStyle = GREEN;
+        ctx.lineWidth = 1.2;
+
         if (typeof ctx.setLineDash === 'function') ctx.setLineDash([3 * s, 4 * s]);
         ctx.beginPath();
-        ctx.arc(cx, gy, r, 0, TAU);
+        ctx.arc(gx, gy, r, 0, TAU);
         ctx.stroke();
         if (typeof ctx.setLineDash === 'function') ctx.setLineDash([]);
 
         ctx.beginPath();
-        ctx.moveTo(cx - r * 1.75, cy - r * 1.25);
-        ctx.lineTo(cx - r * 0.48, gy);
-        ctx.moveTo(cx + r * 1.75, cy - r * 1.25);
-        ctx.lineTo(cx + r * 0.48, gy);
+        ctx.moveTo(gx - r * 1.75, gy - r * 1.8);
+        ctx.lineTo(gx - r * 0.48, gy);
+        ctx.moveTo(gx + r * 1.75, gy - r * 1.8);
+        ctx.lineTo(gx + r * 0.48, gy);
         ctx.stroke();
 
         ctx.beginPath();
-        ctx.moveTo(cx - 7 * s, gy);
-        ctx.lineTo(cx - 2 * s, gy);
-        ctx.moveTo(cx + 2 * s, gy);
-        ctx.lineTo(cx + 7 * s, gy);
-        ctx.moveTo(cx, gy - 5 * s);
-        ctx.lineTo(cx, gy + 5 * s);
+        ctx.moveTo(gx - 7 * s, gy);
+        ctx.lineTo(gx - 2 * s, gy);
+        ctx.moveTo(gx + 2 * s, gy);
+        ctx.lineTo(gx + 7 * s, gy);
+        ctx.moveTo(gx, gy - 5 * s);
+        ctx.lineTo(gx, gy + 5 * s);
         ctx.stroke();
 
         for (const off of [-r * 0.62, 0, r * 0.62]) {
           ctx.beginPath();
-          ctx.moveTo(cx + off, gy - r);
-          ctx.lineTo(cx + off, gy - r + 4 * s);
+          ctx.moveTo(gx + off, gy - r);
+          ctx.lineTo(gx + off, gy - r + 4 * s);
           ctx.stroke();
         }
 
         ctx.font = `700 ${Math.round(9 * s)}px ${MONO}`;
         ctx.textAlign = 'center';
         ctx.fillStyle = GREEN_DIM;
-        ctx.fillText('GUN', cx, gy + r + 10 * s);
+        ctx.fillText('GUN', gx, gy + r + 10 * s);
+        ctx.restore();
       }
 
-      // Lead computing pipper for an airborne, moving locked target.
-      const t = state.lockedTarget;
-      if (t && t.airborne && t.position) {
-        const range = this._range(t, this._ownPos(state));
-        const tof = clamp((range == null ? 900 : range) / 1030, 0.12, 2.2);
-        const vx = vecNum(t.velocity, 'x');
-        const vy = vecNum(t.velocity, 'y');
-        const vz = vecNum(t.velocity, 'z');
-        const lead = {
-          x: vecNum(t.position, 'x') + vx * tof,
-          y: vecNum(t.position, 'y') + vy * tof,
-          z: vecNum(t.position, 'z') + vz * tof,
-        };
-        const q = this._project(lead, camera, w, h);
-        if (q && !q.behind && q.x > 0 && q.x < w && q.y > 0 && q.y < h) {
-          const lr = clamp(9 - tof * 2.5, 4, 9) * s;
-          ctx.strokeStyle = AMBER;
-          ctx.lineWidth = 1.2;
-          ctx.beginPath();
-          ctx.arc(q.x, q.y, lr, 0, TAU);
-          ctx.stroke();
-          ctx.beginPath();
-          ctx.arc(q.x, q.y, 1.8 * s, 0, TAU);
-          ctx.fillStyle = AMBER;
-          ctx.fill();
-          ctx.beginPath();
-          ctx.moveTo(q.x - lr - 5 * s, q.y);
-          ctx.lineTo(q.x - lr - 1.5 * s, q.y);
-          ctx.moveTo(q.x + lr + 1.5 * s, q.y);
-          ctx.lineTo(q.x + lr + 5 * s, q.y);
-          ctx.stroke();
+      // Ballistic lead pipper: the true 3D leadPoint when the solver provides
+      // one, otherwise the legacy velocity-lead approximation.
+      let leadProj = null;
+      let leadTof = 0;
+      if (gunSol) {
+        if (gunSol.leadValid && gunSol.leadPoint) {
+          const lp = this._project(gunSol.leadPoint, camera, w, h);
+          if (lp && !lp.behind && lp.x > 0 && lp.x < w && lp.y > 0 && lp.y < h) leadProj = lp;
+        }
+      } else {
+        const t = state.lockedTarget;
+        if (t && t.airborne && t.position) {
+          const range = this._range(t, this._ownPos(state));
+          const tof = clamp((range == null ? 900 : range) / 1030, 0.12, 2.2);
+          leadTof = tof;
+          const lead = {
+            x: vecNum(t.position, 'x') + vecNum(t.velocity, 'x') * tof,
+            y: vecNum(t.position, 'y') + vecNum(t.velocity, 'y') * tof,
+            z: vecNum(t.position, 'z') + vecNum(t.velocity, 'z') * tof,
+          };
+          const q = this._project(lead, camera, w, h);
+          if (q && !q.behind && q.x > 0 && q.x < w && q.y > 0 && q.y < h) leadProj = q;
         }
       }
+
+      if (leadProj) {
+        const lr = (gunSol ? 7 : clamp(9 - leadTof * 2.5, 4, 9)) * s;
+        ctx.save();
+        if (isExternal) {
+          // Faint dashed cue from the nose boresight to the lead ring: put the
+          // boresight on the ring and the rounds will meet the target.
+          const ax = bx != null ? bx : gx;
+          const ay = by != null ? by : gy;
+          ctx.strokeStyle = 'rgba(255,196,107,0.30)';
+          ctx.lineWidth = 1.0;
+          if (typeof ctx.setLineDash === 'function') ctx.setLineDash([2.5 * s, 5 * s]);
+          ctx.beginPath();
+          ctx.moveTo(ax, ay);
+          ctx.lineTo(leadProj.x, leadProj.y);
+          ctx.stroke();
+          if (typeof ctx.setLineDash === 'function') ctx.setLineDash([]);
+        }
+        ctx.strokeStyle = AMBER;
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.arc(leadProj.x, leadProj.y, lr, 0, TAU);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(leadProj.x, leadProj.y, 1.8 * s, 0, TAU);
+        ctx.fillStyle = AMBER;
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(leadProj.x - lr - 5 * s, leadProj.y);
+        ctx.lineTo(leadProj.x - lr - 1.5 * s, leadProj.y);
+        ctx.moveTo(leadProj.x + lr + 1.5 * s, leadProj.y);
+        ctx.lineTo(leadProj.x + lr + 5 * s, leadProj.y);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    // ------------------------------------------------------------- AIM-9
+    if (selected === 'AIM9') {
+      // Seeker field-of-view cue on the true 3D nose boresight, so in chase or
+      // cockpit head-look you see exactly where the seeker is looking.
+      const sx = boreVisible ? bx : cx;
+      const sy = boreVisible ? by : cy;
+      const locked = !!(state.lockedTarget && state.lockedTarget.alive !== false);
+      const sr = 11 * s;
+
+      ctx.save();
+      if (locked) {
+        ctx.strokeStyle = AMBER;
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        ctx.arc(sx, sy, sr, 0, TAU);
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = 'rgba(157,255,192,0.42)';
+        ctx.lineWidth = 1.0;
+        if (typeof ctx.setLineDash === 'function') ctx.setLineDash([3 * s, 5 * s]);
+        ctx.beginPath();
+        ctx.arc(sx, sy, sr, 0, TAU);
+        ctx.stroke();
+        if (typeof ctx.setLineDash === 'function') ctx.setLineDash([]);
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(sx - sr - 4 * s, sy);
+      ctx.lineTo(sx - sr + 2 * s, sy);
+      ctx.moveTo(sx + sr - 2 * s, sy);
+      ctx.lineTo(sx + sr + 4 * s, sy);
+      ctx.moveTo(sx, sy - sr - 4 * s);
+      ctx.lineTo(sx, sy - sr + 2 * s);
+      ctx.moveTo(sx, sy + sr - 2 * s);
+      ctx.lineTo(sx, sy + sr + 4 * s);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(sx, sy, 1.6 * s, 0, TAU);
+      ctx.fillStyle = locked ? AMBER : 'rgba(157,255,192,0.55)';
+      ctx.fill();
       ctx.restore();
     }
   }

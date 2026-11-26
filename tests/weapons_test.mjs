@@ -25,6 +25,54 @@ function step(ws, flight, world, targets = [], seconds = 1 / 60) {
   return ws.update(seconds, flight, world, targets);
 }
 
+// Feature 12A helpers --------------------------------------------------------
+function withDispersion(disp, fn) {
+  const orig = WEAPONS.GUN.dispersion;
+  WEAPONS.GUN.dispersion = disp;
+  try {
+    return fn();
+  } finally {
+    WEAPONS.GUN.dispersion = orig;
+  }
+}
+
+function gunImpact(ws, flight, world, maxSeconds = 4) {
+  for (let i = 0; i < Math.ceil(maxSeconds * 60); i++) {
+    const events = ws.update(1 / 60, flight, world);
+    const impact = events.find((e) => e.kind === 'impact' && e.weapon === 'GUN');
+    if (impact) return impact;
+  }
+  return null;
+}
+
+// Fires `shots` GUN rounds from a static aircraft and returns the worst
+// miss distance between the real impacts and each shot's solved impact point.
+function strafeBurst(world, pos, diveDeg, speed, shots = 10) {
+  const ws = new WeaponSystem(null);
+  ws.selectWeapon('GUN');
+  const pitch = (-diveDeg * Math.PI) / 180;
+  const f = new THREE.Vector3(0, Math.sin(pitch), -Math.cos(pitch)).multiplyScalar(speed);
+  const flight = makeFlight({ pos, vel: [f.x, f.y, f.z], pitch });
+
+  let worst = 0;
+  let solved = 0;
+  for (let s = 0; s < shots; s++) {
+    const sol = ws.computeGunSolution(flight, world);
+    if (sol.valid && sol.impactValid) {
+      const aim = { x: sol.impactPoint.x, y: sol.impactPoint.y, z: sol.impactPoint.z };
+      solved++;
+      ws.fire(flight);
+      const impact = gunImpact(ws, flight, world);
+      const miss = impact
+        ? Math.hypot(impact.position.x - aim.x, impact.position.y - aim.y, impact.position.z - aim.z)
+        : Infinity;
+      worst = Math.max(worst, miss);
+    }
+    ws.update(0.1, flight, world);
+  }
+  return { ws, worst, solved };
+}
+
 // ------------------------------------------------------- 1. cycling + ammo
 {
   const ws = new WeaponSystem(null);
@@ -237,6 +285,75 @@ function step(ws, flight, world, targets = [], seconds = 1 / 60) {
     'reset restores full loadout');
   ok(ws.ccip.valid === false, 'reset invalidates CCIP');
   ok(ws.fire(flight).fired === true, 'can fire immediately after reset');
+}
+
+// ------------------------------------------------ 6. Feature 12A gun solution
+{
+  const ws = new WeaponSystem(null);
+  ws.selectWeapon('GUN');
+  const flatStrafe = strafeBurst(flatWorld, [0, 400, 0], 30, 220, 10);
+  ok(flatStrafe.solved === 10, '12A: flat diving strafe solved all 10 shots');
+  ok(flatStrafe.worst < 15, '12A: flat strafe rounds land within 15 m of gunSolution.impactPoint',
+    flatStrafe.worst.toFixed(2) + ' m');
+
+  const slopedWorld = { heightAt: (x, z) => Math.max(0, -z * 0.08) };
+  const slopeStrafe = strafeBurst(slopedWorld, [0, 450, 0], 40, 220, 10);
+  ok(slopeStrafe.solved === 10, '12A: sloped strafe solved all 10 shots');
+  ok(slopeStrafe.worst < 15, '12A: sloped strafe rounds land within 15 m of impactPoint',
+    slopeStrafe.worst.toFixed(2) + ' m');
+
+  // Zero-dispersion exact parity (< 1 m)
+  withDispersion(0, () => {
+    const exact = strafeBurst(flatWorld, [0, 400, 0], 30, 220, 1);
+    ok(exact.worst < 1.0, '12A: zero-dispersion GUN matches impactPoint within 1 m',
+      exact.worst.toFixed(3) + ' m');
+  });
+
+  // Air-to-air crossing bandit lead accuracy (< 15 m)
+  withDispersion(0, () => {
+    const wLead = new WeaponSystem(null);
+    wLead.selectWeapon('GUN');
+    const own = makeFlight({ pos: [0, 2000, 0], vel: [0, 0, -220], pitch: 0 });
+    const bandit = {
+      id: 'mig-1', alive: true, airborne: true, hitRadius: 16,
+      position: new THREE.Vector3(0, 2000, -800),
+      velocity: new THREE.Vector3(200, 0, 0),
+    };
+    const sol = wLead.computeGunSolution(own, flatWorld, bandit);
+    ok(sol.valid && sol.leadValid, '12A: lead solution valid for crossing bandit');
+    ok(sol.leadPoint.x > bandit.position.x + 80, '12A: lead point leads east of crossing bandit');
+
+    // Aim nose directly at leadPoint and fire
+    const muzzle = new THREE.Vector3(-0.75, 0.25, -2.5).applyQuaternion(own.quaternion).add(own.position);
+    const aimDir = new THREE.Vector3(sol.leadPoint.x, sol.leadPoint.y, sol.leadPoint.z).sub(muzzle).normalize();
+    const aimedQ = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, -1), aimDir);
+    const aimedFlight = { ...own, quaternion: aimedQ };
+    const tof = sol.tof;
+    const fired = wLead.fire(aimedFlight);
+    ok(fired.fired, '12A: fired aimed lead shot');
+    const round = wLead.projectiles[0];
+    // Step round and bandit together to tof
+    const steps = Math.max(1, Math.round(tof / (1 / 60)));
+    const dt = tof / steps;
+    let minMiss = Infinity;
+    for (let i = 0; i < steps; i++) {
+      wLead.update(dt, aimedFlight, flatWorld, []);
+      bandit.position.addScaledVector(bandit.velocity, dt);
+      if (wLead.projectiles.length > 0) {
+        minMiss = Math.min(minMiss, wLead.projectiles[0].position.distanceTo(bandit.position));
+      }
+    }
+    ok(minMiss < 15, '12A: aimed lead round passes within 15 m of moving bandit',
+      minMiss.toFixed(2) + ' m');
+  });
+
+  // boresightPoint and ccipOrigin
+  const wb = new WeaponSystem(null);
+  const fLevel = makeFlight({ pos: [0, 1200, 0], vel: [0, 0, -240], pitch: 0 });
+  wb.selectWeapon('MK82');
+  wb.update(1 / 60, fLevel, flatWorld);
+  ok(wb.boresightPoint.valid && wb.boresightPoint.z < -1100, '12A: boresightPoint valid ahead of nose');
+  ok(wb.ccipOrigin.valid && wb.ccipOrigin.z < -200, '12A: ccipOrigin valid along flight velocity');
 }
 
 // ------------------------------------------------------------ summary
