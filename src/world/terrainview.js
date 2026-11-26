@@ -127,7 +127,24 @@ export class TerrainView {
     if (next === this.theater) return;
     this.theater = next;
     this.water.setPalette(PALETTES[next]);
-    // Clear existing cached tiles so terrain seamlessly repaints in the new theater palette.
+    // Drop every cached tile so terrain repaints cleanly in the new palette:
+    // no old-LOD geometry survives to overlap the rebuilt quadtree.
+    this._clearTiles();
+    this.lastBuildX = Infinity;
+    this.lastBuildZ = Infinity;
+  }
+
+  /** Force a rebuild of the visible quadtree (used at boot and on teleport). */
+  refresh(center, immediate = 0) {
+    // A refresh means the height field under us changed; stale LODs kept for
+    // streaming continuity would now overlap the new tiles, so clear first.
+    this._clearTiles();
+    this._rebuild(center);
+    if (immediate > 0) this._buildPending(immediate);
+  }
+
+  /** Remove every tile mesh and its GPU geometry, resetting streaming state. */
+  _clearTiles() {
     for (const mesh of this.tiles.values()) {
       this.group.remove(mesh);
       mesh.geometry.dispose();
@@ -135,14 +152,6 @@ export class TerrainView {
     this.tiles.clear();
     this._stale.clear();
     this.pending.length = 0;
-    this.lastBuildX = Infinity;
-    this.lastBuildZ = Infinity;
-  }
-
-  /** Force a rebuild of the visible quadtree (used at boot). */
-  refresh(center, immediate = 0) {
-    this._rebuild(center);
-    if (immediate > 0) this._buildPending(immediate);
   }
 
   _rebuild(center) {
@@ -410,22 +419,29 @@ class WaterSurface {
           vec3 viewDir = normalize(cameraPosition - vWorld);
           float t = uTime;
           vec2 p = vWorld.xz;
+          // Kill wave/specular detail with distance so the far Adriatic reads as
+          // a smooth plate: no sub-pixel normal jitter, hence no horizon shimmer.
+          float distFade = 1.0 - smoothstep(3500.0, 24000.0, length(vWorld.xz - cameraPosition.xz));
           float w1 = sin(p.x * 0.045 + t * 0.7) * cos(p.y * 0.052 - t * 0.55);
           float w2 = sin(p.x * 0.011 - t * 0.23 + p.y * 0.017) * 0.8;
           float w3 = sin((p.x + p.y) * 0.19 + t * 1.4) * 0.25;
-          vec3 n = normalize(vec3(w1 * 0.16 + w3 * 0.05, 1.0, w2 * 0.16 + w3 * 0.05));
+          vec3 n = normalize(vec3((w1 * 0.16 + w3 * 0.05) * distFade, 1.0, (w2 * 0.16 + w3 * 0.05) * distFade));
           float fres = pow(1.0 - max(dot(n, viewDir), 0.0), 3.2);
           vec3 col = mix(uDeep, uShallow, 0.35 + 0.25 * w2);
           col = mix(col, uSkyColor, clamp(fres * 0.7, 0.0, 0.75));
           vec3 r = reflect(-uSunDir, n);
           float spec = pow(max(dot(r, viewDir), 0.0), 120.0);
           float sparkle = pow(max(dot(r, viewDir), 0.0), 18.0) * 0.12;
-          col += uSunColor * (spec * 1.4 + sparkle);
+          col += uSunColor * (spec * 1.4 + sparkle) * distFade;
           gl_FragColor = vec4(col, 1.0);
           #include <fog_fragment>
         }
       `,
       fog: true,
+      // Push the sea plane behind any low-lying coastal terrain sharing y=0.
+      polygonOffset: true,
+      polygonOffsetFactor: 2,
+      polygonOffsetUnits: 2,
     });
     this.mesh = new THREE.Mesh(geo, this.material);
     this.mesh.position.y = SEA_LEVEL;

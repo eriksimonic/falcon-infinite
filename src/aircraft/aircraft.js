@@ -17,6 +17,12 @@ const _fbRight = new THREE.Vector3();
 const _fbUp = new THREE.Vector3();
 const _fbTmp = new THREE.Vector3();
 
+// Near planes tuned per rig: the cockpit keeps a tight near so the instrument
+// panel never clips, while every external rig pushes near out to 1.5 (12x more
+// depth precision at the horizon, no shader-side depth hacks needed).
+const COCKPIT_NEAR = 0.22;
+const EXTERNAL_NEAR = 1.5;
+
 export class Aircraft {
   constructor(scene, world) {
     this.scene = scene;
@@ -30,7 +36,7 @@ export class Aircraft {
 
     this.camera = new THREE.PerspectiveCamera(
       CONFIG.camera.cockpitFov, window.innerWidth / window.innerHeight,
-      0.12, CONFIG.render.far,
+      COCKPIT_NEAR, CONFIG.render.far,
     );
     this.mode = 'cockpit';
     this.lookYaw = 0;
@@ -96,6 +102,7 @@ export class Aircraft {
     } else {
       this.camera.fov = CONFIG.camera.externalFov;
     }
+    this.camera.near = mode === 'cockpit' ? COCKPIT_NEAR : EXTERNAL_NEAR;
     this.camera.updateProjectionMatrix();
   }
 
@@ -196,6 +203,7 @@ export class Aircraft {
       cam.up.set(0, 1, 0);
       cam.lookAt(_v2);
       cam.fov = 42;
+      cam.near = EXTERNAL_NEAR;
       cam.updateProjectionMatrix();
       return;
     }
@@ -258,6 +266,7 @@ export class Aircraft {
         cam.position.z += Math.sin(t * 29 + 2) * 0.012 * this._shake;
       }
       cam.fov = CONFIG.camera.cockpitFov;
+      cam.near = COCKPIT_NEAR;
       cam.updateProjectionMatrix();
       return;
     }
@@ -313,6 +322,7 @@ export class Aircraft {
       cam.up.set(0, 1, 0);
       cam.lookAt(_v2);
       cam.fov = CONFIG.camera.externalFov;
+      cam.near = EXTERNAL_NEAR;
       cam.updateProjectionMatrix();
       return;
     }
@@ -325,6 +335,7 @@ export class Aircraft {
       cam.up.copy(up).normalize();
       cam.lookAt(_v2);
       cam.fov = CONFIG.camera.externalFov;
+      cam.near = EXTERNAL_NEAR;
       cam.updateProjectionMatrix();
       return;
     }
@@ -353,6 +364,7 @@ export class Aircraft {
       cam.up.set(0, 1, 0);
       cam.lookAt(pos);
       cam.fov = 38;
+      cam.near = EXTERNAL_NEAR;
       cam.updateProjectionMatrix();
 
       // Radial closing speed (positive = inbound) -> engine Doppler pitch.

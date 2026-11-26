@@ -537,18 +537,28 @@ export class RoadNetwork {
     }
     near.sort((a, b) => a.d2 - b.d2);
 
+    const aps = airportsNear(cx, cz, 2);
     const polylines = [];
     let segmentBudget = this.capacity;
     for (const { road } of near) {
-      let length = 0;
       const pts = road.points;
-      for (let i = 1; i < pts.length; i++) {
-        length += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z);
+      // OSM tags both carriageways of a dual motorway (H4/A1) with the full
+      // carriageway width, so the two ribbons overlap and Z-fight. Cap each
+      // carriageway to one lane-and-a-half so they sit side by side.
+      const width = Math.min(road.width, 10.5);
+      // Real asphalt must never cross an airport pad: clip every polyline
+      // where it enters the runway clearing (plus margin).
+      for (const run of splitAroundAirports(pts, aps, 40)) {
+        let length = 0;
+        for (let i = 1; i < run.length; i++) {
+          length += Math.hypot(run[i].x - run[i - 1].x, run[i].z - run[i - 1].z);
+        }
+        const est = Math.max(1, Math.ceil(length / SAMPLE_STEP));
+        if (est > segmentBudget) continue;
+        segmentBudget -= est;
+        polylines.push({ width, points: run });
       }
-      const est = Math.max(1, Math.ceil(length / SAMPLE_STEP));
-      if (est > segmentBudget) continue;
-      segmentBudget -= est;
-      polylines.push({ width: road.width, points: pts });
+      if (segmentBudget <= 0) break;
     }
 
     const data = buildRoadRibbonData(polylines, terrainHeight);
