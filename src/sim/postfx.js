@@ -1,11 +1,12 @@
-// Feature 32 — selective cinematic bloom.
+// Feature 32 — selective cinematic bloom. Feature 35 tamed it for the
+// photoreal Vipava pass.
 //
 // Three.js's built-in EffectComposer chain: RenderPass -> UnrealBloomPass ->
-// OutputPass. The bloom threshold is deliberately high (0.88 by day, tapering
-// to 0.72 at night) so the sunlit sky, clouds and terrain stay clean while the
-// HDR/un-tonemapped emissives — afterburner Mach diamonds, BFFG plasma,
-// fireball cores, city night windows, H4 traffic streaks, runway strobes and
-// landmark beacons — flare properly.
+// OutputPass. The bloom threshold is deliberately high (1.05 by day, easing to
+// 0.88 at night) so the sunlit sky, clouds, terrain and building facades stay
+// clean while only HDR/un-tonemapped emissives — afterburner Mach diamonds,
+// BFFG plasma, fireball cores, city night windows, H4 traffic streaks, runway
+// strobes and landmark beacons — flare properly.
 //
 // Headless-safe: with no renderer, no WebGL context, or `enabled: false` the
 // system degrades to a plain `renderer.render(scene, camera)` passthrough, so
@@ -17,17 +18,21 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 
-// Day is conservative (blue sky sits under the threshold), night opens up so
-// window/beacon/traffic emissives pop in the dark.
-const DAY_THRESHOLD = 0.88;
-const NIGHT_THRESHOLD = 0.72;
-const DAY_STRENGTH = 0.36;
-const NIGHT_STRENGTH = 0.58;
-const BLOOM_RADIUS = 0.45;
+// Day is conservative (blue sky sits well under the threshold), night opens up
+// so window/beacon/traffic emissives pop in the dark without washing out.
+const DAY_THRESHOLD = 1.05;
+const NIGHT_THRESHOLD = 0.88;
+const DAY_STRENGTH = 0.14;
+const NIGHT_STRENGTH = 0.24;
+const BLOOM_RADIUS = 0.36;
 
 const NIGHT_BLEND_RATE = 1.6; // blend units per second (smooth dusk/dawn)
 const PULSE_DECAY = 0.6; // seconds for a detonation bloom spike to fade
 const PULSE_FLOOR = 0.002;
+const PULSE_LIMIT = 1.1; // soft cap on additive pulse over the base strength
+
+const _nightLevel = (night) =>
+  typeof night === 'number' ? clamp(night, 0, 1) : (night ? 1 : 0);
 
 function clamp(v, lo, hi) {
   return v < lo ? lo : v > hi ? hi : v;
@@ -44,7 +49,7 @@ export class PostFXSystem {
    * @param {object|null} renderer WebGLRenderer, or null when headless.
    * @param {object|null} scene
    * @param {object|null} camera
-   * @param {{enabled?: boolean, night?: boolean}} [options]
+   * @param {{enabled?: boolean, night?: boolean|number}} [options]
    */
   constructor(renderer, scene, camera, options = {}) {
     const { enabled = true, night = false } = options || {};
@@ -53,9 +58,13 @@ export class PostFXSystem {
     this.scene = scene || null;
     this.camera = camera || null;
 
-    this.nightBlend = night ? 1 : 0;
-    this.threshold = night ? NIGHT_THRESHOLD : DAY_THRESHOLD;
-    this.strength = night ? NIGHT_STRENGTH : DAY_STRENGTH;
+    // `night` is a continuous 0..1 level (sky.night), not a boolean: golden
+    // hour sits near 0.05 and must not snap straight to full night bloom.
+    this.nightTarget = _nightLevel(night);
+    this.night = this.nightTarget > 0.5;
+    this.nightBlend = this.nightTarget;
+    this.threshold = lerp(DAY_THRESHOLD, NIGHT_THRESHOLD, this.nightBlend);
+    this.strength = lerp(DAY_STRENGTH, NIGHT_STRENGTH, this.nightBlend);
     this.radius = BLOOM_RADIUS;
 
     // Temporary additive bloom spike (detonations, Mach 1.0 shockwave).
@@ -147,16 +156,22 @@ export class PostFXSystem {
     return this.enabled;
   }
 
-  /** Smoothly move the threshold/strength between day and night presets. */
+  /**
+   * Aim the day/night bloom preset at a continuous 0..1 night level (booleans
+   * still work: true = 1, false = 0). The actual transition is eased in
+   * update(), so a golden-hour `sky.night ~ 0.05` stays near the day preset
+   * instead of snapping to full night bloom.
+   */
   setNight(night) {
-    this.night = !!night;
+    this.nightTarget = _nightLevel(night);
+    this.night = this.nightTarget > 0.5;
     return this;
   }
 
   /** Temporary bloom spike (BFFG/Mk-82 detonation, Mach 1.0 shockwave). */
   pulseBloom(amount = 0.55) {
     const add = Number.isFinite(amount) ? Math.max(0, amount) : 0;
-    if (add > 0) this.bloomPulse = Math.min(2.5, Math.max(this.bloomPulse, add));
+    if (add > 0) this.bloomPulse = Math.min(PULSE_LIMIT, Math.max(this.bloomPulse, add));
     return this;
   }
 
@@ -164,7 +179,7 @@ export class PostFXSystem {
   update(dt) {
     const h = Number.isFinite(dt) && dt > 0 ? Math.min(dt, 1) : 0;
 
-    const target = this.night ? 1 : 0;
+    const target = this.nightTarget;
     const step = NIGHT_BLEND_RATE * h;
     if (this.nightBlend < target) this.nightBlend = Math.min(target, this.nightBlend + step);
     else if (this.nightBlend > target) this.nightBlend = Math.max(target, this.nightBlend - step);
@@ -185,7 +200,7 @@ export class PostFXSystem {
     const pass = this.bloomPass;
     if (!pass) return;
     pass.threshold = clamp(this.threshold, 0, 2);
-    pass.strength = this.strength + this.bloomPulse;
+    pass.strength = this.strength + Math.min(this.bloomPulse, PULSE_LIMIT);
     pass.radius = this.radius;
   }
 

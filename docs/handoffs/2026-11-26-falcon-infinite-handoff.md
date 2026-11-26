@@ -9,7 +9,7 @@
 - **Commands**:
   - `npm run dev` — Vite dev server (`http://127.0.0.1:5173`, auto-enables MCP browser bridge)
   - `npm run build` — Production bundle (`dist/`, zero warnings, splits `vendor-three` + `index`)
-  - `npm test` — Runs all **21 headless Node test suites** (`tests/*_test.mjs`)
+  - `npm test` — Runs all **24 headless Node test suites** (`tests/*_test.mjs`)
   - `npm run mcp` — Runs the local stdio MCP server (`mcp/server.mjs`, HTTP bridge on `127.0.0.1:5179`)
   - `npm run wso` — Runs the real-time AI WSO / Co-Pilot (`mcp/wso_copilot.mjs`) over MCP
 
@@ -20,7 +20,7 @@
 ### Strict Role Split (IMPORTANT — Follow This Rule)
 - **AGY (Antigravity) = Coordinator ONLY**:
   - Plans architecture and feature breakdowns.
-  - Writes clear, disjoint, worker-ready spec documents in `docs/features/` (next number: **`30-...`**).
+  - Writes clear, disjoint, worker-ready spec documents in `docs/features/` (next number: **`36-...`**).
   - Dispatches parallel **Hermes** workers for **ALL implementation** AND **ALL validation**.
   - Reviews worker summaries, manages git commits/pushes/handoffs — **does NOT write feature implementation code directly**.
 - **Hermes (`/home/erik/.local/bin/hermes`) = Implementation & Validation Workers**:
@@ -30,7 +30,7 @@
 
 ---
 
-## 3. Completed Systems (Waves 1–12, Features 01–29)
+## 3. Completed Systems (Waves 1–14, Features 01–35)
 
 ### Core, Audio & MCP / AI WSO
 - `src/core/audio.js` — Layered procedural F-16 turbofan engine + atmospheric wind + radial-velocity **Doppler pitch shift** for flyby camera.
@@ -62,12 +62,17 @@
 - `src/combat/weapons.js` — `GUN`, `AIM9`, `MK82` (`180` dmg, `75 m` splash), and **`BFFG`** (`4` key / `Tab`, 2 rounds, `5000` dmg, `420 m` splash, cyan-gold plasma warhead + live CCIP). All weapons raycast against **3D rotated building facades (`hitBuilding`)** for mid-air side-wall detonations.
 - `src/world/buildings.js` — Wall-aligned reflective glass window shader, 4-corner slope grounding, cumulative HP damage for `GUN`, animated **burn & collapse** (`2.4–3.8 s` tilt/shrink/glow), **permanent multi-piece jagged ruins**, weapon-scaled craters (`4–6 m` GUN, `18 m` AIM-9, `38 m` Mk-82, **`160 m` BFFG wasteland**), and 75-second smoldering ruin fires (`getRuinFirePoints()`).
 - `src/sim/vfx.js` — **5-lobe turbulent billowing fireball clusters**, dynamic blast flash `PointLight`, **160-chunk ballistic tumbling 3D debris**, `16`-slot rising smoke plumes, building fire puffs (`spawnFirePuff`), tire/catapult smoke, Mach vapor cone, wingtip vapor.
-- `src/ui/hud.js`, `src/ui/tactical.js`, `src/ui/kneeboard.js` — 60 FPS HUD with ILS needles (cockpit + minimal external), carrier FLOLS meatball, replay banner, cloud-entry mist wash, `BFFG-9000 · DANGER` reticle, and **Kneeboard (`K`)** with city/landmark labels + live `"OVER <PLACE> / X.X KM <DIR> OF <PLACE>"` + GPS readout.
+- `src/ui/hud.js`, `src/ui/tactical.js`, `src/ui/kneeboard.js` — 60 FPS HUD with ILS needles (cockpit + minimal external), carrier FLOLS meatball, replay banner, cloud-entry mist wash, `BFFG-9000 · DANGER` reticle, G-LOC blackout/redout vignettes, Mach 1.0 shock ring, Soča Canyon Run gate/timer/medal strip, Weapon Cam banner, and **Kneeboard (`K`)** with city/landmark labels + live `"OVER <PLACE> / X.X KM <DIR> OF <PLACE>"` + GPS readout.
+
+### Vipava Valley Showcase, Living Night & Cinematic Polish (Features 30–35)
+- **Default Showcase & *Burja* Wind** (`src/config.js`, `src/sim/weather.js`, `src/combat/missions.js`, `src/combat/canyon_run.js`) — Boots directly into **Vipava Valley** at **Golden Hour (`17:36`)**. Added authentic **Vipava *Burja*** NE (`045°`, `42 kt` + lee-wave pulses) wind preset and 3 real-landmark missions: **`SOČA CANYON`** (8-gate low-level airborne timed course from `LJAJ` → Vogršček → Gorizia Castle → Solkan Bridge → Sveta Gora with Gold/Silver/Bronze medals), **`NANOS SEAD`** (SA-6 & radar on Nanos plateau + H4 Viaduct), and **`ADRIATIC CAP`** (MiG-29 intercept over Gulf of Trieste).
+- **Living Night & Photorealistic Vipava** (`src/world/buildings.js`, `src/world/landmarks.js`, `src/world/traffic_roads.js`, `src/world/airports.js`, `src/world/terrainview.js`) — Warm emissive night windows across 7,770 OSM buildings with **Adriatic terracotta & dark slate roofs**, deeper ground-contact AO, and **sun-behind-pilot glass glint**; architectural night uplighting on Sveta Gora, Solkan Bridge, Gorizia Castle, Nanos Tower, and Faro della Vittoria; instanced bidirectional **headlight/taillight traffic streaks** on the real H4 expressway & valley roads; runway **PAPI + sequenced "rabbit" approach strobes**; desaturated photorealistic Vipava Karst/vineyard palette; and a **4-octave (`6 m / 28 m / 140 m / 520 m`) continuous distance + Nyquist terrain LOD cascade** with `1.22` quadtree split factor.
+- **Selective Bloom, Juice, Weapon Cam & Photo Mode** (`src/sim/postfx.js`, `src/sim/juice.js`, `src/aircraft/weapon_cam.js`) — Tamed `UnrealBloomPass` (`1.05`/`0.88` threshold, `0.14`/`0.24` strength, continuous `0..1` night blend, detonation/Mach bloom pulses, disabled on Low); sustained G-LOC blackout/redout + recoil/explosion/catapult/Mach camera shake; **`F5` Weapon Follow-Cam** (tracks `BFFG` > `MK82` > `AIM9` with 2.2 s impact linger); **`F6` Freeze-Frame Photo Mode** with free orbit/zoom/FOV and synchronous stamped PNG export (`S`).
 
 ---
 
 ## 4. Next Roadmap Ideas
 1. **Local Mini LLM for AI WSO**: Install Ollama (`ollama pull qwen2.5:1.5b` or `llama3.2:1b`) and run `WSO_LLM_URL=http://127.0.0.1:11434/v1/chat/completions WSO_LLM_MODEL=qwen2.5:1.5b npm run wso` alongside `npm run dev` for live local AI tactical callouts.
 2. **Additional 100×100 km Real-World Theaters**: Reuse `scripts/bake_*.py` + `docs/decisions/terrain-detail-grids.md` to bake new real-world grids (e.g., Julian Alps / Triglav / Bled, Istria / Pula, Dolomites, or Grand Canyon).
-3. **Vipava Valley Missions**: Add Vipava-specific combat/navigation sorties (e.g. Soča Valley canyon run, Nanos radar SEAD, Gulf of Trieste carrier qualification) and real Vipava **Burja** northeast gust wind preset.
-4. **Izola & Piran OSM Buildings**: Re-run just the `Izola+Piran` Overpass box (timed out during the 11-city batch) and merge into `public/media/vipava_osm.json`.
+3. **Izola & Piran OSM Buildings**: Re-run just the `Izola+Piran` Overpass box (timed out during the 11-city batch) and merge into `public/media/vipava_osm.json`.
+4. **Live Moving Ground Convoys & Night AAA Flak**: Add destructible armored convoys along the H4 highway and glowing 37mm AAA tracer arcs around Nanos SEAD & strike zones.

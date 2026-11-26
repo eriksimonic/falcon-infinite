@@ -31,17 +31,17 @@ const PALETTES = {
     seabed: new THREE.Color(0x3a524a).convertSRGBToLinear(),
     snowLineBase: 1650,
   },
-  // Vipava Valley / Slovenian Karst: vineyard greens, pale limestone cliffs,
-  // alpine spruce on the high plateaus, deep Adriatic blue water.
+  // Vipava Valley / Slovenian Karst: muted olive-sage meadows, dusty ochre
+  // earth, dark alpine spruce, pale weathered limestone, deep Adriatic water.
   vipava: {
     sand: new THREE.Color(0xd7c49b).convertSRGBToLinear(),
-    grassLow: new THREE.Color(0x7f9b52).convertSRGBToLinear(),  // vineyard valley floor
-    grassHigh: new THREE.Color(0x9db56b).convertSRGBToLinear(),
-    forest: new THREE.Color(0x3c5a35).convertSRGBToLinear(),    // alpine spruce
-    rock: new THREE.Color(0xbdb6a4).convertSRGBToLinear(),      // pale Karst limestone
-    rockDark: new THREE.Color(0x8d8778).convertSRGBToLinear(),
+    grassLow: new THREE.Color(0x6d7556).convertSRGBToLinear(),   // muted olive-sage valley floor
+    grassHigh: new THREE.Color(0x84896c).convertSRGBToLinear(),  // dry sunlit hillside
+    forest: new THREE.Color(0x324231).convertSRGBToLinear(),     // deep dark alpine spruce/pine
+    rock: new THREE.Color(0xb2ada0).convertSRGBToLinear(),       // weathered Karst limestone
+    rockDark: new THREE.Color(0x787368).convertSRGBToLinear(),   // crisp shadow limestone
     snow: new THREE.Color(0xeef2ee).convertSRGBToLinear(),
-    dirt: new THREE.Color(0xa8956e).convertSRGBToLinear(),
+    dirt: new THREE.Color(0x96876b).convertSRGBToLinear(),       // dusty earth
     seabed: new THREE.Color(0x24475b).convertSRGBToLinear(),
     snowLineBase: 1550,
     forestMix: 0.85,
@@ -81,14 +81,15 @@ const TERRAIN_DETAILS = {
   },
   vipava: {
     detailAlbedo: 1.06,
-    bump: 0.86,
+    bump: 1.04,
     rock: 1.0,
     field: 0.72,
     sheen: 0.06,
     strataPeriod: 8.2,
     strataContrast: 1.0,
     rockColors: [0xd4cebb, 0xaba491, 0x776f62, 0xbab2a2],
-    fieldColors: [0x73923f, 0xab926a, 0xafc573, 0x50732d],
+    // muted vineyards, dry earth, pale meadow, dark olive groves
+    fieldColors: [0x667349, 0x99896c, 0x8f946c, 0x4c5939],
   },
 };
 
@@ -262,6 +263,12 @@ const DETAIL_ALBEDO = /* glsl */`
   fieldCol *= mix( 0.68, 1.0, border );
 
   terrAlb = mix( terrAlb, fieldCol, fieldMask * fieldAA * mix( 0.55, 1.0, border ) );
+
+  // 3b) Realistic earth: pull ~20% toward luminance so the valley reads muted
+  // and Mediterranean rather than saturated green.
+  float finalLum = dot( terrAlb, vec3( 0.2126, 0.7152, 0.0722 ) );
+  terrAlb = mix( terrAlb, vec3( finalLum ), 0.20 );
+
   diffuseColor.rgb = terrAlb;
 `;
 

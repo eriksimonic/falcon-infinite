@@ -353,16 +353,26 @@ function proj(id, type, x, y, z, vx, vy, vz) {
     'setEnabled(true) stays inert headlessly');
   ok(fx.setNight(true) === fx, 'setNight is chainable');
   fx.update(2);
-  ok(Math.abs(fx.threshold - 0.72) < 1e-6, 'night threshold reaches 0.72',
+  ok(Math.abs(fx.threshold - 0.88) < 1e-6, 'night threshold reaches 0.88',
     `threshold=${fx.threshold}`);
-  ok(Math.abs(fx.strength - 0.58) < 1e-6, 'night strength reaches 0.58',
+  ok(Math.abs(fx.strength - 0.24) < 1e-6, 'night strength reaches 0.24',
     `strength=${fx.strength}`);
-  ok(Math.abs(fx.radius - 0.45) < 1e-6, 'bloom radius is 0.45');
+  ok(Math.abs(fx.radius - 0.36) < 1e-6, 'bloom radius is 0.36');
 
   fx.setNight(false);
   fx.update(2);
-  ok(Math.abs(fx.threshold - 0.88) < 1e-6, 'day threshold returns to 0.88');
-  ok(Math.abs(fx.strength - 0.36) < 1e-6, 'day strength returns to 0.36');
+  ok(Math.abs(fx.threshold - 1.05) < 1e-6, 'day threshold returns to 1.05');
+  ok(Math.abs(fx.strength - 0.14) < 1e-6, 'day strength returns to 0.14');
+
+  // Golden hour (sky.night ~ 0.05) must stay on the day preset, not snap.
+  fx.setNight(0.05);
+  fx.update(2);
+  ok(Math.abs(fx.threshold - 1.0415) < 1e-3, 'golden hour keeps the day threshold',
+    `threshold=${fx.threshold}`);
+  ok(Math.abs(fx.strength - 0.145) < 1e-3, 'golden hour keeps the day strength',
+    `strength=${fx.strength}`);
+  fx.setNight(false);
+  fx.update(2);
 
   fx.pulseBloom();
   ok(fx.bloomPulse > 0.5, 'pulseBloom spikes the pulse');

@@ -128,7 +128,9 @@ function makeBuildingMaterial() {
         vec3 ln = normalize(vLocalN);
         float ndl = max(dot(n, uSunDir), 0.0);
         float wrap = max(dot(n, uSunDir) * 0.5 + 0.5, 0.0);
-        vec3 col = vCol * (uAmbient + uSunColor * (ndl * 0.9 + wrap * 0.14)) + vCol * 0.06;
+        // Softened diffuse keeps sunlit facades under the bloom threshold while
+        // sharpening the sunlit-vs-shadow side contrast.
+        vec3 col = vCol * (uAmbient * 0.85 + uSunColor * (ndl * 0.78 + wrap * 0.10)) + vCol * 0.06;
 
         // Wall-aligned facade coordinates. The axis that runs *across* each
         // wall (local z for the ±X walls, local x for the ±Z walls) is taken in
@@ -156,6 +158,13 @@ function makeBuildingMaterial() {
                             clamp(wrap, 0.0, 1.0));
         col = mix(col, skyGlass, glass * 0.62 * day);
 
+        // Sun-behind-pilot glint: only when the sun is behind the camera and
+        // shining straight onto the facade in front do sun-facing windows
+        // return a crisp specular flare (the only daytime building bloom).
+        vec3 viewDir = normalize(cameraPosition - vWorld);
+        float sunBehind = smoothstep(0.45, 0.94, dot(viewDir, uSunDir));
+        col += uSunColor * glass * ndl * sunBehind * day * 0.95;
+
         // Night: unlit glass reads as a dark hole, lit rooms glow. Occupancy is
         // hashed per building so whole blocks wake up together (an office tower
         // burns bright, a row of houses lights three windows); every window
@@ -171,18 +180,27 @@ function makeBuildingMaterial() {
         vec3 winColor = mix(vec3(1.0, 0.78, 0.42), vec3(1.0, 0.62, 0.25), step(0.68, tone));
         winColor = mix(winColor, vec3(0.78, 0.90, 1.0), step(0.92, tone));
         float brightness = 0.72 + 0.28 * h21(cell * 3.17 + 7.1) + 0.28 * rnd;
-        // 1.45x warm boost at full night so selective bloom picks up the
-        // towns as bright clusters at altitude.
-        col += winColor * lit * uNight * 2.6 * 1.45 * brightness;
+        // Warm night windows, kept below the bloom threshold so towns read as
+        // lit clusters at altitude instead of glowing blobs.
+        col += winColor * lit * uNight * 1.45 * brightness;
 
-        // Subtle base ambient occlusion over the bottom 15% of each block.
-        col *= mix(0.72, 1.0, smoothstep(0.0, 0.15, vLocal.y));
+        // Deeper base ambient occlusion over the bottom of each block so every
+        // building sits crisply anchored on the terrain.
+        col *= mix(0.54, 1.0, smoothstep(0.0, 0.18, vLocal.y));
 
-        // Textured, darker rooftops with a mottled gravel/tar tone.
+        // Vipava/Adriatic roofs: mostly weathered terracotta tiles with a
+        // minority of dark slate, hashed per building, mottled per tile and lit
+        // by the same sun so towns separate unmistakably from the muted ground.
         float roof = smoothstep(0.65, 0.95, abs(ln.y));
         vec2 rp = vec2(vLocal.x * vScale.x, vLocal.z * vScale.z) * 0.4;
         float mottle = h21(floor(rp) + floor(vCol.yz * 131.0));
-        vec3 roofCol = col * mix(vec3(0.62, 0.60, 0.56), vec3(0.86, 0.84, 0.80), mottle);
+        float tileGrain = h21(floor(rp * 5.0) + floor(vCol.yz * 57.0) + 2.3);
+        float roofPick = h21(vec2(buildingSeed * 131.7 + 0.5, 7.3));
+        vec3 terracotta = mix(vec3(0.56, 0.26, 0.17), vec3(0.44, 0.21, 0.15), mottle);
+        vec3 slate = mix(vec3(0.26, 0.28, 0.31), vec3(0.35, 0.36, 0.37), mottle);
+        vec3 roofBase = mix(terracotta, slate, step(0.68, roofPick));
+        roofBase *= 0.94 + 0.12 * tileGrain;
+        vec3 roofCol = roofBase * (uAmbient * 0.8 + uSunColor * (ndl * 0.82 + 0.12));
         col = mix(col, roofCol, roof);
 
         gl_FragColor = vec4(col, 1.0);
