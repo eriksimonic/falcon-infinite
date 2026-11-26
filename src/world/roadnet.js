@@ -273,11 +273,16 @@ export class RoadNetwork {
       map,
       color: map ? 0xffffff : 0x2f3230,
       polygonOffset: true,
-      polygonOffsetFactor: -1.5,
-      polygonOffsetUnits: -1.5,
+      // Stronger than the inland-water offset (-1/-1): a viaduct deck crossing
+      // a river sheet must always win the depth test.
+      polygonOffsetFactor: -3,
+      polygonOffsetUnits: -3,
     });
     this.mesh = new THREE.Mesh(new THREE.BufferGeometry(), this.material);
     this.mesh.name = 'highways';
+    // Drawn after inland water (renderOrder 0) so highways/viaducts layer on
+    // top of rivers and lakes instead of z-fighting with them.
+    this.mesh.renderOrder = 1;
     this.mesh.frustumCulled = false;
     this.mesh.visible = false;
     if (scene && typeof scene.add === 'function') scene.add(this.mesh);

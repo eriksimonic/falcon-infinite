@@ -19,7 +19,11 @@ const RIVER_LIFT_M = 0.35; // metres above the terrain surface
 // Monfalcone / Grado are only 0..2 m high. Inland ribbons must stay clear of
 // that band entirely, otherwise the sea plane and the river sheet Z-fight.
 const SEA_CUTOFF_M = 1.8; // below this the Adriatic Sea plane takes over
-const LAKE_LIFT_M = 0.45;
+// A lake sheet sits this far above the higher of its median shoreline height
+// and its basin centre. Using the minimum shoreline height would bury every
+// dammed reservoir: the dam foot is far lower than the basin, so
+// `min + 0.45` lands the surface underground (Vogrscek).
+const LAKE_LIFT_M = 0.85;
 // Same reasoning for lakes: a lagoon surface pinned near y=0 collides with the
 // sea plane across the whole Grado marsh. 2.0 m keeps every lake sheet above
 // the sea plane's offset band.
@@ -87,11 +91,39 @@ function pushTriUp(indices, positions, a, b, c) {
 }
 
 /**
+ * Area-weighted centroid of a closed [x, z] polygon (vertex mean when the
+ * polygon is degenerate).
+ */
+function polygonCentroid(pts) {
+  let area2 = 0;
+  let cx = 0;
+  let cz = 0;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const cross = pts[j][0] * pts[i][1] - pts[i][0] * pts[j][1];
+    area2 += cross;
+    cx += (pts[j][0] + pts[i][0]) * cross;
+    cz += (pts[j][1] + pts[i][1]) * cross;
+  }
+  if (Math.abs(area2) > 1e-9) return [cx / (3 * area2), cz / (3 * area2)];
+  let sx = 0;
+  let sz = 0;
+  for (const [x, z] of pts) { sx += x; sz += z; }
+  return [sx / pts.length, sz / pts.length];
+}
+
+/**
  * Sample the terrain around a lake perimeter and pick a single flat level.
+ *
+ * The level must clear both the typical shoreline and the basin centre: a
+ * dammed reservoir's dam foot can sit >10 m below the basin, so taking the
+ * minimum perimeter height (the old `minPerimeterH + 0.45`) puts the whole
+ * sheet underground. The median shoreline plus the centre height is robust to
+ * a handful of low dam samples.
+ *
  * Returns NaN when the polygon yields no usable samples.
  */
 function lakeWaterLevel(pts, heightAt) {
-  let minH = Infinity;
+  const hs = [];
   let prev = pts[0];
   for (let i = 1; i <= pts.length; i++) {
     const cur = pts[i % pts.length];
@@ -102,12 +134,18 @@ function lakeWaterLevel(pts, heightAt) {
       const x = prev[0] + (cur[0] - prev[0]) * t;
       const z = prev[1] + (cur[1] - prev[1]) * t;
       const h = heightAt(x, z);
-      if (Number.isFinite(h) && h < minH) minH = h;
+      if (Number.isFinite(h)) hs.push(h);
     }
     prev = cur;
   }
-  if (!Number.isFinite(minH)) return NaN;
-  return Math.max(LAKE_MIN_Y, minH + LAKE_LIFT_M);
+  if (hs.length === 0) return NaN;
+
+  hs.sort((a, b) => a - b);
+  const medianPerimeterH = hs[Math.floor(hs.length * 0.5)];
+  const [cx, cz] = polygonCentroid(pts);
+  const centerH = heightAt(cx, cz);
+  const baseH = Math.max(medianPerimeterH, Number.isFinite(centerH) ? centerH : medianPerimeterH);
+  return Math.max(LAKE_MIN_Y, baseH + LAKE_LIFT_M);
 }
 
 /** Drop a duplicated closing vertex, if present. */
@@ -346,7 +384,9 @@ export class InlandWaterSystem {
 
     const mesh = new THREE.Mesh(geometry, this.material);
     mesh.name = 'inland-water';
-    mesh.renderOrder = 1;
+    // Water draws before the road deck (RoadNetwork.renderOrder = 1) so a
+    // highway crossing a river/lake never loses the depth tie.
+    mesh.renderOrder = 0;
     mesh.userData.riverSegments = built.riverSegments;
     mesh.userData.lakeCount = built.lakeCount;
 

@@ -48,6 +48,51 @@ function polygonArea(pts) {
   return Math.abs(area) * 0.5;
 }
 
+// Lake level contract under test: median shoreline height and basin centre,
+// whichever is higher, plus 0.85 m (floored at 2.0 m). The old
+// `minPerimeterH + 0.45` buried dammed reservoirs.
+const LAKE_MIN_Y = 2.0;
+const LAKE_LIFT_M = 0.85;
+const LAKE_STEP_M = 30;
+function lakeCentroid(pts) {
+  let area2 = 0, cx = 0, cz = 0;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const cross = pts[j][0] * pts[i][1] - pts[i][0] * pts[j][1];
+    area2 += cross;
+    cx += (pts[j][0] + pts[i][0]) * cross;
+    cz += (pts[j][1] + pts[i][1]) * cross;
+  }
+  if (Math.abs(area2) > 1e-9) return [cx / (3 * area2), cz / (3 * area2)];
+  let sx = 0, sz = 0;
+  for (const [x, z] of pts) { sx += x; sz += z; }
+  return [sx / pts.length, sz / pts.length];
+}
+/** Perimeter heights sampled exactly like the builder does. */
+function perimeterHeights(pts, heightAt) {
+  const hs = [];
+  let prev = pts[0];
+  for (let i = 1; i <= pts.length; i++) {
+    const cur = pts[i % pts.length];
+    const segLen = Math.hypot(cur[0] - prev[0], cur[1] - prev[1]);
+    const steps = Math.max(1, Math.ceil(segLen / LAKE_STEP_M));
+    for (let s = 0; s < steps; s++) {
+      const t = s / steps;
+      hs.push(heightAt(prev[0] + (cur[0] - prev[0]) * t, prev[1] + (cur[1] - prev[1]) * t));
+    }
+    prev = cur;
+  }
+  return hs;
+}
+function expectedLakeLevel(pts, heightAt) {
+  const hs = perimeterHeights(pts, heightAt).filter(Number.isFinite);
+  if (hs.length === 0) return NaN;
+  hs.sort((a, b) => a - b);
+  const medianPerimeterH = hs[Math.floor(hs.length * 0.5)];
+  const [cx, cz] = lakeCentroid(pts);
+  const centerH = heightAt(cx, cz);
+  return Math.max(LAKE_MIN_Y, Math.max(medianPerimeterH, centerH) + LAKE_LIFT_M);
+}
+
 // ---------------------------------------------------------------------------
 // 1. Rivers on sloped terrain
 // ---------------------------------------------------------------------------
@@ -173,8 +218,7 @@ check(lakeGeo.indices.length >= 3 * (concave.length - 2),
 const lakeVerts = lakeGeo.positions.length / 3;
 check(lakeVerts === concave.length, `lake keeps ${concave.length} contour vertices`);
 
-const perimeterH = Math.min(...concave.map(([x, z]) => sloped(x, z)));
-const wantLevel = Math.max(1.2, perimeterH + 0.45);
+const wantLevel = expectedLakeLevel(concave, sloped);
 for (let i = 0; i < lakeVerts; i++) {
   if (Math.abs(lakeGeo.positions[i * 3 + 1] - wantLevel) > 1e-3) {
     check(false, `lake vertex ${i} not at flat level ${wantLevel.toFixed(2)}`);
@@ -182,7 +226,53 @@ for (let i = 0; i < lakeVerts; i++) {
   }
   if (i === lakeVerts - 1) check(true, 'lake is a single flat water level');
 }
-check(wantLevel >= 1.2, 'lake level respects the 1.2 m floor');
+check(wantLevel >= 2.0, 'lake level respects the 2.0 m floor');
+// The level must clear both the median shoreline and the basin centre, so the
+// sheet can never be buried by a single low sample.
+{
+  const hs = perimeterHeights(concave, sloped).sort((a, b) => a - b);
+  const median = hs[Math.floor(hs.length * 0.5)];
+  const [cx, cz] = lakeCentroid(concave);
+  const centerH = sloped(cx, cz);
+  check(wantLevel >= median + 0.85 - 1e-6,
+    `lake level clears the median shoreline (${wantLevel.toFixed(2)} vs ${median.toFixed(2)})`);
+  check(wantLevel >= centerH + 0.85 - 1e-6,
+    `lake level clears the basin centre (${wantLevel.toFixed(2)} vs ${centerH.toFixed(2)})`);
+}
+
+// Dammed reservoir (Vogrscek): one shoreline edge — the dam foot — sits 10 m
+// below the basin. The old `minPerimeterH + 0.45` rule put the whole sheet
+// underground; the surface must sit above the basin centre instead.
+{
+  const basinH = 100;
+  const damFootH = basinH - 10;
+  const reservoir = [[0, 0], [600, 0], [600, 400], [0, 400]];
+  const dammed = (x) => (x < 60 ? damFootH : basinH);
+
+  const geo = buildInlandWaterGeometry({ rivers: [], lakes: [reservoir] }, dammed);
+  check(geo.lakeCount === 1, 'dammed reservoir triangulated');
+
+  const level = geo.positions[1];
+  const [cx, cz] = lakeCentroid(reservoir);
+  const centerH = dammed(cx, cz);
+  near(centerH, basinH, 1e-9, 'dammed fixture: basin centre height');
+  check(level > centerH, `dammed reservoir sits above its basin centre (${level.toFixed(2)} > ${centerH.toFixed(2)})`);
+  near(level, basinH + 0.85, 1e-3, 'dammed reservoir level = basin centre + 0.85 m');
+
+  // Fixture sanity: the old min-perimeter rule would have buried it.
+  const hs = perimeterHeights(reservoir, dammed);
+  const oldLevel = Math.max(2.0, Math.min(...hs) + 0.45);
+  check(oldLevel < basinH,
+    `old minPerimeterH + 0.45 formula would bury the reservoir (${oldLevel.toFixed(2)} < ${basinH})`);
+
+  for (let i = 0; i < geo.positions.length / 3; i++) {
+    if (Math.abs(geo.positions[i * 3 + 1] - level) > 1e-6) {
+      check(false, `dammed reservoir vertex ${i} is not on the flat level`);
+      break;
+    }
+    if (i === geo.positions.length / 3 - 1) check(true, 'dammed reservoir surface is flat');
+  }
+}
 
 let lakeDownFaces = 0;
 let lakeArea = 0;
@@ -266,6 +356,7 @@ check(highLevel !== null && highLevel > lowLevel + 1,
 
   sys.setWaterData(riverData, sloped);
   check(sys.mesh !== null, 'setWaterData attaches a mesh');
+  check(sys.mesh.renderOrder === 0, 'water renderOrder 0 so highways (1) layer on top');
   check(sys.geometry !== null, 'setWaterData keeps the geometry handle');
   const attrCount = sys.geometry.getAttribute('position')?.count ?? 0;
   check(attrCount === riverGeo.positions.length / 3, 'attached geometry matches the builder');
