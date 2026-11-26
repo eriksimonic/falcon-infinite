@@ -1,3 +1,130 @@
+// Visual keyboard + categorized reference control map shared by Menu and ESC Pause.
+const KEY_ROWS = [
+  [
+    { k: '1', s: 'GUN', c: 'cbt' },
+    { k: '2', s: 'AIM9', c: 'cbt' },
+    { k: '3', s: 'MK82', c: 'cbt' },
+    { k: '[', s: '-1H', c: 'wld' },
+    { k: ']', s: '+1H', c: 'wld' },
+  ],
+  [
+    { k: 'TAB', s: 'WPN', c: 'cbt', w: 1.4 },
+    { k: 'Q', s: 'YAW', c: 'flt' },
+    { k: 'W', s: 'DWN', c: 'flt' },
+    { k: 'E', s: 'YAW', c: 'flt' },
+    { k: 'R', s: 'RST', c: 'sys' },
+    { k: 'T', s: 'TIM', c: 'wld' },
+    { k: 'Y', s: 'WX', c: 'wld' },
+    { k: 'U', s: 'WND', c: 'wld' },
+    { k: 'O', s: 'ZM', c: 'sys' },
+  ],
+  [
+    { k: 'A', s: 'ROL', c: 'flt' },
+    { k: 'S', s: 'UP', c: 'flt' },
+    { k: 'D', s: 'ROL', c: 'flt' },
+    { k: 'F', s: 'FLP', c: 'flt' },
+    { k: 'G', s: 'GER', c: 'flt' },
+    { k: 'H', s: 'HLP', c: 'sys' },
+    { k: 'J', s: 'EJC', c: 'cbt' },
+    { k: 'K', s: 'MAP', c: 'sys' },
+    { k: 'L', s: 'WNG', c: 'sys' },
+  ],
+  [
+    { k: '⇧', s: 'THR+', c: 'flt', w: 1.5 },
+    { k: 'Z', s: 'AP', c: 'sys' },
+    { k: 'X', s: 'FLR', c: 'cbt' },
+    { k: 'C', s: 'CAM', c: 'wld' },
+    { k: 'V', s: 'VIEW', c: 'wld' },
+    { k: 'B', s: 'BRK', c: 'flt' },
+    { k: 'N', s: 'NVG', c: 'cbt' },
+    { k: 'M', s: 'MUT', c: 'sys' },
+  ],
+  [
+    { k: 'CTRL', s: 'THR-', c: 'flt', w: 1.6 },
+    { k: 'SPACE', s: 'FIRE WEAPON', c: 'cbt', w: 4.2 },
+    { k: 'ESC', s: 'PAUSE', c: 'sys', w: 1.5 },
+  ],
+];
+
+const CONTROL_GROUPS = [
+  {
+    title: 'FLIGHT',
+    cls: 'flt',
+    items: [
+      [['W', 'S'], 'Pitch down / up'],
+      [['A', 'D'], 'Roll left / right'],
+      [['Q', 'E'], 'Rudder / steer'],
+      [['⇧', 'CTRL'], 'Throttle + / −'],
+      [['G', 'F'], 'Gear / Flaps'],
+      [['B'], 'Brakes / airbrake'],
+    ],
+  },
+  {
+    title: 'COMBAT',
+    cls: 'cbt',
+    items: [
+      [['SPC'], 'Fire weapon'],
+      [['TAB'], 'Cycle weapon'],
+      [['1', '2', '3'], 'GUN / AIM-9 / MK-82'],
+      [['X'], 'Deploy flares'],
+      [['N'], 'NVG night vision'],
+      [['J'], 'ACES II eject'],
+    ],
+  },
+  {
+    title: 'SYSTEMS',
+    cls: 'sys',
+    items: [
+      [['Z'], 'Autopilot mode'],
+      [['K', 'O'], 'Kneeboard / zoom'],
+      [['L'], 'Toggle wingman'],
+      [['R'], 'Reset to runway'],
+      [['M'], 'Mute audio'],
+    ],
+  },
+  {
+    title: 'VIEW & WORLD',
+    cls: 'wld',
+    items: [
+      [['V', 'C'], 'Cockpit / camera'],
+      [['Y', 'U'], 'Weather / wind'],
+      [['T'], 'Time scale'],
+      [['[', ']'], 'Time − / + 1h'],
+      [['F1', 'F3'], 'Hide UI / Perf'],
+    ],
+  },
+];
+
+function renderControlMap(el) {
+  if (!el) return;
+  const kbdRows = KEY_ROWS.map((row) =>
+    `<div class="kb-row">${row.map((key) => {
+      const style = key.w ? ` style="flex:${key.w}"` : '';
+      return `<div class="kb-cap kb-${key.c}"${style}><b>${key.k}</b><i>${key.s}</i></div>`;
+    }).join('')}</div>`
+  ).join('');
+
+  const legend = `
+    <div class="kb-legend">
+      <span class="leg-flt"><i></i>FLIGHT</span>
+      <span class="leg-cbt"><i></i>COMBAT</span>
+      <span class="leg-sys"><i></i>SYSTEMS</span>
+      <span class="leg-wld"><i></i>VIEW/WORLD</span>
+    </div>
+  `;
+
+  const groups = CONTROL_GROUPS.map((g) => `
+    <div class="cm-group">
+      <div class="cm-head cm-${g.cls}">${g.title}</div>
+      <div class="cm-list">${g.items.map(([keys, label]) =>
+        `<div class="cm-item"><span class="cm-keys">${keys.map((k) => `<kbd class="k-${g.cls}">${k}</kbd>`).join('')}</span><span class="cm-lbl">${label}</span></div>`
+      ).join('')}</div>
+    </div>
+  `).join('');
+
+  el.innerHTML = `<div class="kb-board">${kbdRows}</div>${legend}<div class="cm-groups">${groups}</div>`;
+}
+
 // DOM UI: boot, menu, pause, help, crash, toasts, ATC strip.
 export class UI {
   constructor(callbacks = {}) {
@@ -16,6 +143,9 @@ export class UI {
     this.pauseStats = this.$('pause-stats');
     this.crashReason = this.$('crash-reason');
     this.crashSub = this.$('crash-sub');
+
+    renderControlMap(this.$('menu-control-map'));
+    renderControlMap(this.$('pause-control-map'));
 
     this.mission = 'free';
     this.theater = 'temperate';

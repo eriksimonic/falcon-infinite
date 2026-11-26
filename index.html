@@ -92,39 +92,31 @@
       </div>
 
       <div class="menu-side">
-        <div class="side-title">FLIGHT CONTROLS</div>
-        <div class="keys">
-          <div><kbd>W</kbd><kbd>S</kbd><span>Pitch</span></div>
-          <div><kbd>A</kbd><kbd>D</kbd><span>Roll</span></div>
-          <div><kbd>Q</kbd><kbd>E</kbd><span>Rudder</span></div>
-          <div><kbd>⇧</kbd><kbd>CTRL</kbd><span>Throttle</span></div>
-          <div><kbd>G</kbd><span>Landing gear</span></div>
-          <div><kbd>F</kbd><span>Flaps</span></div>
-          <div><kbd>B</kbd><span>Brakes / airbrake</span></div>
-          <div><kbd>SPC</kbd><span>Fire weapon</span></div>
-          <div><kbd>TAB</kbd><span>Cycle weapon</span></div>
-          <div><kbd>X</kbd><kbd>N</kbd><span>Flares / NVG</span></div>
-          <div><kbd>Z</kbd><kbd>K</kbd><span>Autopilot / Map</span></div>
-          <div><kbd>V</kbd><kbd>C</kbd><span>Cockpit / camera</span></div>
-          <div><kbd>T</kbd><span>Time scale</span></div>
-          <div><kbd>[</kbd><kbd>]</kbd><span>Time of day</span></div>
-          <div><kbd>Y</kbd><kbd>U</kbd><span>Weather / wind</span></div>
-          <div><kbd>H</kbd><span>Help</span></div>
-        </div>
-        <div class="side-foot">Mouse look in cockpit · wheel zoom · F3 telemetry</div>
+        <div class="side-title">CONTROL MAP</div>
+        <div id="menu-control-map" class="ctrl-map"></div>
+        <div class="side-foot">Cockpit: LMB fire · RMB look · External: drag orbit · wheel zoom</div>
       </div>
     </div>
   </div>
 
   <!-- pause -->
   <div id="pause" class="screen hidden">
-    <div class="panel">
-      <div class="eyebrow">FLIGHT PAUSED</div>
-      <h2>HOLDING</h2>
-      <div class="pause-stats" id="pause-stats"></div>
-      <button id="resume-btn" class="start small">RESUME <span>ESC</span></button>
-      <button id="respawn-btn" class="ghost">RESET TO RUNWAY</button>
-      <button id="menu-btn" class="ghost">RETURN TO MENU</button>
+    <div class="panel pause-panel">
+      <div class="pause-grid">
+        <div class="pause-left">
+          <div class="eyebrow">FLIGHT PAUSED</div>
+          <h2>HOLDING</h2>
+          <div class="pause-stats" id="pause-stats"></div>
+          <button id="resume-btn" class="start small">RESUME <span>ESC</span></button>
+          <button id="respawn-btn" class="ghost">RESET TO RUNWAY</button>
+          <button id="menu-btn" class="ghost">RETURN TO MENU</button>
+        </div>
+        <div class="pause-right">
+          <div class="side-title">CONTROL MAP</div>
+          <div id="pause-control-map" class="ctrl-map"></div>
+          <div class="side-foot">Cockpit: LMB fire · RMB look · External: drag orbit · wheel zoom</div>
+        </div>
+      </div>
     </div>
   </div>
 
