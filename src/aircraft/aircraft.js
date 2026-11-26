@@ -200,11 +200,29 @@ export class Aircraft {
       return;
     }
 
+    // Alt+0 recenters every camera offset (works in cockpit and external views).
+    if (input && input.anyDown('AltLeft', 'AltRight') && input.wasPressed('Digit0')) {
+      this.lookYaw = 0;
+      this.lookPitch = 0;
+      this.chaseYaw = 0;
+      this.chasePitch = 0;
+      this.chaseDist = CONFIG.camera.chaseDistance;
+      this._lastLook = 0;
+    }
+
     if (this.mode === 'cockpit') {
       // head-look offsets
       if (input) {
+        const alt = input.anyDown('AltLeft', 'AltRight');
+        const panYaw = (input.isDown('ArrowLeft') ? 1 : 0) - (input.isDown('ArrowRight') ? 1 : 0);
+        const panPitch = (input.isDown('ArrowUp') ? 1 : 0) - (input.isDown('ArrowDown') ? 1 : 0);
         const active = input.pointerLocked || (input.mouse.buttons & 4);
-        if (active && (input.mouse.dx || input.mouse.dy)) {
+        if (alt && (panYaw || panPitch)) {
+          // keyboard head-look (Alt + arrows) — never auto-recenters mid-pan
+          this.lookYaw = clamp(this.lookYaw + panYaw * 1.8 * dt, -2.2, 2.2);
+          this.lookPitch = clamp(this.lookPitch + panPitch * 1.2 * dt, -1.1, 1.1);
+          this._lastLook = 0;
+        } else if (active && (input.mouse.dx || input.mouse.dy)) {
           this.lookYaw -= input.mouse.dx * CONFIG.camera.mouseSensitivity;
           this.lookPitch -= input.mouse.dy * CONFIG.camera.mouseSensitivity;
           this.lookYaw = clamp(this.lookYaw, -2.2, 2.2);
@@ -252,6 +270,16 @@ export class Aircraft {
         if ((input.mouse.buttons & 1) && (input.mouse.dx || input.mouse.dy)) {
           this.chaseYaw -= input.mouse.dx * 0.005;
           this.chasePitch = clamp(this.chasePitch + input.mouse.dy * 0.004, -0.8, 1.1);
+        }
+        if (input.anyDown('AltLeft', 'AltRight')) {
+          // keyboard orbit control (Alt + arrows) + Alt ± distance
+          const panYaw = (input.isDown('ArrowLeft') ? 1 : 0) - (input.isDown('ArrowRight') ? 1 : 0);
+          const panPitch = (input.isDown('ArrowUp') ? 1 : 0) - (input.isDown('ArrowDown') ? 1 : 0);
+          if (panYaw) this.chaseYaw += panYaw * 1.6 * dt;
+          if (panPitch) this.chasePitch = clamp(this.chasePitch + panPitch * 1.1 * dt, -0.8, 1.1);
+          const zoom = (input.anyDown('Equal', 'NumpadAdd') ? 1 : 0)
+            - (input.anyDown('Minus', 'NumpadSubtract') ? 1 : 0);
+          if (zoom) this.chaseDist = clamp(this.chaseDist + zoom * 38 * dt, 12, 120);
         }
       }
       const hdg = Math.atan2(flight.forward.x, -flight.forward.z);

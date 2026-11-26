@@ -1,6 +1,6 @@
 // Weapon system acceptance tests (headless: scene = null, no mesh creation).
 import * as THREE from 'three';
-import { WeaponSystem, WEAPON_TYPES, WEAPONS } from '../src/combat/weapons.js';
+import { WeaponSystem, WEAPON_TYPES, WEAPONS, DEFAULT_AMMO } from '../src/combat/weapons.js';
 
 let checks = 0;
 const failures = [];
@@ -76,14 +76,16 @@ function strafeBurst(world, pos, diveDeg, speed, shots = 10) {
 // ------------------------------------------------------- 1. cycling + ammo
 {
   const ws = new WeaponSystem(null);
-  ok(WEAPON_TYPES.join(',') === 'GUN,AIM9,MK82', 'weapon types exported');
+  ok(WEAPON_TYPES.join(',') === 'GUN,AIM9,MK82,BFFG', 'weapon types exported');
   ok(ws.selected === 'GUN', 'starts on GUN');
-  ok(ws.ammo.GUN === 510 && ws.ammo.AIM9 === 4 && ws.ammo.MK82 === 6 && ws.ammo.FLARE === 30,
-    'initial loadout full');
+  ok(ws.ammo.GUN === 510 && ws.ammo.AIM9 === 4 && ws.ammo.MK82 === 6
+    && ws.ammo.BFFG === 2 && ws.ammo.FLARE === 30,
+  'initial loadout full');
 
   ok(ws.cycleWeapon() === 'AIM9', 'GUN -> AIM9');
   ok(ws.cycleWeapon() === 'MK82', 'AIM9 -> MK82');
-  ok(ws.cycleWeapon() === 'GUN', 'MK82 wraps to GUN');
+  ok(ws.cycleWeapon() === 'BFFG', 'MK82 -> BFFG');
+  ok(ws.cycleWeapon() === 'GUN', 'BFFG wraps to GUN');
   ok(ws.selectWeapon('MK82') === 'MK82', 'selectWeapon picks valid type');
   ok(ws.selectWeapon('NOPE') === 'MK82', 'selectWeapon ignores invalid type');
 
@@ -271,18 +273,22 @@ function strafeBurst(world, pos, diveDeg, speed, shots = 10) {
   ws.selectWeapon('MK82');
   ws.fire(flight);
   ws.update(0.1, flight, flatWorld);
+  ws.selectWeapon('BFFG');
+  ws.fire(flight);
   ws.deployFlare(flight);
   ws.update(0.3, flight, flatWorld);
   ok(ws.projectiles.length > 0 && ws.flares.length > 0, 'combat state populated before reset');
-  ok(ws.ammo.GUN < 510 && ws.ammo.AIM9 < 4 && ws.ammo.MK82 < 6 && ws.ammo.FLARE < 30,
-    'ammo spent before reset');
+  ok(ws.ammo.GUN < 510 && ws.ammo.AIM9 < 4 && ws.ammo.MK82 < 6
+    && ws.ammo.BFFG < 2 && ws.ammo.FLARE < 30,
+  'ammo spent before reset');
 
   const ret = ws.reset();
   ok(ret === ws, 'reset is chainable');
   ok(ws.projectiles.length === 0, 'reset clears projectiles');
   ok(ws.flares.length === 0, 'reset clears flares');
-  ok(ws.ammo.GUN === 510 && ws.ammo.AIM9 === 4 && ws.ammo.MK82 === 6 && ws.ammo.FLARE === 30,
-    'reset restores full loadout');
+  ok(ws.ammo.GUN === 510 && ws.ammo.AIM9 === 4 && ws.ammo.MK82 === 6
+    && ws.ammo.BFFG === 2 && ws.ammo.FLARE === 30,
+  'reset restores full loadout');
   ok(ws.ccip.valid === false, 'reset invalidates CCIP');
   ok(ws.fire(flight).fired === true, 'can fire immediately after reset');
 }
@@ -500,6 +506,119 @@ function mk82Drop({
       ok(impact.damage === 120 && impact.splashRadius === 32,
         '21: AIM-9 impact carries damage + splashRadius');
     }
+  }
+}
+
+// ------------------------------------ 9. Feature 23 BFFG mega-ordnance
+{
+  ok(WEAPON_TYPES.includes('BFFG'), '23: WEAPON_TYPES includes BFFG');
+  ok(DEFAULT_AMMO.BFFG === 2, '23: DEFAULT_AMMO.BFFG === 2', String(DEFAULT_AMMO.BFFG));
+  ok(WEAPONS.BFFG.name === 'BFFG-9000 Mega-Ordnance', '23: BFFG name');
+  ok(WEAPONS.BFFG.damage >= 4000, '23: BFFG damage >= 4000', String(WEAPONS.BFFG.damage));
+  ok(WEAPONS.BFFG.splashRadius >= 400, '23: BFFG splashRadius >= 400',
+    String(WEAPONS.BFFG.splashRadius));
+
+  const ws = new WeaponSystem(null);
+  ok(ws.selectWeapon('BFFG') === 'BFFG', '23: BFFG selectable');
+  const flight = makeFlight({ pos: [0, 2500, 0], vel: [0, 0, -240] });
+
+  // While BFFG is selected a live impact solution must drive the HUD reticle.
+  ws.update(1 / 60, flight, flatWorld);
+  ok(ws.ccip.valid === true, '23: BFFG live CCIP solution valid');
+  ok(ws.ccip.timeToImpact > 0, '23: BFFG CCIP timeToImpact > 0',
+    ws.ccip.timeToImpact.toFixed(2));
+  const predicted = { x: ws.ccip.x, y: ws.ccip.y, z: ws.ccip.z };
+
+  const shot = ws.fire(flight);
+  ok(shot.fired === true && shot.type === 'BFFG', '23: BFFG fires');
+  ok(ws.ammo.BFFG === 1, '23: BFFG ammo decrements', String(ws.ammo.BFFG));
+  ok(ws.projectiles.length === 1 && ws.projectiles[0].type === 'BFFG',
+    '23: BFFG projectile spawned');
+  ok(ws.fire(flight).fired === false, '23: BFFG respects 2.5 s cooldown');
+
+  let impact = null;
+  let cyanTrails = 0;
+  for (let i = 0; i < 60 * 40 && !impact; i++) {
+    for (const e of ws.update(1 / 60, flight, flatWorld)) {
+      if (e.kind === 'trail' && e.color === 0x66f7ff) cyanTrails++;
+      else if (e.kind === 'impact' && e.weapon === 'BFFG') impact = e;
+    }
+  }
+  ok(cyanTrails > 5, '23: BFFG emits cyan plasma trail events', String(cyanTrails));
+  ok(!!impact, '23: BFFG detonates');
+  if (impact) {
+    ok(impact.weapon === 'BFFG' && impact.damage === 5000 && impact.splashRadius === 420,
+      '23: BFFG impact carries the 5000 dmg / 420 m blast payload');
+    const miss = Math.hypot(
+      impact.position.x - predicted.x,
+      impact.position.y - predicted.y,
+      impact.position.z - predicted.z,
+    );
+    ok(miss < 20, '23: BFFG lands within 20 m of its live CCIP reticle (inside the 420 m blast)',
+      miss.toFixed(2) + ' m');
+  }
+}
+
+// --------------------- 10. Feature 23 3D building side-wall impacts
+const WALL_Y = 45;
+function wallWorld() {
+  return {
+    heightAt: () => 0,
+    buildings: {
+      hitBuilding(p0, p1) {
+        if (p0.y >= WALL_Y && p1.y <= WALL_Y) {
+          const dy = p0.y - p1.y;
+          const f = dy > 1e-9 ? (p0.y - WALL_Y) / dy : 0;
+          return {
+            x: p0.x + (p1.x - p0.x) * f,
+            y: WALL_Y,
+            z: p0.z + (p1.z - p0.z) * f,
+            t: f,
+          };
+        }
+        return null;
+      },
+    },
+  };
+}
+
+function wallShot(weapon, world) {
+  const ws = new WeaponSystem(null);
+  ws.selectWeapon(weapon);
+  const pitch = (-45 * Math.PI) / 180;
+  const flight = makeFlight({
+    pos: [0, 400, 0],
+    vel: [0, Math.sin(pitch) * 220, -Math.cos(pitch) * 220],
+    pitch,
+  });
+  const fired = ws.fire(flight);
+  let impact = null;
+  for (let i = 0; i < 60 * 40 && !impact; i++) {
+    impact = ws.update(1 / 60, flight, world)
+      .find((e) => e.kind === 'impact' && e.weapon === weapon) || null;
+  }
+  return { ws, fired, impact };
+}
+
+for (const weapon of ['GUN', 'AIM9', 'MK82', 'BFFG']) {
+  // Baseline: with no building system the same shot reaches the ground.
+  const open = wallShot(weapon, flatWorld);
+  ok(open.fired.fired === true, `23: ${weapon} test shot fired`);
+  ok(!!open.impact && open.impact.position.y <= 0.01,
+    `23: ${weapon} passes through to the ground with no buildings`,
+    open.impact ? open.impact.position.y.toFixed(2) : 'no impact');
+  ok(!!open.impact && open.impact.hitBuilding === undefined,
+    `23: ${weapon} ground impact is not flagged as a building hit`);
+
+  // With a standing wall the round must detonate at the facade, mid-air.
+  const wall = wallShot(weapon, wallWorld());
+  ok(!!wall.impact, `23: ${weapon} detonates on the building wall`);
+  if (wall.impact) {
+    ok(Math.abs(wall.impact.position.y - WALL_Y) < 1e-6,
+      `23: ${weapon} detonates at y = 45 m, not y = 0`,
+      wall.impact.position.y.toFixed(2));
+    ok(wall.impact.hitBuilding === true,
+      `23: ${weapon} building impact sets hitBuilding: true`);
   }
 }
 

@@ -138,7 +138,7 @@ const TOOLS = [
     name: 'combat_action',
     title: 'Combat action',
     description:
-      'Select a weapon (GUN/AIM9/MK82), fire a shot or burst, deploy flares, toggle NVGs, or trigger ejection.',
+      'Select a weapon (GUN/AIM9/MK82/BFFG), fire a shot or burst, deploy flares, toggle NVGs, or trigger ejection.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -146,7 +146,7 @@ const TOOLS = [
           type: 'string',
           enum: ['select_weapon', 'fire', 'deploy_flares', 'toggle_nvg', 'eject'],
         },
-        weapon: { type: 'string', enum: ['GUN', 'AIM9', 'MK82'] },
+        weapon: { type: 'string', enum: ['GUN', 'AIM9', 'MK82', 'BFFG'] },
         burstMs: {
           type: 'integer',
           minimum: 0,

@@ -10,24 +10,28 @@
 //   - RWR search ping / lock triple-chirp / SAM launch warning
 //   - Pilot G-strain breathing under sustained load
 // One-shots: Vulcan cannon, missile launch, bomb release, flare pop,
-// explosion (distance-filtered), sonic boom, tanker boom contact, radio beep.
+// explosion (distance-filtered), BFFG mega launch, BFFG mega-detonation,
+// sonic boom, tanker boom contact, radio beep.
 
 const TAU = Math.PI * 2;
 
 const SAMPLE_URLS = {
-  vulcan: '/media/sfx/vulcan.wav',
-  aim9_growl: '/media/sfx/aim9_growl.wav',
-  missile_launch: '/media/sfx/missile_launch.wav',
-  aim_launch_pop: '/media/sfx/aim_launch_pop.wav',
-  bomb_release: '/media/sfx/bomb_release.wav',
-  flare_pop: '/media/sfx/flare_pop.wav',
-  explosion: '/media/sfx/explosion.wav',
-  explosion_heavy: '/media/sfx/explosion_heavy.ogg',
-  sonic_boom: '/media/sfx/sonic_boom.ogg',
-  rwr_new: '/media/sfx/rwr_new.wav',
-  rwr_sam_launch: '/media/sfx/rwr_sam_launch.wav',
-  boom_contact: '/media/sfx/boom_contact.wav',
-  caution: '/media/sfx/caution.wav',
+  vulcan: './media/sfx/vulcan.wav',
+  aim9_growl: './media/sfx/aim9_growl.wav',
+  missile_launch: './media/sfx/missile_launch.wav',
+  aim_launch_pop: './media/sfx/aim_launch_pop.wav',
+  bomb_release: './media/sfx/bomb_release.wav',
+  flare_pop: './media/sfx/flare_pop.wav',
+  explosion: './media/sfx/explosion.wav',
+  explosion_heavy: './media/sfx/explosion_heavy.ogg',
+  // Feature 24: optional mega-ordnance sample; if it is absent the loader logs
+  // nothing and megaExplosion() falls back to the heavy explosion bank.
+  explosion_lg: './media/sfx/explosion_lg.ogg',
+  sonic_boom: './media/sfx/sonic_boom.ogg',
+  rwr_new: './media/sfx/rwr_new.wav',
+  rwr_sam_launch: './media/sfx/rwr_sam_launch.wav',
+  boom_contact: './media/sfx/boom_contact.wav',
+  caution: './media/sfx/caution.wav',
 };
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
@@ -551,6 +555,108 @@ export class CombatAudio {
     sub.connect(sg).connect(this._bus);
     this._start(sub, t0);
     this._stop(sub, send + 0.02);
+  }
+
+  // -------------------------------------------------------------------------
+  // Feature 24: BFFG mega-ordnance
+  // -------------------------------------------------------------------------
+  // Dramatic low-end plasma/thermobaric launch: a 140 -> 38 Hz drop, a filtered
+  // broadband whoosh, a high-energy crackle burst, plus the real missile_launch
+  // sample pitched down to 0.65 when it has finished loading.
+  bffgFire() {
+    if (!this._ready()) return;
+    const t0 = this._now();
+
+    this._playSample('missile_launch', {
+      gain: 0.95, rate: 0.65, jitter: 0.02, duration: 2.4,
+    });
+
+    // Plasma thump: sine body plus a gritty saw layer, both diving hard.
+    for (const [type, peak] of [['sine', 0.50], ['sawtooth', 0.18]]) {
+      const osc = this._osc(type, 140);
+      const g = this._gainNode(0);
+      const end = this._env(g.gain, peak, 0.008, 0.06, 0.95, t0);
+      this._sweep(osc.frequency, 140, 38, t0, 0.9);
+      osc.connect(g).connect(this._bus);
+      this._start(osc, t0);
+      this._stop(osc, end + 0.02);
+    }
+
+    // Broadband pressure wave: the air being shoved out of the way.
+    const whoosh = this._noiseSrc(false);
+    if (whoosh) {
+      const bp = this._filter('bandpass', 900, 0.7);
+      this._sweep(bp.frequency, 2200, 180, t0, 1.4);
+      const g = this._gainNode(0);
+      const end = this._env(g.gain, 0.30, 0.03, 0.25, 1.2, t0);
+      whoosh.connect(bp).connect(g).connect(this._bus);
+      this._playNoise(whoosh, t0, end, 1.55);
+    }
+
+    // High-energy crackle burst on top of the ignition.
+    for (let i = 0; i < 6; i++) {
+      const when = t0 + i * 0.042;
+      const crack = this._noiseSrc(false);
+      if (!crack) break;
+      const hp = this._filter('highpass', 2100 + i * 240, 0.7);
+      const g = this._gainNode(0);
+      const end = this._env(g.gain, 0.17 * (1 - i * 0.13), 0.001, 0, 0.05, when);
+      crack.connect(hp).connect(g).connect(this._bus);
+      this._playNoise(crack, when, end, 0.08);
+    }
+  }
+
+  // Colossal thermobaric detonation. The attenuation law is deliberately much
+  // flatter than a normal bomb: even 5 km out the blast must hit the chest.
+  megaExplosion(distanceM = 150) {
+    if (!this._ready()) return;
+    const t0 = this._now();
+    const d = Math.max(0, fin(distanceM, 150));
+    const att = clamp(1 / (1 + d / 3200), 0.35, 1.0);
+
+    // Deep-pitched sample layer (explosion_lg when present, else the heavy
+    // explosion bank), plus a synth boom if no sample has loaded yet.
+    const key = this._samples.has('explosion_lg')
+      ? 'explosion_lg'
+      : (this._samples.has('explosion_heavy') ? 'explosion_heavy' : 'explosion');
+    const sampled = this._playSample(key, {
+      gain: 1.15 * att,
+      rate: 0.62,
+      jitter: 0.03,
+      lowpassHz: clamp(9000 / (1 + d / 2500), 300, 9000),
+    });
+
+    if (!sampled) {
+      const boom = this._noiseSrc(false);
+      if (boom) {
+        const lp = this._filter('lowpass', 320, 0.9);
+        this._sweep(lp.frequency, 430, 40, t0, 2.2);
+        const g = this._gainNode(0);
+        const end = this._env(g.gain, 0.85 * att, 0.02, 0.15, 2.2, t0);
+        boom.connect(lp).connect(g).connect(this._bus);
+        this._playNoise(boom, t0, end, 2.5);
+      }
+    }
+
+    // Sub-bass shockwave: 44 -> 16 Hz across 2.6 s.
+    const sub = this._osc('sine', 44);
+    const sg = this._gainNode(0);
+    const send = this._env(sg.gain, 0.55 * att, 0.02, 0.25, 2.35, t0);
+    this._sweep(sub.frequency, 44, 16, t0, 2.6);
+    sub.connect(sg).connect(this._bus);
+    this._start(sub, t0);
+    this._stop(sub, send + 0.05);
+
+    // Rolling filtered rumble, 2.8 s: the mushroom cloud grinding upward.
+    const rumble = this._noiseSrc(false);
+    if (rumble) {
+      const lp = this._filter('lowpass', 260, 0.85);
+      this._sweep(lp.frequency, 520, 55, t0, 2.8);
+      const g = this._gainNode(0);
+      const end = this._env(g.gain, 0.90 * att, 0.05, 0.5, 2.25, t0);
+      rumble.connect(lp).connect(g).connect(this._bus);
+      this._playNoise(rumble, t0, end, 2.95);
+    }
   }
 
   sonicBoom() {

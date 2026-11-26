@@ -762,6 +762,198 @@ function makeAudioHarness() {
 }
 
 // ===========================================================================
+// 6. Feature 24: BFFG blast reticle, weapon strip entry & mega audio
+// ===========================================================================
+{
+  const W = 1440;
+  const H = 900;
+  const S = Math.min(W / 1600, H / 900); // matches the overlay's internal scale
+
+  const cam = new PerspectiveCamera(50, W / H, 0.1, 60000);
+  cam.position.set(0, 300, 0);
+  cam.lookAt(0, 0, -3000);
+  cam.updateProjectionMatrix();
+  cam.updateMatrixWorld(true);
+
+  const geoCtx = () => {
+    const arcs = [];
+    const lines = [];
+    let cur = null;
+    const base = makeCanvas();
+    base.arc = (x, y, r) => { arcs.push({ x, y, r }); };
+    base.moveTo = (x, y) => { cur = { x, y }; };
+    base.lineTo = (x, y) => {
+      if (cur) lines.push({ x0: cur.x, y0: cur.y, x1: x, y1: y });
+      cur = { x, y };
+    };
+    return { ctx: base, arcs, lines };
+  };
+
+  const ov = new TacticalOverlay();
+  const impact = { x: 40, y: 0, z: -2400, timeToImpact: 5.6 };
+  const bffgState = {
+    telemetry: { mode: 'cockpit', heading: 0, pitch: -6, roll: 0, position: new Vector3(0, 300, 0) },
+    camera: cam,
+    weapons: {
+      selected: 'BFFG',
+      ammo: { GUN: 510, AIM9: 4, MK82: 6, BFFG: 2, FLARE: 30 },
+      ccipOrigin: { valid: true, x: 0, y: 280, z: -400 },
+      ccip: { valid: true, ...impact },
+    },
+    mission: { radio: [] },
+  };
+
+  const g = geoCtx();
+  let threw = null;
+  try {
+    ov.draw(g.ctx, W, H, bffgState);
+  } catch (err) {
+    threw = err;
+  }
+  ok(!threw, '24: BFFG reticle draws without error', threw && threw.message);
+
+  const pv = new Vector3(impact.x, impact.y, impact.z).project(cam);
+  const px = (pv.x * 0.5 + 0.5) * W;
+  const py = (-pv.y * 0.5 + 0.5) * H;
+  const outerRing = g.arcs.some((a) =>
+    Math.hypot(a.x - px, a.y - py) < 2.5 && a.r > 15 * S && a.r < 21 * S);
+  const innerRing = g.arcs.some((a) =>
+    Math.hypot(a.x - px, a.y - py) < 2.5 && a.r > 7 * S && a.r < 13 * S);
+  ok(outerRing && innerRing,
+    '24: bold double ring drawn at the projected BFFG impact point',
+    `px=${px.toFixed(1)} py=${py.toFixed(1)}`);
+  const crosshairs = g.lines.filter((l) =>
+    (Math.abs(l.y0 - l.y1) < 0.01 && Math.abs(l.y0 - py) < 0.6)
+    || (Math.abs(l.x0 - l.x1) < 0.01 && Math.abs(l.x0 - px) < 0.6));
+  ok(crosshairs.length >= 4, '24: BFFG reticle has crosshairs', String(crosshairs.length));
+
+  const texts = g.ctx.__state.texts;
+  ok(texts.some((t) => t.includes('BFFG-9000') && t.includes('DANGER')),
+    '24: BFFG-9000 DANGER label rendered', texts.filter((t) => t.includes('BFFG')).join('|'));
+  ok(texts.some((t) => t.includes('BFFG 2')),
+    '24: weapon strip shows the BFFG remaining count', texts.join('|'));
+  ok(texts.some((t) => t.includes('5.6s')), '24: BFFG time-to-impact rendered');
+
+  // Delayed-CCIP: level flight pushes the BFFG impact point off the bottom of
+  // the HUD, so the cue must clamp onto the bottom edge instead of vanishing.
+  const camLow = new PerspectiveCamera(50, W / H, 0.1, 60000);
+  camLow.position.set(0, 400, 0);
+  camLow.lookAt(0, 400, -3000);
+  camLow.updateProjectionMatrix();
+  camLow.updateMatrixWorld(true);
+
+  const lowCcip = { x: 0, y: 0, z: -400 };
+  const lowNdc = new Vector3(lowCcip.x, lowCcip.y, lowCcip.z).project(camLow);
+  ok((-lowNdc.y * 0.5 + 0.5) * H > H, '24: BFFG test ccip projects below the screen');
+
+  const gLow = geoCtx();
+  threw = null;
+  try {
+    ov.draw(gLow.ctx, W, H, {
+      telemetry: { mode: 'cockpit', heading: 0, pitch: 0, roll: 0, position: new Vector3(0, 400, 0) },
+      camera: camLow,
+      weapons: {
+        selected: 'BFFG',
+        ammo: { GUN: 510, AIM9: 4, MK82: 6, BFFG: 2, FLARE: 30 },
+        ccipOrigin: { valid: true, x: 0, y: 380, z: -600 },
+        ccip: { valid: true, ...lowCcip, timeToImpact: 2.2 },
+      },
+      mission: { radio: [] },
+    });
+  } catch (err) {
+    threw = err;
+  }
+  ok(!threw, '24: delayed-CCIP BFFG draw is safe', threw && threw.message);
+  const barY = H - 18 * S;
+  const barDrawn = gLow.lines.some((l) =>
+    Math.abs(l.y0 - barY) < 1.5 && Math.abs(l.y1 - barY) < 1.5
+    && Math.abs(l.x1 - l.x0) > 20 * S);
+  ok(barDrawn, '24: BFFG delayed-CCIP bar clamps to the HUD bottom edge');
+  ok(gLow.ctx.__state.texts.some((t) => t.includes('BFFG-9000')),
+    '24: clamped BFFG cue still carries its label',
+    gLow.ctx.__state.texts.join('|'));
+
+  // Strip highlight colours: cyan when loaded but not selected.
+  const gSel = geoCtx();
+  ov.draw(gSel.ctx, W, H, {
+    ...bffgState,
+    weapons: { ...bffgState.weapons, selected: 'MK82' },
+  });
+  ok(gSel.ctx.__state.texts.some((t) => t.includes('BFFG 2')),
+    '24: BFFG stays in the strip when another weapon is selected');
+
+  // ---------------------------------------------------------------- audio
+  const { ctx: actx, rec: arec } = makeAudioHarness();
+  const audio = new CombatAudio();
+  audio.attach(actx, actx.destination);
+  ok(audio.ready === true, '24: mega audio attaches to a mocked AudioContext');
+
+  const peakOf = (list) => list.reduce(
+    (m, gn) => Math.max(m, finite(gn.gain.writtenPeak) ? gn.gain.writtenPeak : 0), 0);
+
+  const g0 = arec.gains.length;
+  const o0 = arec.oscillators.length;
+  let fireThrew = null;
+  try {
+    audio.bffgFire();
+  } catch (err) {
+    fireThrew = err;
+  }
+  ok(!fireThrew, '24: bffgFire fires without throwing', fireThrew && fireThrew.message);
+  const firePeak = peakOf(arec.gains.slice(g0));
+  ok(firePeak > 0.25, '24: bffgFire launch is audible', firePeak.toFixed(3));
+  const fireOsc = arec.oscillators.slice(o0);
+  ok(fireOsc.length >= 2, '24: bffgFire layers the plasma thump oscillators',
+    'osc=' + fireOsc.length);
+  ok(fireOsc.some((o) => o.frequency.value >= 34 && o.frequency.value <= 42),
+    '24: BFFG launch thump bottoms out near 38 Hz',
+    fireOsc.map((o) => o.frequency.value.toFixed(1)).join(','));
+
+  const g1 = arec.gains.length;
+  const o1 = arec.oscillators.length;
+  const f1 = arec.filters.length;
+  let megaThrew = null;
+  try {
+    audio.megaExplosion(3000);
+  } catch (err) {
+    megaThrew = err;
+  }
+  ok(!megaThrew, '24: megaExplosion fires without throwing', megaThrew && megaThrew.message);
+  const megaPeak = peakOf(arec.gains.slice(g1));
+  ok(megaPeak > 0.25, '24: megaExplosion(3000) still hits from 3 km', megaPeak.toFixed(3));
+  const megaOsc = arec.oscillators.slice(o1);
+  ok(megaOsc.some((o) => o.frequency.value <= 20 && o.frequency.value >= 10),
+    '24: sub-bass shockwave sweeps down to ~16 Hz',
+    megaOsc.map((o) => o.frequency.value.toFixed(1)).join(','));
+  ok(arec.filters.length > f1, '24: megaExplosion layers filtered rumble noise');
+
+  // Distance law: the mega blast attenuates, but far slower than a bomb.
+  const gNear = arec.gains.length;
+  audio.megaExplosion(300);
+  const nearPeak = peakOf(arec.gains.slice(gNear));
+  const gFar = arec.gains.length;
+  audio.megaExplosion(6000);
+  const farPeak = peakOf(arec.gains.slice(gFar));
+  ok(nearPeak > farPeak, '24: megaExplosion attenuates with distance',
+    'near=' + nearPeak.toFixed(3) + ' far=' + farPeak.toFixed(3));
+  ok(farPeak > 0.15, '24: megaExplosion is still heavy from 6 km', farPeak.toFixed(3));
+  ok(arec.bad.length === 0, '24: mega audio schedules finite params', arec.bad.slice(0, 6).join(' | '));
+
+  // Safe no-op without an AudioContext / with hostile input.
+  const dead = new CombatAudio();
+  let deadThrew = null;
+  try {
+    dead.bffgFire();
+    dead.megaExplosion(0);
+    dead.megaExplosion(NaN);
+    dead.megaExplosion(-Infinity);
+  } catch (err) {
+    deadThrew = err;
+  }
+  ok(!deadThrew, '24: BFFG audio is a safe no-op without a context', deadThrew && deadThrew.message);
+}
+
+// ===========================================================================
 // Summary
 // ===========================================================================
 console.log(`tactical checks: ${checks}, failures: ${failures.length}`);

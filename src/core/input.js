@@ -4,6 +4,13 @@ const PREVENT = new Set([
   'BracketLeft', 'BracketRight',
 ]);
 
+// Alt-held camera bindings: stop browser scrolling (arrows), page zoom (+/−)
+// and Alt+0 tab-switch hijacking.
+const ALT_PREVENT = new Set([
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'Equal', 'Minus', 'NumpadAdd', 'NumpadSubtract', 'Digit0',
+]);
+
 export class Input {
   constructor() {
     this.down = new Set();
@@ -38,7 +45,7 @@ export class Input {
   _onKeyDown(e) {
     if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
     const code = e.code;
-    if (PREVENT.has(code)) e.preventDefault();
+    if ((e.altKey && ALT_PREVENT.has(code)) || PREVENT.has(code)) e.preventDefault();
     if (!e.repeat) {
       if (!this.down.has(code)) this.pressed.add(code);
       if (this.onKey) this.onKey(code, e);

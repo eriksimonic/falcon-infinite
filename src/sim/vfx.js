@@ -27,6 +27,18 @@ const INITIAL_SMOKE_PUFFS = 14;
 const HOT_SMOKE_PUFFS = 5; // of the initial burst, ember-lit
 const SPARK_MIN = 20;
 const SPARK_MAX = 28;
+// Feature 24: the BFFG mega-blast (scale = 14) is a different animal — an
+// 8.5 s apocalyptic mushroom with a ~336 m shockwave ring (scale * 24), a
+// dense 26-puff plasma/fireball burst and 32-40 high-velocity embers.
+const MEGA_SCALE = 10;
+const MEGA_DURATION = 8.5;
+const MEGA_CORE_TIME = 2.8;
+const MEGA_FIREBALL_TIME = 2.8;
+const MEGA_RING_TIME = 2.2;
+const MEGA_SMOKE_TIME = 6.5;
+const MEGA_INITIAL_PUFFS = 26;
+const MEGA_SPARK_MIN = 32;
+const MEGA_SPARK_MAX = 40;
 const MAX_PLUMES = 16; // a single Mk-82 blast can claim 4 (impact + 3 rubble columns)
 const PUFF_CAPACITY = 1400;
 const SPARK_CAPACITY = 420;
@@ -475,6 +487,12 @@ export class CombatVFX {
         duration: EXPLOSION_DURATION,
         scale: 1,
         smokeTimer: 0,
+        mega: false,
+        // Per-slot stage timings: a mega-blast stretches every one of them.
+        coreTime: CORE_TIME,
+        fireballTime: FIREBALL_TIME,
+        ringTime: RING_TIME,
+        smokeTime: SMOKE_COLUMN_TIME,
         pos: new THREE.Vector3(),
         core,
         coreMat,
@@ -534,7 +552,16 @@ export class CombatVFX {
 
     slot.active = true;
     slot.t = 0;
-    slot.duration = EXPLOSION_DURATION;
+    // Feature 24: a mega-blast lingers for 8.5 s with a long-burning core and
+    // fireball plus a slow 336 m shockwave; everything smaller keeps the exact
+    // Feature 21 timings (5.5 s / 1.8 s / 1.35 s).
+    const mega = s >= MEGA_SCALE;
+    slot.mega = mega;
+    slot.duration = mega ? MEGA_DURATION : EXPLOSION_DURATION;
+    slot.coreTime = mega ? MEGA_CORE_TIME : CORE_TIME;
+    slot.fireballTime = mega ? MEGA_FIREBALL_TIME : FIREBALL_TIME;
+    slot.ringTime = mega ? MEGA_RING_TIME : RING_TIME;
+    slot.smokeTime = mega ? MEGA_SMOKE_TIME : SMOKE_COLUMN_TIME;
     slot.scale = s;
     slot.smokeTimer = 0;
     slot.pos.set(pos.x || 0, pos.y || 0, pos.z || 0);
@@ -542,20 +569,29 @@ export class CombatVFX {
     slot.ring.visible = true;
     slot.fireball.visible = true;
 
-    // 20–28 gravity-arcing hot embers and debris.
-    const sparks = SPARK_MIN + Math.floor(this.rng() * (SPARK_MAX - SPARK_MIN + 1));
+    // 20–28 gravity-arcing hot embers and debris (32–40, much faster, for the
+    // BFFG mega-blast).
+    const sparks = mega
+      ? MEGA_SPARK_MIN + Math.floor(this.rng() * (MEGA_SPARK_MAX - MEGA_SPARK_MIN + 1))
+      : SPARK_MIN + Math.floor(this.rng() * (SPARK_MAX - SPARK_MIN + 1));
+    const megaBoost = Math.pow(s, 0.35);
     for (let i = 0; i < sparks; i++) {
       const theta = this.rng() * Math.PI * 2;
       const phi = this.rng() * 2 - 1;
       const rho = Math.sqrt(Math.max(0, 1 - phi * phi));
-      const spd = (8 + this.rng() * 28) * Math.sqrt(s);
+      const spd = mega
+        ? (22 + this.rng() * 52) * megaBoost
+        : (8 + this.rng() * 28) * Math.sqrt(s);
+      const sparkSize = mega
+        ? (0.16 + this.rng() * 0.2) * Math.min(s, 8)
+        : (0.16 + this.rng() * 0.2) * Math.min(s, 3);
       this.sparks.spawn(
         slot.pos.x, slot.pos.y + 0.4 * s, slot.pos.z,
         Math.cos(theta) * rho * spd,
         Math.abs(phi) * spd * 0.8 + 5,
         Math.sin(theta) * rho * spd,
-        0.55 + this.rng() * 0.85,
-        (0.16 + this.rng() * 0.2) * Math.min(s, 3),
+        mega ? 0.9 + this.rng() * 1.2 : 0.55 + this.rng() * 0.85,
+        sparkSize,
         1.0, 0.55 + this.rng() * 0.3, 0.12,
         0.95, 0, 0.25, -0.55,
       );
@@ -563,11 +599,60 @@ export class CombatVFX {
 
     // Dense detonation burst; the rest of the column is emitted while the
     // fireball is still hot (see update()).
-    for (let i = 0; i < INITIAL_SMOKE_PUFFS; i++) {
-      this._emitExplosionSmoke(slot, true, i >= INITIAL_SMOKE_PUFFS - HOT_SMOKE_PUFFS);
+    if (mega) {
+      for (let i = 0; i < MEGA_INITIAL_PUFFS; i++) this._emitMegaBurstPuff(slot, i);
+    } else {
+      for (let i = 0; i < INITIAL_SMOKE_PUFFS; i++) {
+        this._emitExplosionSmoke(slot, true, i >= INITIAL_SMOKE_PUFFS - HOT_SMOKE_PUFFS);
+      }
     }
 
     return slot;
+  }
+
+  /**
+   * Feature 24: one building-fire pulse — a bright flickering flame puff plus a
+   * thick dark smoke puff. Headless-safe, allocation-free (only writes into the
+   * preallocated puff pool). Returns the number of puffs emitted.
+   */
+  spawnFirePuff(pos, scale = 1) {
+    const p = pos && typeof pos === 'object' ? pos : null;
+    const sc = clamp(Number.isFinite(scale) ? scale : 1, 0.2, 6);
+    const px = p && Number.isFinite(p.x) ? p.x : 0;
+    const py = p && Number.isFinite(p.y) ? p.y : 0;
+    const pz = p && Number.isFinite(p.z) ? p.z : 0;
+    const jitter = 0.4 * sc;
+
+    // Flame: #ff6e1a -> #ffb43a, short and violently buoyant.
+    const lr = 1 - this.rng() * 0.1;
+    this.puffs.spawn(
+      px + (this.rng() - 0.5) * jitter,
+      py + this.rng() * 0.5 * sc,
+      pz + (this.rng() - 0.5) * jitter,
+      (this.rng() - 0.5) * 1.6 * sc,
+      (5.5 + this.rng() * 4.5) * sc,
+      (this.rng() - 0.5) * 1.6 * sc,
+      0.6 + this.rng() * 0.5,
+      (0.9 + this.rng() * 0.8) * sc,
+      1.0, (0.43 + this.rng() * 0.24) * lr, (0.10 + this.rng() * 0.10) * lr,
+      0.86, 2.2, 0.55, 1.8,
+    );
+
+    // Soot: #1e1d1c, long-lived, drifting downwind with the weather system.
+    this.puffs.spawn(
+      px + (this.rng() - 0.5) * jitter,
+      py + 0.7 * sc + this.rng() * 0.6 * sc,
+      pz + (this.rng() - 0.5) * jitter,
+      (this.rng() - 0.5) * 1.0 * sc,
+      (2.0 + this.rng() * 2.2) * sc,
+      (this.rng() - 0.5) * 1.0 * sc,
+      2.8 + this.rng() * 1.7,
+      (1.6 + this.rng() * 1.4) * sc,
+      0.118, 0.114, 0.110,
+      0.62, 1.6, 0.9, 2.2,
+    );
+
+    return 2;
   }
 
   spawnSmokePlume(pos, duration = 60) {
@@ -761,7 +846,8 @@ export class CombatVFX {
       const t = e.t;
 
       // Incandescent core: additive white-yellow, expands to ~11x scale.
-      const coreT = t / CORE_TIME;
+      // Mega-blasts keep it burning for 2.8 s instead of 1.8 s.
+      const coreT = t / (e.coreTime || CORE_TIME);
       if (coreT < 1) {
         const ease = 1 - (1 - coreT) * (1 - coreT);
         e.core.visible = true;
@@ -776,12 +862,12 @@ export class CombatVFX {
 
       // Normal-blended orange-red fireball shell, slightly slower to bloom and
       // the part that stays readable against a bright daytime sky.
-      const fbT = t / FIREBALL_TIME;
+      const fbT = t / (e.fireballTime || FIREBALL_TIME);
       if (fbT < 1) {
         const ease = 1 - Math.pow(1 - fbT, 1.7);
         const rise = fbT < 0.12 ? fbT / 0.12 : 1;
         e.fireball.visible = true;
-        e.fireball.position.set(e.pos.x, e.pos.y + 0.08 * e.scale * ease, e.pos.z);
+        e.fireball.position.set(e.pos.x, e.pos.y + (e.mega ? 0.32 : 0.08) * e.scale * ease, e.pos.z);
         const fs = e.scale * (0.7 + 10.3 * ease);
         e.fireball.scale.set(fs, fs, fs);
         e.fireballMat.opacity = 0.92 * rise * Math.pow(1 - fbT, 1.25);
@@ -790,8 +876,9 @@ export class CombatVFX {
         e.fireballMat.opacity = 0;
       }
 
-      // Ground-hugging condensation shockwave ring.
-      const ringT = t / RING_TIME;
+      // Ground-hugging condensation shockwave ring: scale * 24 at full expansion,
+      // so a BFFG mega-blast (scale 14) throws a ~336 m ring over 2.2 s.
+      const ringT = t / (e.ringTime || RING_TIME);
       if (ringT < 1) {
         const ease = 1 - (1 - ringT) * (1 - ringT);
         e.ring.visible = true;
@@ -804,12 +891,17 @@ export class CombatVFX {
         e.ringMat.opacity = 0;
       }
 
-      // Bolling smoke column while the fireball is still hot.
-      if (t < SMOKE_COLUMN_TIME) {
+      // Bolling smoke column while the fireball is still hot. A mega-blast
+      // keeps boiling for 6.5 s and every puff is a 20-40 m mushroom lobe.
+      if (t < e.smokeTime) {
         e.smokeTimer -= dt;
-        while (e.smokeTimer <= 0 && t < SMOKE_COLUMN_TIME) {
-          e.smokeTimer += 0.085;
-          this._emitExplosionSmoke(e, false, false);
+        while (e.smokeTimer <= 0 && t < e.smokeTime) {
+          e.smokeTimer += e.mega ? 0.1 : 0.085;
+          if (e.mega) {
+            this._emitMegaColumnSmoke(e, clamp(t / e.smokeTime, 0, 1));
+          } else {
+            this._emitExplosionSmoke(e, false, false);
+          }
         }
       }
 
@@ -888,6 +980,13 @@ export class CombatVFX {
       const e = this.explosions[i];
       e.active = false;
       e.t = 0;
+      e.mega = false;
+      e.duration = EXPLOSION_DURATION;
+      e.coreTime = CORE_TIME;
+      e.fireballTime = FIREBALL_TIME;
+      e.ringTime = RING_TIME;
+      e.smokeTime = SMOKE_COLUMN_TIME;
+      e.smokeTimer = 0;
       e.core.visible = false;
       e.ring.visible = false;
       e.fireball.visible = false;
@@ -994,6 +1093,76 @@ export class CombatVFX {
     _local.copy(GUN_PORT).applyQuaternion(flight.quaternion).add(flight.position);
     this.muzzle.mesh.position.copy(_local);
     this.muzzle.mesh.quaternion.copy(flight.quaternion);
+  }
+
+  // Feature 24: the BFFG detonation burst is a three-way mix — fiery
+  // orange-gold fireball lobes, cyan-white plasma flash and dense charcoal
+  // mushroom smoke — all at mega scale.
+  _emitMegaBurstPuff(e, i) {
+    const s = Math.min(e.scale, 12);
+    const k = s / 12;
+    const ang = this.rng() * Math.PI * 2;
+    const rad = this.rng() * 3.2 * s * 0.5;
+    const x = e.pos.x + Math.cos(ang) * rad;
+    const z = e.pos.z + Math.sin(ang) * rad;
+    const y = e.pos.y + 0.5 * s + this.rng() * 2.2 * s;
+    const out = Math.cos(ang) * (6 + this.rng() * 10) * k;
+    const outZ = Math.sin(ang) * (6 + this.rng() * 10) * k;
+
+    if (i < 10) {
+      // Liquid-fire lobes: bright orange-gold, blooming outward.
+      const f = 0.88 + this.rng() * 0.12;
+      this.puffs.spawn(
+        x, y, z, out, 8 + this.rng() * 9, outZ,
+        1.6 + this.rng() * 1.4,
+        (5 + this.rng() * 5) * k,
+        1.0 * f, (0.52 + this.rng() * 0.14) * f, 0.06 * f,
+        0.85, 2.4, 0.6, 2.8,
+      );
+    } else if (i < 15) {
+      // Cyan-white plasma flash: the warhead's thermobaric core igniting.
+      const f = 0.9 + this.rng() * 0.1;
+      this.puffs.spawn(
+        x, y, z, out * 1.6, 14 + this.rng() * 10, outZ * 1.6,
+        0.7 + this.rng() * 0.6,
+        (4 + this.rng() * 5) * k,
+        0.62 * f, 0.95 * f, 1.0,
+        0.9, 5.5, 0.5, 3.4,
+      );
+    } else {
+      // Dense charcoal mushroom smoke, already climbing hard at t = 0.
+      const shade = 0.10 + this.rng() * 0.08;
+      this.puffs.spawn(
+        x, y, z, out, 10 + this.rng() * 12, outZ,
+        4.5 + this.rng() * 3.0,
+        (7 + this.rng() * 6) * k,
+        shade, shade * 0.97, shade * 0.92,
+        0.8, 4.2, 0.7, 2.4,
+      );
+    }
+  }
+
+  // The stem-and-cap column of a lingering mega mushroom: emissions start
+  // higher and rise harder as the cloud billows up.
+  _emitMegaColumnSmoke(e, column) {
+    const s = Math.min(e.scale, 12);
+    const k = s / 12;
+    const ang = this.rng() * Math.PI * 2;
+    const spread = (2.5 + 7.5 * column) * s * 0.5;
+    const rad = this.rng() * spread;
+    const shade = 0.09 + this.rng() * 0.08;
+    this.puffs.spawn(
+      e.pos.x + Math.cos(ang) * rad,
+      e.pos.y + (1.2 + 9.5 * column) * s * 0.5 + this.rng() * 2.0 * s * 0.5,
+      e.pos.z + Math.sin(ang) * rad,
+      Math.cos(ang) * (2 + this.rng() * 3),
+      4.0 + this.rng() * 4.0 + 4.0 * column,
+      Math.sin(ang) * (2 + this.rng() * 3),
+      4.0 + this.rng() * 3.0,
+      (6 + this.rng() * 6) * k,
+      shade, shade * 0.97, shade * 0.92,
+      0.72, 3.0 + 2.0 * column, 0.7, 2.2,
+    );
   }
 
   _emitExplosionSmoke(e, initial = false, hot = false) {

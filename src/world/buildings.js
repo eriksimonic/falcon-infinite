@@ -22,6 +22,9 @@ const ROAD_SAMPLE_STEP = 20; // metres between terrain samples along a street
 const STREET_RANGE = 15000; // ribbons are only built this close to the camera
 const STREET_REBUILD_DIST = 1200; // rebuild the ribbon mesh after this much travel
 
+const COLLAPSE_MIN = 2.4; // seconds
+const COLLAPSE_SPAN = 1.4; // extra seconds, hashed per building (2.4..3.8 s)
+
 const _c = new THREE.Color();
 const _m = new THREE.Matrix4();
 const _q = new THREE.Quaternion();
@@ -355,6 +358,11 @@ export class BuildingSystem {
 
     // Destruction state is pure data, so it exists headlessly too.
     this.destroyed = new Set();
+    // Buildings that are burning and falling right now: key -> collapse entry
+    // ({ key, b, s, minY, topY, height, t, duration, tiltX, tiltZ, seed }).
+    // They only join `destroyed` once the animation has played out, which is
+    // what makes the collapse smooth instead of an instant snap to rubble.
+    this.collapsing = new Map();
     this.craters = [];
     this._cratersDirty = true;
     this._groundCache = new WeakMap();
@@ -445,6 +453,21 @@ export class BuildingSystem {
   }
 
   update(dt, camera, sky) {
+    // Collapse timers are pure data, so they advance headlessly too and a
+    // finished building only then becomes permanent rubble.
+    if (this.collapsing.size > 0) {
+      const step = Number.isFinite(dt) ? Math.max(0, dt) : 0;
+      for (const [key, c] of this.collapsing) {
+        c.t += step;
+        if (c.t >= c.duration) {
+          this.collapsing.delete(key);
+          this.destroyed.add(key);
+        }
+      }
+      this._needsRebuild = true;
+      this.stats.destroyed = this.destroyed.size + this.collapsing.size;
+    }
+
     if (!this.scene || !camera) return;
     if (sky) {
       this.material.uniforms.uSunDir.value.copy(sky.sunDir);
@@ -470,9 +493,10 @@ export class BuildingSystem {
    * Apply a blast at a world position.
    *
    * `splashRadius` is the lethal radius in metres; buildings whose centre is
-   * within `splashRadius + max(w, d) * 0.4` collapse into rubble. A charred
-   * crater is added when `damage >= 40`. Returns the newly destroyed buildings
-   * (`{ destroyedCount, positions }`) so callers can spawn smoke and toasts.
+   * within `splashRadius + max(w, d) * 0.4` start to burn and collapse. A
+   * charred crater is added when `damage >= 40`. Returns the newly hit
+   * buildings (`{ destroyedCount, positions }`) so callers can spawn fires,
+   * smoke and toasts; the positions are the burning centre of each building.
    */
   applyBlast(position, splashRadius = 30, damage = 100) {
     const px = Number.isFinite(position?.x) ? position.x : 0;
@@ -491,30 +515,198 @@ export class BuildingSystem {
     for (const s of near) {
       for (const b of s.buildings) {
         const key = buildingKey(s, b);
-        if (this.destroyed.has(key)) continue;
+        if (this.destroyed.has(key) || this.collapsing.has(key)) continue;
         const reach = splash + Math.max(b.w, b.d) * 0.4;
         const dx = b.x - px;
         const dz = b.z - pz;
         if (dx * dx + dz * dz > reach * reach) continue;
-        this.destroyed.add(key);
-        result.positions.push({
-          x: b.x,
-          y: Number.isFinite(b.y) ? b.y : terrainHeight(b.x, b.z),
-          z: b.z,
+
+        const g = this._ground(b);
+        const minY = g.base;
+        const topY = g.top;
+        const seed = hash2(Math.round(b.x), Math.round(b.z), 0x2c1b3c6d);
+        const h2 = hash2(Math.round(b.z), Math.round(b.x), 0x7f4a7c15);
+        const lean = 0.14 + h2 * 0.18; // 0.14..0.32 rad
+        // Burning and falling: the building stays standing (and shootable)
+        // until the collapse timer runs out in update().
+        this.collapsing.set(key, {
+          key,
+          b,
+          s,
+          minY,
+          topY,
+          height: Math.max(1, topY - minY),
+          t: 0,
+          duration: COLLAPSE_MIN + seed * COLLAPSE_SPAN,
+          tiltX: lean * (seed < 0.5 ? -1 : 1),
+          tiltZ: lean * (h2 < 0.5 ? -1 : 1),
+          seed,
         });
+
+        const baseY = Number.isFinite(b.y) ? b.y : terrainHeight(b.x, b.z);
+        result.positions.push({ x: b.x, y: baseY + b.h * 0.45, z: b.z });
       }
     }
 
     result.destroyedCount = result.positions.length;
-    this.stats.destroyed = this.destroyed.size;
+    this.stats.destroyed = this.destroyed.size + this.collapsing.size;
     this.stats.craters = this.craters.length;
     if (result.destroyedCount > 0 || damage >= 40) this._needsRebuild = true;
     return result;
   }
 
-  /** Clear every destroyed building and crater (mission reset / respawn). */
+  /**
+   * First standing building hit by the world-space segment `p0 -> p1`.
+   *
+   * Exact slab ray/AABB test against each building's rotated footprint and its
+   * full height, so ordnance aimed at a tower facade detonates on the wall
+   * instead of falling through to the street. Buildings that are already flat
+   * rubble are ignored; buildings mid-collapse use their current height.
+   * Headless-safe: it only reads deterministic settlement data.
+   *
+   * Returns `{ x, y, z, t, key, building, settlement }` or `null`.
+   */
+  hitBuilding(p0, p1) {
+    if (!p0 || !p1) return null;
+    const ax = p0.x;
+    const ay = p0.y;
+    const az = p0.z;
+    const ex = p1.x - ax;
+    const ey = p1.y - ay;
+    const ez = p1.z - az;
+    if (!Number.isFinite(ax) || !Number.isFinite(ay) || !Number.isFinite(az) ||
+        !Number.isFinite(ex) || !Number.isFinite(ey) || !Number.isFinite(ez)) {
+      return null;
+    }
+    const len2 = ex * ex + ey * ey + ez * ez;
+    if (len2 < 1e-9) return null;
+
+    const mx = ax + ex * 0.5;
+    const mz = az + ez * 0.5;
+    const halfLen = 0.5 * Math.hypot(ex, ez);
+    const near = settlementsNear(mx, mz, halfLen + 1600);
+
+    let bestT = 1;
+    let best = null;
+
+    for (const s of near) {
+      const sdx = s.x - mx;
+      const sdz = s.z - mz;
+      const sReach = s.radius + halfLen + 60;
+      if (sdx * sdx + sdz * sdz > sReach * sReach) continue;
+
+      for (const b of s.buildings) {
+        const key = buildingKey(s, b);
+        if (this.destroyed.has(key)) continue;
+
+        const g = this._ground(b);
+        const minY = g.base;
+        let topY = g.top;
+        const c = this.collapsing.get(key);
+        if (c) {
+          const remain = 1 - clamp(c.t / c.duration, 0, 1);
+          topY = minY + Math.max(0.5, g.top - minY) * remain;
+        }
+
+        // Bounding circle around the segment midpoint rejects most buildings
+        // with two multiplies, before the exact slab test.
+        const br = Math.hypot(b.w, b.d) * 0.5;
+        const bdx = b.x - mx;
+        const bdz = b.z - mz;
+        const bReach = br + halfLen;
+        if (bdx * bdx + bdz * bdz > bReach * bReach) continue;
+
+        // World -> building-local (inverse of rotation.y = rot as addBox uses).
+        const cos = Math.cos(b.rot);
+        const sin = Math.sin(b.rot);
+        const dx0 = ax - b.x;
+        const dz0 = az - b.z;
+        const oX = dx0 * cos - dz0 * sin;
+        const oZ = dx0 * sin + dz0 * cos;
+        const dX = ex * cos - ez * sin;
+        const dZ = ex * sin + ez * cos;
+
+        const hw = b.w * 0.5;
+        const hd = b.d * 0.5;
+        let tMin = 0;
+        let tMax = 1;
+
+        // X slab
+        if (Math.abs(dX) < 1e-9) {
+          if (oX < -hw || oX > hw) continue;
+        } else {
+          let t1 = (-hw - oX) / dX;
+          let t2 = (hw - oX) / dX;
+          if (t1 > t2) { const tmp = t1; t1 = t2; t2 = tmp; }
+          if (t1 > tMin) tMin = t1;
+          if (t2 < tMax) tMax = t2;
+          if (tMin > tMax) continue;
+        }
+        // Y slab
+        if (Math.abs(ey) < 1e-9) {
+          if (ay < minY || ay > topY) continue;
+        } else {
+          const inv = 1 / ey;
+          let t1 = (minY - ay) * inv;
+          let t2 = (topY - ay) * inv;
+          if (t1 > t2) { const tmp = t1; t1 = t2; t2 = tmp; }
+          if (t1 > tMin) tMin = t1;
+          if (t2 < tMax) tMax = t2;
+          if (tMin > tMax) continue;
+        }
+        // Z slab
+        if (Math.abs(dZ) < 1e-9) {
+          if (oZ < -hd || oZ > hd) continue;
+        } else {
+          let t1 = (-hd - oZ) / dZ;
+          let t2 = (hd - oZ) / dZ;
+          if (t1 > t2) { const tmp = t1; t1 = t2; t2 = tmp; }
+          if (t1 > tMin) tMin = t1;
+          if (t2 < tMax) tMax = t2;
+          if (tMin > tMax) continue;
+        }
+
+        if (tMin < bestT) {
+          bestT = tMin;
+          best = { key, building: b, settlement: s };
+        }
+      }
+    }
+
+    if (!best) return null;
+    return {
+      x: ax + ex * bestT,
+      y: ay + ey * bestT,
+      z: az + ez * bestT,
+      t: bestT,
+      key: best.key,
+      building: best.building,
+      settlement: best.settlement,
+    };
+  }
+
+  /**
+   * World-space fire/smoke emitters for every burning, still-falling building.
+   * `progress` runs 0 -> 1 across the collapse so VFX can scale the plume.
+   */
+  getCollapsingFirePoints() {
+    const out = [];
+    for (const c of this.collapsing.values()) {
+      const progress = clamp(c.duration > 0 ? c.t / c.duration : 1, 0, 1);
+      out.push({
+        x: c.b.x,
+        y: c.minY + c.height * 0.45 * (1 - progress),
+        z: c.b.z,
+        progress,
+      });
+    }
+    return out;
+  }
+
+  /** Clear every destroyed building, in-flight collapse and crater (mission reset / respawn). */
   resetDamage() {
     this.destroyed.clear();
+    this.collapsing.clear();
     this.craters.length = 0;
     this._cratersDirty = true;
     this._needsRebuild = true;
@@ -575,10 +767,10 @@ export class BuildingSystem {
     const limit = this.preset.buildingLimit || 16000;
     const lightLimit = this.lightMesh.instanceMatrix.count;
 
-    const addBox = (x, baseY, z, w, h, d, rot, color) => {
+    const addBox = (x, baseY, z, w, h, d, rot, color, tiltX = 0, tiltZ = 0) => {
       if (n >= limit || !(h > 0) || !(w > 0) || !(d > 0)) return false;
       _p.set(x, baseY, z);
-      _e.set(0, rot || 0, 0);
+      _e.set(tiltX, rot || 0, tiltZ);
       _q.setFromEuler(_e);
       _s.set(w, h, d);
       _m.compose(_p, _q, _s);
@@ -594,7 +786,8 @@ export class BuildingSystem {
       for (const b of s.buildings) {
         if (n >= limit) break;
         const g = this._ground(b);
-        if (this.destroyed.has(buildingKey(s, b))) {
+        const key = buildingKey(s, b);
+        if (this.destroyed.has(key)) {
           // Collapsed shell: low charred rubble instead of a tower.
           const rubble = 1.6 + hash2(Math.round(b.x), Math.round(b.z), 0x5bd1e995) * 1.6;
           addBox(b.x, g.base, b.z, b.w * 0.82, rubble, b.d * 0.82, b.rot + 0.12, 0x22201e);
@@ -604,6 +797,11 @@ export class BuildingSystem {
             b.z + (hash2(Math.round(b.z), Math.round(b.x), 0x2545f491) - 0.5) * b.d * 0.5,
             b.w * 0.42, rubble * 0.55, b.d * 0.42, b.rot - 0.3, 0x2c2724,
           );
+          continue;
+        }
+        const c = this.collapsing.get(key);
+        if (c) {
+          this._addCollapse(addBox, b, g, c);
           continue;
         }
         this._addSilhouette(addBox, b, g.base, g.top);
@@ -676,7 +874,7 @@ export class BuildingSystem {
     this.stats.roads = roadCount;
     this.stats.settlements = settlements.length;
     this.stats.lights = ln;
-    this.stats.destroyed = this.destroyed.size;
+    this.stats.destroyed = this.destroyed.size + this.collapsing.size;
     this.stats.craters = this.craters.length;
   }
 
@@ -722,6 +920,41 @@ export class BuildingSystem {
         addBox(b.x, base, b.z, b.w, h, b.d, b.rot, b.color);
         addBox(b.x, top, b.z, b.w * 0.88, 1.1, b.d * 0.88, b.rot, dark);
       }
+    }
+  }
+
+  // Live burn & collapse: the same footprint leans, shakes, shrinks and turns
+  // from fire orange through ember red into charred black as `c.t` advances.
+  _addCollapse(addBox, b, g, c) {
+    const p = clamp(c.duration > 0 ? c.t / c.duration : 1, 0, 1);
+    const eased = p * p * (3 - 2 * p);
+    const h = (g.top - g.base) * (1 - eased);
+    if (h < 0.6) return;
+    const wobble = Math.sin(p * Math.PI) * (1 - p * 0.55);
+    const shakeX = Math.sin(c.t * 9.5 + c.seed * 31.4) * 0.9 * wobble;
+    const shakeZ = Math.cos(c.t * 11.7 + c.seed * 17.9) * 0.9 * wobble;
+    const lean = Math.min(1, p * 1.5);
+    const color = p < 0.35 ? 0xff6a1a : p < 0.75 ? 0xb8350c : 0x22201e;
+
+    addBox(
+      b.x + shakeX, g.base, b.z + shakeZ,
+      b.w, h, b.d, b.rot, color,
+      c.tiltX * lean, c.tiltZ * lean,
+    );
+
+    // Once it is properly coming down, a second broken slab shears off and
+    // slides outwards so the silhouette is not just a shrinking prism.
+    if (p > 0.35) {
+      const fall = (p - 0.35) / 0.65;
+      addBox(
+        b.x + shakeX - c.tiltX * b.w * 1.6 * fall,
+        g.base,
+        b.z + shakeZ + c.tiltZ * b.d * 1.6 * fall,
+        b.w * 0.55, h * 0.5, b.d * 0.55,
+        b.rot + 0.45 * fall,
+        p < 0.75 ? 0x6d2a10 : 0x2c2724,
+        c.tiltX * lean * 1.5, c.tiltZ * lean * 1.5,
+      );
     }
   }
 

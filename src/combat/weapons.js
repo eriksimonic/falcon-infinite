@@ -6,7 +6,7 @@
 import * as THREE from 'three';
 import { mulberry32 } from '../world/noise.js';
 
-export const WEAPON_TYPES = ['GUN', 'AIM9', 'MK82'];
+export const WEAPON_TYPES = ['GUN', 'AIM9', 'MK82', 'BFFG'];
 
 const G = 9.81;
 const GUN_YAW_LIMIT = 0.004; // rad, realistic M61 dispersion cone
@@ -46,6 +46,19 @@ export const WEAPONS = {
     splashRadius: 75,
     ttl: 90,
   },
+  BFFG: {
+    // Feature 23: "Big Falcon Gun" tactical plasma-thermobaric mega-ordnance.
+    name: 'BFFG-9000 Mega-Ordnance',
+    cooldown: 2.5,
+    launchSpeed: 240,
+    accel: 95,
+    burnTime: 1.8,
+    maxSpeed: 560,
+    drag: 4e-5,
+    damage: 5000,
+    splashRadius: 420, // levels an entire city district
+    ttl: 35,
+  },
   FLARE: {
     name: 'M206 flare',
     cooldown: 0.25,
@@ -55,7 +68,22 @@ export const WEAPONS = {
   },
 };
 
-export const DEFAULT_AMMO = { GUN: 510, AIM9: 4, MK82: 6, FLARE: 30 };
+export const DEFAULT_AMMO = { GUN: 510, AIM9: 4, MK82: 6, BFFG: 2, FLARE: 30 };
+
+// Feature 23: BFFG rocket-motor step shared by the live projectile and the CCIP
+// predictor, so the on-screen reticle matches the round that actually flies.
+const BFFG_BURN_GRAVITY = 0.35; // gentle arc while the motor boosts
+const BFFG_COAST_GRAVITY = 1.0;
+const BFFG_MIN_COAST_SPEED = 140; // m/s, never stall out mid-air
+function bffgStep(pos, vel, h, age, def) {
+  const burning = age <= def.burnTime;
+  let speed = vel.length();
+  if (burning) speed = Math.min(def.maxSpeed, speed + def.accel * h);
+  speed = Math.max(burning ? 1 : BFFG_MIN_COAST_SPEED, speed - def.drag * speed * speed * h);
+  if (speed > 1e-6) vel.setLength(speed);
+  vel.y -= G * (burning ? BFFG_BURN_GRAVITY : BFFG_COAST_GRAVITY) * h;
+  pos.addScaledVector(vel, h);
+}
 
 const _vMid = new THREE.Vector3();
 const _acc1 = new THREE.Vector3();
@@ -149,7 +177,7 @@ export class WeaponSystem {
     };
     this._resetAimState();
 
-    this._cooldown = { GUN: 0, AIM9: 0, MK82: 0, FLARE: 0 };
+    this._cooldown = { GUN: 0, AIM9: 0, MK82: 0, BFFG: 0, FLARE: 0 };
     this._gunSide = 1;
     this._aim9Side = 1;
     this._mk82Side = 1;
@@ -255,6 +283,31 @@ export class WeaponSystem {
         side,
       });
       return { fired: true, type, position: rail.clone(), velocity: v.clone(), targetId };
+    }
+
+    // Feature 23: BFFG — centerline mega-ordnance rail, boosted off the jet.
+    if (type === 'BFFG') {
+      const rail = _tmp.set(0, -1.35, -3.4).applyQuaternion(q).add(origin);
+      const v = velocity.clone().addScaledVector(forward, def.launchSpeed);
+
+      this.ammo.BFFG--;
+      this._spawn({
+        type,
+        position: rail.clone(),
+        velocity: v,
+        ttl: def.ttl,
+        damage: def.damage,
+        splashRadius: def.splashRadius,
+        target: null,
+        targetId: null,
+        drag: def.drag,
+        speed: v.length(),
+        age: 0,
+        burnTime: def.burnTime,
+        accel: def.accel,
+        maxSpeed: def.maxSpeed,
+      });
+      return { fired: true, type, position: rail.clone(), velocity: v.clone(), targetId: null };
     }
 
     // Mk-82
@@ -578,6 +631,72 @@ export class WeaponSystem {
     return this.ccip;
   }
 
+  // Feature 23: live BFFG impact solution. Mirrors `fire()`'s launch state and
+  // the projectile's boosted flight (0.35 G during burn, 1.0 G after) so the
+  // HUD can project a real reticle for the mega-ordnance.
+  computeBFFGCCIP(flight, world) {
+    const def = WEAPONS.BFFG;
+    if (!flight || !flight.position) {
+      this.ccip.valid = false;
+      this.ccipOrigin.valid = false;
+      return this.ccip;
+    }
+
+    const q = flight.quaternion || _q.identity();
+    _gForward.set(0, 0, -1).applyQuaternion(q);
+    const pos = _tmp.set(0, -1.35, -3.4).applyQuaternion(q).add(flight.position).clone();
+    const vel = (flight.velocity ? flight.velocity.clone() : new THREE.Vector3());
+    vel.addScaledVector(_gForward, def.launchSpeed);
+
+    if (flight.velocity) {
+      this.ccipOrigin.valid = true;
+      this.ccipOrigin.x = flight.position.x + flight.velocity.x * 1.2;
+      this.ccipOrigin.y = flight.position.y + flight.velocity.y * 1.2;
+      this.ccipOrigin.z = flight.position.z + flight.velocity.z * 1.2;
+    } else {
+      this.ccipOrigin.valid = false;
+    }
+
+    // Same 0.02 s substep the live projectile uses, so the pipper and the
+    // detonation agree to within a step.
+    const step = 0.02;
+    const maxTime = def.ttl;
+    let age = 0;
+    let crossed = false;
+    const prev = new THREE.Vector3();
+
+    while (age < maxTime - 1e-9) {
+      const h = Math.min(step, maxTime - age);
+      prev.copy(pos);
+      const prevGh = this._heightAt(world, prev.x, prev.z);
+      age += h;
+      bffgStep(pos, vel, h, age, def);
+
+      const gh = this._heightAt(world, pos.x, pos.z);
+      if (pos.y <= gh) {
+        const dy1 = prev.y - prevGh;
+        const dy2 = pos.y - gh;
+        const denom = dy1 - dy2;
+        const f = denom > 1e-6 ? clamp(dy1 / denom, 0, 1) : 0;
+        const x = prev.x + (pos.x - prev.x) * f;
+        const z = prev.z + (pos.z - prev.z) * f;
+        this.ccip.valid = true;
+        this.ccip.x = x;
+        this.ccip.y = this._heightAt(world, x, z);
+        this.ccip.z = z;
+        this.ccip.timeToImpact = age - h + h * f;
+        crossed = true;
+        break;
+      }
+    }
+
+    if (!crossed) {
+      this.ccip.valid = false;
+      this.ccip.timeToImpact = 0;
+    }
+    return this.ccip;
+  }
+
   // ------------------------------------------------------------------- update
   update(dt, flight, world, targets = [], lockedTarget = null) {
     const events = [];
@@ -627,6 +746,8 @@ export class WeaponSystem {
 
     if (this.selected === 'MK82' && flight) {
       this.computeCCIP(flight, world);
+    } else if (this.selected === 'BFFG' && flight) {
+      this.computeBFFGCCIP(flight, world);
     } else {
       this.ccip.valid = false;
       this.ccipOrigin.valid = false;
@@ -716,6 +837,12 @@ export class WeaponSystem {
         return;
       }
       this._trail(p, events, h, 0.05, 0xffd9a0, 0.8);
+    } else if (p.type === 'BFFG') {
+      // Feature 23: rocket-boosted mega-ordnance with a gentle gravity arc
+      // during the burn and full gravity once the motor cuts out.
+      bffgStep(p.position, p.velocity, h, p.age, WEAPONS.BFFG);
+      p.speed = p.velocity.length();
+      this._trail(p, events, h, 0.03, 0x66f7ff, 2.8);
     } else if (p.type === 'MK82') {
       ballisticStep(p.position, p.velocity, h, p.drag);
       // Thin condensation/smoke trail: lets the player trace the fall line all
@@ -737,6 +864,19 @@ export class WeaponSystem {
           p.dead = true;
           return;
         }
+      }
+    }
+
+    // Feature 23: 3D building side/roof impacts for every weapon. A projectile
+    // entering a standing building detonates on the facade at the exact wall
+    // point rather than tunnelling through to the ground behind it.
+    if (world && world.buildings && typeof world.buildings.hitBuilding === 'function') {
+      const bHit = world.buildings.hitBuilding(_prevPos, p.position);
+      if (bHit) {
+        p.position.set(bHit.x, bHit.y, bHit.z);
+        this._impact(p, events, this._splashTargetId(p, targets), true);
+        p.dead = true;
+        return;
       }
     }
 
@@ -803,15 +943,17 @@ export class WeaponSystem {
     return bestId;
   }
 
-  _impact(p, events, hitTargetId) {
-    events.push({
+  _impact(p, events, hitTargetId, hitBuilding = false) {
+    const ev = {
       kind: 'impact',
       weapon: p.type,
       position: { x: p.position.x, y: p.position.y, z: p.position.z },
       hitTargetId: hitTargetId != null ? hitTargetId : null,
       splashRadius: p.splashRadius,
       damage: p.damage,
-    });
+    };
+    if (hitBuilding === true) ev.hitBuilding = true;
+    events.push(ev);
   }
 
   _trail(p, events, h, interval, color, size) {
@@ -869,6 +1011,42 @@ export class WeaponSystem {
 
   // ------------------------------------------------------------------ visuals
   _makeMesh(type, position) {
+    // Feature 23: BFFG mega-ordnance — cyan-white plasma warhead core ringed by
+    // golden-amber stabilizers, sized to read clearly from the chase cam.
+    if (type === 'BFFG') {
+      const group = new THREE.Group();
+
+      // Warhead core: bright plasma sphere with a white-hot centre.
+      const coreGeo = new THREE.SphereGeometry(0.95, 14, 10);
+      const core = new THREE.Mesh(coreGeo, new THREE.MeshBasicMaterial({ color: 0x66f7ff }));
+      core.position.z = -0.6;
+      const glowGeo = new THREE.SphereGeometry(0.44, 10, 8);
+      const glow = new THREE.Mesh(glowGeo, new THREE.MeshBasicMaterial({ color: 0xf2ffff }));
+      glow.position.z = -0.6;
+      group.add(core, glow);
+
+      // Golden-amber stabilizer rings, perpendicular to the flight axis (+Z).
+      for (const [radius, z] of [[1.25, -1.2], [1.05, 0.1]]) {
+        const ringGeo = new THREE.TorusGeometry(radius, 0.13, 6, 18);
+        const ring = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: 0xffc857 }));
+        ring.position.z = z;
+        group.add(ring);
+      }
+
+      // Rocket motor / nozzle section aft of the warhead.
+      const bodyGeo = new THREE.CylinderGeometry(0.55, 0.72, 1.9, 12);
+      bodyGeo.rotateX(Math.PI / 2);
+      const body = new THREE.Mesh(bodyGeo, new THREE.MeshBasicMaterial({ color: 0xffc857 }));
+      body.position.z = 1.5;
+      group.add(body);
+
+      group.position.copy(position);
+      group.frustumCulled = false;
+      for (const child of group.children) child.frustumCulled = false;
+      this.scene.add(group);
+      return group;
+    }
+
     // Mk-82 is a two-part group (olive body + amber nose band) so the fall line
     // reads clearly from the chase cam. Its long axis lies along local +Z,
     // which is the axis `_orientMesh` aligns to the velocity vector.

@@ -534,8 +534,10 @@ class App {
 
   buildCommand() {
     const i = this.input;
-    const up = i.anyDown('ShiftLeft', 'ShiftRight') || i.isDown('ArrowUp');
-    const down = i.anyDown('ControlLeft', 'ControlRight') || i.isDown('ArrowDown');
+    // Alt+arrows drive the camera, so they must never nudge the throttle.
+    const alt = i.anyDown('AltLeft', 'AltRight');
+    const up = i.anyDown('ShiftLeft', 'ShiftRight') || (!alt && i.isDown('ArrowUp'));
+    const down = i.anyDown('ControlLeft', 'ControlRight') || (!alt && i.isDown('ArrowDown'));
     return {
       pitch: (i.isDown('KeyS') ? 1 : 0) - (i.isDown('KeyW') ? 1 : 0),
       roll: (i.isDown('KeyA') ? 1 : 0) - (i.isDown('KeyD') ? 1 : 0),
@@ -595,6 +597,7 @@ class App {
     if (i.wasPressed('Digit1')) { this.weapons.selectWeapon('GUN'); this.audio.click(); this.ui.toast('WEAPON · GUN'); }
     if (i.wasPressed('Digit2')) { this.weapons.selectWeapon('AIM9'); this.audio.click(); this.ui.toast('WEAPON · AIM-9'); }
     if (i.wasPressed('Digit3')) { this.weapons.selectWeapon('MK82'); this.audio.click(); this.ui.toast('WEAPON · MK-82'); }
+    if (i.wasPressed('Digit4')) { this.weapons.selectWeapon('BFFG'); this.audio.click(); this.ui.toast('WEAPON · BFFG-9000'); }
     if (i.wasPressed('KeyX')) {
       const res = this.weapons.deployFlare(f);
       if (res.deployed) {
@@ -742,6 +745,9 @@ class App {
             } else if (fired.type === 'MK82') {
               this.combatAudio.bombRelease();
               this.ui.toast('PICKLE · MK-82 AWAY');
+            } else if (fired.type === 'BFFG') {
+              this.combatAudio.bffgFire();
+              this.ui.toast('BFFG AWAY — BRACE FOR IMPACT!!');
             }
           }
         }
@@ -751,10 +757,13 @@ class App {
           if (ev.kind === 'trail') {
             this.vfx.spawnTrail(ev.position, ev.color, ev.size);
           } else if (ev.kind === 'impact') {
-            const scale = ev.weapon === 'MK82' ? 4.5 : (ev.weapon === 'AIM9' ? 2.8 : 0.65);
+            const isBffg = ev.weapon === 'BFFG';
+            const scale = isBffg ? 14 : (ev.weapon === 'MK82' ? 4.5 : (ev.weapon === 'AIM9' ? 2.8 : 0.65));
             this.vfx.spawnExplosion(ev.position, scale);
-            // Feature 21: rising smoke columns that linger after the fireball.
-            if (ev.weapon === 'MK82') {
+            // Feature 21/24: rising smoke columns that linger after the fireball.
+            if (isBffg) {
+              this.vfx.spawnSmokePlume(ev.position, 75);
+            } else if (ev.weapon === 'MK82') {
               this.vfx.spawnSmokePlume(ev.position, 28);
             } else if (ev.weapon === 'AIM9') {
               this.vfx.spawnSmokePlume(ev.position, 12);
@@ -764,14 +773,21 @@ class App {
               ev.position.y - f.position.y,
               ev.position.z - f.position.z,
             );
-            if (ev.weapon !== 'GUN' || ev.hitTargetId) this.combatAudio.explosion(dist);
+            if (isBffg) this.combatAudio.megaExplosion(dist);
+            else if (ev.weapon !== 'GUN' || ev.hitTargetId) this.combatAudio.explosion(dist);
             const destroyed = this.targets.applyImpact(ev);
-            // Feature 20/21: the same blast levels any city in the kill zone.
+            // Feature 20/21/23: the same blast levels any city in the kill zone.
             const bRes = this.world.buildings.applyBlast(ev.position, ev.splashRadius, ev.damage);
-            for (let i = 0; i < Math.min(3, bRes.positions.length); i++) {
-              this.vfx.spawnSmokePlume(bRes.positions[i], 55);
+            const plumeCount = isBffg ? 6 : 3;
+            const plumeDuration = isBffg ? 70 : 55;
+            for (let i = 0; i < Math.min(plumeCount, bRes.positions.length); i++) {
+              this.vfx.spawnSmokePlume(bRes.positions[i], plumeDuration);
             }
-            if (bRes.destroyedCount > 0 && destroyed.length === 0) {
+            if (isBffg) {
+              this.ui.toast(bRes.destroyedCount > 0
+                ? 'WOOPS · ' + bRes.destroyedCount + ' STRUCTURES VAPORIZED!!'
+                : 'WOOPS · BFFG DETONATION!!');
+            } else if (bRes.destroyedCount > 0 && destroyed.length === 0) {
               this.ui.toast('IMPACT · ' + bRes.destroyedCount
                 + (bRes.destroyedCount > 1 ? ' STRUCTURES DESTROYED' : ' STRUCTURE DESTROYED'));
             }
@@ -811,6 +827,19 @@ class App {
         const nextRadioHead = this._missionSnap?.radio?.[this._missionSnap.radio.length - 1]?.text;
         if (nextRadioHead && nextRadioHead !== prevRadioHead) {
           this.combatAudio.radioBeep();
+        }
+
+        // Feature 22/24: burning buildings visibly belch flame + smoke while they
+        // collapse. Throttled to ~7 Hz so the puff pool is not starved.
+        this._collapseFxT = (this._collapseFxT || 0) + simDt;
+        if (this._collapseFxT >= 0.14) {
+          this._collapseFxT = 0;
+          const bld = this.world.buildings;
+          if (bld && typeof bld.getCollapsingFirePoints === 'function') {
+            const firePoints = bld.getCollapsingFirePoints();
+            const n = Math.min(6, firePoints.length);
+            for (let i = 0; i < n; i++) this.vfx.spawnFirePuff(firePoints[i], 1.3);
+          }
         }
       }
 

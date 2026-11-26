@@ -22,6 +22,7 @@ const GREEN = '#9dffc0';
 const GREEN_DIM = 'rgba(157,255,192,0.56)';
 const GREEN_FAINT = 'rgba(157,255,192,0.22)';
 const AMBER = '#ffc46b';
+const BFFG_CYAN = '#5cf6ff';
 const RED = '#ff6b5e';
 const INK = '#eafff1';
 const MONO = 'ui-monospace, Menlo, monospace';
@@ -544,6 +545,136 @@ export class TacticalOverlay {
       }
     }
 
+    // ------------------------------------------------------------- BFFG
+    // Feature 24: the BFFG-9000 mega-ordnance gets its own blast reticle —
+    // bold double ring (cyan outer / amber inner), crosshairs and a DANGER
+    // label. Same delayed-CCIP handling as the Mk-82: level flight pushes the
+    // impact point below the HUD, so the cue is clamped to the bottom edge.
+    if (selected === 'BFFG' && ccip && ccip.valid) {
+      const p = this._project(ccip, camera, w, h);
+      if (p && !p.behind) {
+        let origin = null;
+        const co = weapons.ccipOrigin;
+        if (co && co.valid) {
+          const o = this._project(co, camera, w, h);
+          if (o && !o.behind && o.x >= 0 && o.x <= w && o.y >= 0 && o.y <= h) origin = o;
+        }
+        if (!origin && boreVisible) origin = boreProj;
+        const ox = origin ? origin.x : cx;
+        const oy = origin ? origin.y : cy;
+        const tti = Math.max(0, num(ccip.timeToImpact, 0));
+        const bottomEdge = h - 18 * s;
+        const label = 'BFFG-9000 \u00b7 DANGER';
+
+        if (p.y >= bottomEdge) {
+          const dy = p.y - oy;
+          const t = Math.abs(dy) > 0.0001 ? clamp((bottomEdge - oy) / dy, 0, 1) : 0;
+          const qx = clamp(ox + (p.x - ox) * t, 24 * s, w - 24 * s);
+          const qy = bottomEdge;
+          const halfBar = (isExternal ? 26 : 32) * s;
+
+          ctx.save();
+          ctx.strokeStyle = 'rgba(92,246,255,0.72)';
+          ctx.lineWidth = 1.4;
+          if (typeof ctx.setLineDash === 'function') ctx.setLineDash([6 * s, 6 * s]);
+          ctx.beginPath();
+          ctx.moveTo(ox, oy);
+          ctx.lineTo(qx, qy);
+          ctx.stroke();
+          if (typeof ctx.setLineDash === 'function') ctx.setLineDash([]);
+
+          // Bold cyan bar with an amber inner bar riding above it.
+          ctx.strokeStyle = BFFG_CYAN;
+          ctx.lineWidth = 2.6;
+          ctx.beginPath();
+          ctx.moveTo(qx - halfBar, qy);
+          ctx.lineTo(qx + halfBar, qy);
+          ctx.stroke();
+          ctx.strokeStyle = AMBER;
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          ctx.moveTo(qx - halfBar * 0.62, qy - 4.5 * s);
+          ctx.lineTo(qx + halfBar * 0.62, qy - 4.5 * s);
+          ctx.stroke();
+
+          // End caps plus a beak pointing down at the impact point.
+          ctx.strokeStyle = BFFG_CYAN;
+          ctx.lineWidth = 1.8;
+          ctx.beginPath();
+          ctx.moveTo(qx - halfBar, qy - 6 * s);
+          ctx.lineTo(qx - halfBar, qy + 6 * s);
+          ctx.moveTo(qx + halfBar, qy - 6 * s);
+          ctx.lineTo(qx + halfBar, qy + 6 * s);
+          ctx.moveTo(qx - 5 * s, qy);
+          ctx.lineTo(qx, qy + 8 * s);
+          ctx.lineTo(qx + 5 * s, qy);
+          ctx.stroke();
+
+          ctx.font = `700 ${Math.round(10 * s)}px ${MONO}`;
+          ctx.textAlign = 'center';
+          ctx.fillStyle = BFFG_CYAN;
+          ctx.fillText(label, qx, clamp(qy - 15 * s, 12 * s, h - 12 * s));
+          ctx.font = `600 ${Math.round(9 * s)}px ${MONO}`;
+          ctx.fillStyle = AMBER;
+          ctx.fillText(tti.toFixed(1) + 's', qx, clamp(qy - 27 * s, 12 * s, h - 12 * s));
+          ctx.restore();
+        } else if (p.x > 0 && p.x < w && p.y > 0 && p.y < h) {
+          const rOuter = (isExternal ? 16 : 20) * s;
+          const rInner = rOuter * 0.55;
+
+          ctx.save();
+          ctx.strokeStyle = 'rgba(92,246,255,0.72)';
+          ctx.lineWidth = 1.4;
+          if (typeof ctx.setLineDash === 'function') ctx.setLineDash([6 * s, 6 * s]);
+          ctx.beginPath();
+          ctx.moveTo(ox, oy);
+          ctx.lineTo(p.x, p.y);
+          ctx.stroke();
+          if (typeof ctx.setLineDash === 'function') ctx.setLineDash([]);
+
+          // Double ring: heavy cyan outer, amber inner.
+          ctx.strokeStyle = BFFG_CYAN;
+          ctx.lineWidth = 2.4;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, rOuter, 0, TAU);
+          ctx.stroke();
+          ctx.strokeStyle = AMBER;
+          ctx.lineWidth = 1.4;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, rInner, 0, TAU);
+          ctx.stroke();
+
+          // Crosshairs beyond the outer ring.
+          ctx.strokeStyle = BFFG_CYAN;
+          ctx.lineWidth = 1.8;
+          ctx.beginPath();
+          ctx.moveTo(p.x - rOuter - 7 * s, p.y);
+          ctx.lineTo(p.x - rOuter - 2 * s, p.y);
+          ctx.moveTo(p.x + rOuter + 2 * s, p.y);
+          ctx.lineTo(p.x + rOuter + 7 * s, p.y);
+          ctx.moveTo(p.x, p.y - rOuter - 7 * s);
+          ctx.lineTo(p.x, p.y - rOuter - 2 * s);
+          ctx.moveTo(p.x, p.y + rOuter + 2 * s);
+          ctx.lineTo(p.x, p.y + rOuter + 7 * s);
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 2.6 * s, 0, TAU);
+          ctx.fillStyle = AMBER;
+          ctx.fill();
+
+          ctx.font = `700 ${Math.round(10 * s)}px ${MONO}`;
+          ctx.textAlign = 'left';
+          ctx.fillStyle = BFFG_CYAN;
+          ctx.fillText(label, clamp(p.x + rOuter + 10 * s, 4, w - 130 * s), clamp(p.y - 6 * s, 12 * s, h - 12 * s));
+          ctx.font = `600 ${Math.round(9 * s)}px ${MONO}`;
+          ctx.fillStyle = AMBER;
+          ctx.fillText(tti.toFixed(1) + 's', clamp(p.x + rOuter + 10 * s, 4, w - 130 * s), clamp(p.y + 8 * s, 12 * s, h - 12 * s));
+          ctx.restore();
+        }
+      }
+    }
+
     // ------------------------------------------------------------- GUN
     if (selected === 'GUN') {
       const r = (isExternal ? 14 : 25) * s;
@@ -931,6 +1062,8 @@ export class TacticalOverlay {
       { key: 'GUN', text: 'GUN ' + Math.round(num(ammo.GUN, 0)) },
       { key: 'AIM9', text: 'AIM-9 ' + Math.round(num(ammo.AIM9, 0)) },
       { key: 'MK82', text: 'MK-82 ' + Math.round(num(ammo.MK82, 0)) },
+      // Feature 24: the BFFG mega-ordnance is always visible in the strip.
+      { key: 'BFFG', text: 'BFFG ' + Math.round(num(ammo.BFFG, 0)) },
       { key: 'FLARE', text: 'FLR ' + Math.round(num(ammo.FLARE, 0)) },
     ];
 
@@ -959,14 +1092,17 @@ export class TacticalOverlay {
       const seg = segs[i];
       const sw = widths[i] + segPad;
       const selected = weapons.selected === seg.key;
+      const bffg = seg.key === 'BFFG';
       if (selected) {
         roundRectPath(ctx, cur + 1 * s, y0 + 3 * s, sw - 2 * s, hgt - 6 * s, 3 * s);
-        ctx.fillStyle = 'rgba(255,196,107,0.16)';
+        ctx.fillStyle = bffg ? 'rgba(92,246,255,0.16)' : 'rgba(255,196,107,0.16)';
         ctx.fill();
-        ctx.strokeStyle = 'rgba(255,196,107,0.62)';
+        ctx.strokeStyle = bffg ? 'rgba(92,246,255,0.68)' : 'rgba(255,196,107,0.62)';
         ctx.stroke();
       }
-      ctx.fillStyle = selected ? AMBER : (num(ammo[seg.key], 0) <= 0 ? 'rgba(157,255,192,0.30)' : INK);
+      // BFFG: bright cyan while loaded, amber once the pilot selects it.
+      const empty = num(ammo[seg.key], 0) <= 0;
+      ctx.fillStyle = selected ? AMBER : (empty ? 'rgba(157,255,192,0.30)' : (bffg ? BFFG_CYAN : INK));
       ctx.textAlign = 'center';
       ctx.fillText(seg.text, cur + sw * 0.5, y0 + hgt * 0.5 + 0.5);
       cur += sw;

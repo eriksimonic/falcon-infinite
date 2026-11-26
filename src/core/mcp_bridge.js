@@ -22,7 +22,7 @@ export const BRIDGE_VERSION = '1.0.0';
 
 const AP_MODES = ['OFF', 'ALT_HDG', 'ATT'];
 const CAMERA_MODES = ['cockpit', 'chase', 'wing', 'orbit', 'flyby'];
-const WEAPON_TYPES = ['GUN', 'AIM9', 'MK82'];
+const WEAPON_TYPES = ['GUN', 'AIM9', 'MK82', 'BFFG'];
 const RADIO_PRIORITIES = ['info', 'warn', 'urgent'];
 const MISSION_IDS = ['free', 'sead', 'strike', 'cap'];
 

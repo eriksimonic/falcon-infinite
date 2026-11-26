@@ -4,6 +4,7 @@ const KEY_ROWS = [
     { k: '1', s: 'GUN', c: 'cbt' },
     { k: '2', s: 'AIM9', c: 'cbt' },
     { k: '3', s: 'MK82', c: 'cbt' },
+    { k: '4', s: 'BFFG', c: 'cbt' },
     { k: '[', s: '-1H', c: 'wld' },
     { k: ']', s: '+1H', c: 'wld' },
   ],
@@ -65,7 +66,7 @@ const CONTROL_GROUPS = [
     items: [
       [['SPC'], 'Fire weapon'],
       [['TAB'], 'Cycle weapon'],
-      [['1', '2', '3'], 'GUN / AIM-9 / MK-82'],
+      [['1', '2', '3', '4'], 'GUN / AIM-9 / MK-82 / BFFG'],
       [['X'], 'Deploy flares'],
       [['N'], 'NVG night vision'],
       [['J'], 'ACES II eject'],
@@ -88,6 +89,8 @@ const CONTROL_GROUPS = [
     items: [
       [['V'], 'Cockpit view'],
       [['C'], 'Camera cycle / flyby'],
+      [['ALT+←↑↓→'], 'Pan camera'],
+      [['ALT++', 'ALT+−'], 'Camera distance'],
       [['Y', 'U'], 'Weather / wind'],
       [['T'], 'Time scale'],
       [['[', ']'], 'Time − / + 1h'],

@@ -1,5 +1,6 @@
-// Node-only acceptance test for Feature 20:
-// terrain-hugging street ribbons + destructible buildings.
+// Node-only acceptance test for Feature 20 (terrain-hugging street ribbons +
+// destructible buildings) and Feature 22 (3D side-wall impacts + animated
+// burn & collapse).
 //
 // Run: node tests/cities_destruction_test.mjs
 //
@@ -86,14 +87,16 @@ check(first.destroyedCount === first.positions.length,
   'destroyedCount does not match positions length');
 check(first.destroyedCount >= expected.length,
   `applyBlast missed buildings within the splash (${first.destroyedCount}/${expected.length})`);
-check(sys.destroyed.size === first.destroyedCount, 'destroyed Set size is inconsistent');
+check(sys.destroyed.size + sys.collapsing.size === first.destroyedCount,
+  'destroyed + collapsing set size is inconsistent');
 check(blastMs < 500, `applyBlast too slow (${fmt(blastMs)} ms)`);
 
 const posKeys = new Set(first.positions.map((p) => `${p.x},${p.z}`));
 for (const b of expected) {
   check(posKeys.has(`${b.x},${b.z}`), `building at ${b.x},${b.z} was not reported destroyed`);
-  check(sys.destroyed.has(`${site.id}:${Math.round(b.x)}:${Math.round(b.z)}`),
-    `expected building ${b.x},${b.z} missing from destroyed set`);
+  const key = `${site.id}:${Math.round(b.x)}:${Math.round(b.z)}`;
+  check(sys.destroyed.has(key) || sys.collapsing.has(key),
+    `expected building ${b.x},${b.z} missing from destroyed/collapsing state`);
 }
 for (const p of first.positions) {
   check(Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.z),
@@ -115,18 +118,19 @@ for (const b of site.buildings) {
   if (Math.hypot(b.x - target.x, b.z - target.z) > reachOf(b) + 1) survivors++;
 }
 check(survivors > 0, 'every building in the settlement was destroyed');
-check(sys.destroyed.size < site.buildings.length,
-  'destroyed set covers the whole settlement for a small blast');
+check(sys.destroyed.size + sys.collapsing.size < site.buildings.length,
+  'destroyed/collapsing covers the whole settlement for a small blast');
 
 // ---------------------------------------------------------------------------
 // 3. Re-blasting the same spot must not double-count
 // ---------------------------------------------------------------------------
-const sizeBefore = sys.destroyed.size;
+const sizeBefore = sys.destroyed.size + sys.collapsing.size;
 const cratersBefore = sys.craters.length;
 const second = sys.applyBlast({ x: target.x, y: target.y, z: target.z }, SPLASH, 180);
 check(second.destroyedCount === 0, `repeat blast double-counted (${second.destroyedCount})`);
 check(second.positions.length === 0, 'repeat blast returned positions');
-check(sys.destroyed.size === sizeBefore, 'repeat blast grew the destroyed set');
+check(sys.destroyed.size + sys.collapsing.size === sizeBefore,
+  'repeat blast grew the destroyed/collapsing state');
 check(sys.craters.length === cratersBefore + 1, 'repeat blast did not add a crater');
 
 // Low-damage blasts leave no crater (but may still knock a building down).
@@ -140,6 +144,7 @@ check(sys.craters.length === cratersBeforeWeak, 'low-damage blast created a crat
 // ---------------------------------------------------------------------------
 sys.resetDamage();
 check(sys.destroyed.size === 0, 'resetDamage left destroyed buildings');
+check(sys.collapsing.size === 0, 'resetDamage left collapsing buildings');
 check(sys.craters.length === 0, 'resetDamage left craters');
 check(sys.stats.destroyed === 0 && sys.stats.craters === 0, 'resetDamage left stale stats');
 check(sys._needsRebuild === true && sys._cratersDirty === true,
@@ -270,6 +275,127 @@ drawn.resetDamage();
 drawn.rebuild(camera);
 check(drawn.craterMesh.visible === false, 'craters still visible after resetDamage');
 check(drawn.stats.destroyed === 0, 'stub-scene destroyed count not reset');
+
+// ---------------------------------------------------------------------------
+// 8. Feature 22 — 3D side-wall impacts + animated burn/collapse
+// ---------------------------------------------------------------------------
+const sideSys = new BuildingSystem(null, HEADLESS_PRESET);
+check(sideSys.collapsing instanceof Map, 'collapsing is not a Map');
+check(sideSys.collapsing.size === 0, 'collapsing not empty on a fresh system');
+check(sideSys.getCollapsingFirePoints().length === 0, 'fire points on a fresh system');
+check(typeof sideSys.hitBuilding === 'function' &&
+  typeof sideSys.getCollapsingFirePoints === 'function',
+  'hitBuilding/getCollapsingFirePoints missing');
+
+// Tallest real building in the settlement: a genuine tower facade to shoot at.
+let tall = null;
+for (const b of site.buildings) {
+  if (!tall || b.h > tall.h) tall = b;
+}
+check(!!tall && tall.h > 20, 'no tall building in the test settlement');
+
+const tallKey = `${site.id}:${Math.round(tall.x)}:${Math.round(tall.z)}`;
+const tallGround = sideSys._ground(tall);
+const tallMidY = tall.y + tall.h * 0.5;
+const tcos = Math.cos(tall.rot);
+const tsin = Math.sin(tall.rot);
+const uxX = tcos; // world direction of the building's local +x axis
+const uxZ = -tsin;
+const halfW = tall.w * 0.5;
+const halfD = tall.d * 0.5;
+
+// Segment fired straight at the side wall at half the building's height.
+const wallOffset = halfW + 4;
+const wallFrom = { x: tall.x - uxX * wallOffset, y: tallMidY, z: tall.z - uxZ * wallOffset };
+const wallTo = { x: tall.x, y: tallMidY, z: tall.z };
+const wallHit = sideSys.hitBuilding(wallFrom, wallTo);
+check(!!wallHit, 'hitBuilding missed a mid-air side wall');
+if (wallHit) {
+  check(wallHit.key === tallKey, `hitBuilding hit the wrong building (${wallHit.key})`);
+  check(wallHit.t > 0 && wallHit.t < 1, `bad hit parameter t=${wallHit.t}`);
+  check(wallHit.y > tall.y + 2, `side-wall impact is not mid-air (y=${fmt(wallHit.y)})`);
+  check(wallHit.y <= tallGround.top + 1, 'impact point is above the roof');
+  check(Number.isFinite(wallHit.x) && Number.isFinite(wallHit.z), 'impact point is not finite');
+  check(wallHit.building === tall, 'hitBuilding returned the wrong building ref');
+  // The entry point must lie on a vertical facade of the footprint.
+  const hdx = wallHit.x - tall.x;
+  const hdz = wallHit.z - tall.z;
+  const lx = hdx * tcos - hdz * tsin;
+  const lz = hdx * tsin + hdz * tcos;
+  check(Math.abs(Math.abs(lx) - halfW) < 0.5 && Math.abs(lz) <= halfD + 0.5,
+    `impact point is not on the facade (lx=${fmt(lx)}, lz=${fmt(lz)})`);
+  check(wallHit.y > terrainHeight(wallHit.x, wallHit.z) + 2,
+    'impact point is not above the local ground');
+}
+
+// Clean miss straight above the roof: inside the own footprint, high overhead.
+const overFrom = { x: tall.x - uxX * 3, y: tallGround.top + 25, z: tall.z - uxZ * 3 };
+const overTo = { x: tall.x + uxX * 3, y: tallGround.top + 25, z: tall.z + uxZ * 3 };
+check(sideSys.hitBuilding(overFrom, overTo) === null,
+  'hitBuilding hit a building from a ray above its roof');
+
+// Clean miss beside the wall: parallel to the facade, offset outwards.
+const besideOffset = halfW + 8;
+const besideFrom = {
+  x: tall.x + uxX * besideOffset + uxZ * (-halfD * 0.5),
+  y: tallMidY,
+  z: tall.z + uxZ * besideOffset - uxX * (-halfD * 0.5),
+};
+const besideTo = {
+  x: tall.x + uxX * besideOffset + uxZ * (halfD * 0.5),
+  y: tallMidY,
+  z: tall.z + uxZ * besideOffset - uxX * (halfD * 0.5),
+};
+check(sideSys.hitBuilding(besideFrom, besideTo) === null,
+  'hitBuilding hit a building from a ray passing beside it');
+
+// Blast on the tall building must start an animated collapse, not instant rubble.
+const collapseBlast = sideSys.applyBlast({ x: tall.x, y: tall.y, z: tall.z }, 20, 180);
+check(collapseBlast.destroyedCount >= 1, 'blast near the tall building destroyed nothing');
+check(sideSys.collapsing.size >= 1, 'blast did not start a collapse');
+check(sideSys.collapsing.has(tallKey), 'the tall building is not collapsing');
+check(sideSys.destroyed.size === 0, 'buildings snapped to rubble without collapsing');
+check(sideSys.stats.destroyed === sideSys.collapsing.size, 'stats.destroyed out of sync with collapsing');
+let durationOk = true;
+for (const c of sideSys.collapsing.values()) {
+  if (!(c.duration >= 2.4 && c.duration <= 3.8)) durationOk = false;
+  if (!(Math.abs(c.tiltX) >= 0.14 && Math.abs(c.tiltX) <= 0.32)) durationOk = false;
+  if (!(Math.abs(c.tiltZ) >= 0.14 && Math.abs(c.tiltZ) <= 0.32)) durationOk = false;
+}
+check(durationOk, 'collapse duration or lean is outside the 2.4..3.8 s / 0.14..0.32 rad range');
+
+const fire0 = sideSys.getCollapsingFirePoints();
+check(fire0.length === sideSys.collapsing.size, 'fire point count does not match collapsing size');
+let fireOk = true;
+for (const p of fire0) {
+  if (!Number.isFinite(p.x) || !Number.isFinite(p.y) || !Number.isFinite(p.z)) fireOk = false;
+  if (!(p.y > 0.5)) fireOk = false;
+  if (p.progress !== 0) fireOk = false;
+}
+check(fireOk, 'burning positions are invalid');
+
+// Repeat blast during the burn must not double-count the same buildings.
+check(sideSys.applyBlast({ x: tall.x, y: tall.y, z: tall.z }, 20, 180).destroyedCount === 0,
+  'a second blast re-counted a collapsing building');
+
+sideSys.update(0.5);
+const fireMid = sideSys.getCollapsingFirePoints();
+check(fireMid.length === fire0.length, 'advancing the collapse lost burning buildings');
+check(fireMid.every((p) => p.progress > 0 && p.progress < 1), 'collapse progress did not advance');
+check(sideSys.destroyed.size === 0, 'collapse finished in half a second');
+
+sideSys.update(4.5);
+check(sideSys.collapsing.size === 0, 'buildings are still collapsing after 5 s');
+check(sideSys.destroyed.size >= 1, 'no building finished collapsing into rubble');
+check(sideSys.destroyed.has(tallKey), 'the tall building never became rubble');
+check(sideSys.getCollapsingFirePoints().length === 0, 'fire points remain after the collapse');
+check(sideSys.hitBuilding(wallFrom, wallTo) === null,
+  'hitBuilding still hits a building that is flat rubble');
+check(sideSys.stats.destroyed === sideSys.destroyed.size, 'stats.destroyed stale after collapse');
+
+sideSys.resetDamage();
+check(sideSys.collapsing.size === 0 && sideSys.destroyed.size === 0,
+  'resetDamage left collapse state behind');
 
 // ---------------------------------------------------------------------------
 // Summary

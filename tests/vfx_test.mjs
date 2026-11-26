@@ -315,6 +315,132 @@ function run(vfx, seconds, flight, wx, camera = null, dt = 1 / 60) {
     '21: fireball is pooled, not created per blast');
 }
 
+// ------- 4c. Feature 24: BFFG mega-blast scaling & building fire puffs
+{
+  const vfx = new CombatVFX(null);
+  const wx = weather(4, -2, 0.2);
+  const zero = makeFlight({ speed: 0, onGround: true });
+
+  const slot = vfx.spawnExplosion(new THREE.Vector3(0, 0, 0), 14);
+  ok(slot.duration >= 8, '24: mega-blast lingers >= 8 s', String(slot.duration));
+  ok(slot.duration === 8.5, '24: mega-blast duration is exactly 8.5 s', String(slot.duration));
+  ok(slot.coreTime === 2.8 && slot.fireballTime === 2.8 && slot.ringTime === 2.2,
+    '24: core/fireball burn 2.8 s and the ring expands 2.2 s',
+    `${slot.coreTime}/${slot.fireballTime}/${slot.ringTime}`);
+
+  const first = vfx.update(1 / 60, zero, wx, null);
+  ok(first.activeExplosions === 1, '24: mega-blast active on the first frame');
+  ok(vfx.sparks.count >= 32 && vfx.sparks.count <= 40,
+    '24: mega-blast throws 32-40 high-velocity sparks', String(vfx.sparks.count));
+  ok(vfx.puffs.count >= 26,
+    '24: mega-blast seeds >= 26 fireball/mushroom puffs', String(vfx.puffs.count));
+  ok(vfx.sparks.count + vfx.puffs.count >= 50,
+    '24: mega-blast particle burst is rich (>= 50)',
+    String(vfx.sparks.count + vfx.puffs.count));
+
+  // The initial burst must mix fiery orange-gold lobes with cyan-white plasma.
+  let fireLobes = 0;
+  let plasmaPuffs = 0;
+  for (let i = 0; i < vfx.puffs.capacity; i++) {
+    if (!vfx.puffs.active[i]) continue;
+    const r = vfx.puffs.col[i * 3];
+    const g = vfx.puffs.col[i * 3 + 1];
+    const b = vfx.puffs.col[i * 3 + 2];
+    if (r > 0.85 && g > 0.4 && g < 0.75 && b < 0.15) fireLobes++;
+    if (r < 0.7 && g > 0.85 && b > 0.9) plasmaPuffs++;
+  }
+  ok(fireLobes >= 8, '24: orange-gold fireball lobes seeded', String(fireLobes));
+  ok(plasmaPuffs >= 5, '24: cyan-white plasma flash puffs seeded', String(plasmaPuffs));
+
+  // Shockwave: scale * 24 = 336 m, still expanding at ~2 s.
+  run(vfx, 2.0, zero, wx, null, 1 / 60);
+  ok(slot.ring.visible && slot.ring.scale.x > 250,
+    '24: mega shockwave ring expands past 250 m inside its 2.2 s life',
+    slot.ring.scale.x.toFixed(1) + ' m');
+  ok(slot.core.visible && slot.fireball.visible,
+    '24: core and fireball still burning at ~2 s');
+
+  // Lingering blast: still alive, still smoking past 2.4 s.
+  run(vfx, 0.5, zero, wx, null, 1 / 60);
+  ok(vfx.activeExplosions === 1, '24: mega-blast still active past 2.4 s',
+    't=' + slot.t.toFixed(2) + 's');
+  ok(slot.core.visible && slot.fireball.visible,
+    '24: core and fireball visible past 2.4 s');
+  ok(vfx.activeParticles >= 20, '24: mushroom column keeps smoking past 2.4 s',
+    String(vfx.activeParticles));
+
+  // ... and completes cleanly, standing every mesh down.
+  run(vfx, 7, zero, wx, null, 1 / 30);
+  ok(vfx.activeExplosions === 0, '24: mega-blast completes after 8.5 s');
+  ok(!slot.core.visible && !slot.ring.visible && !slot.fireball.visible,
+    '24: mega-blast meshes hidden after expiry');
+
+  // Sub-mega blasts keep the exact Feature 21 timings.
+  const normal = new CombatVFX(null).spawnExplosion({ x: 0, y: 0, z: 0 }, 9);
+  ok(normal.duration === 5.5 && normal.coreTime === 1.8
+    && normal.fireballTime === 1.8 && normal.ringTime === 1.35,
+  '24: sub-mega blasts keep Feature 21 timings (5.5/1.8/1.35)',
+  `${normal.duration}/${normal.coreTime}/${normal.ringTime}`);
+
+  // -- spawnFirePuff: flame + soot pair, zero allocations, wind drift.
+  const fp = new CombatVFX(null);
+  const capBefore = fp.puffs.capacity;
+  const lenBefore = fp.puffs.pos.length;
+  const before = fp.puffs.count;
+  const emitted = fp.spawnFirePuff(new THREE.Vector3(5, 10, 5), 1.2);
+  ok(emitted === 2, '24: spawnFirePuff emits a flame + smoke pair', String(emitted));
+  ok(fp.puffs.count === before + 2, '24: spawnFirePuff adds two puffs',
+    `${before} -> ${fp.puffs.count}`);
+  ok(fp.puffs.capacity === capBefore && fp.puffs.pos.length === lenBefore,
+    '24: spawnFirePuff writes into the existing pool (no allocation)');
+
+  let flameIdx = -1;
+  let sootIdx = -1;
+  for (let i = 0; i < fp.puffs.capacity; i++) {
+    if (!fp.puffs.active[i]) continue;
+    const r = fp.puffs.col[i * 3];
+    const g = fp.puffs.col[i * 3 + 1];
+    const b = fp.puffs.col[i * 3 + 2];
+    if (r > 0.85 && g > 0.3 && g < 0.75 && b < 0.3) flameIdx = i;
+    else if (r < 0.2 && g < 0.2 && b < 0.2) sootIdx = i;
+  }
+  ok(flameIdx >= 0, '24: fire puff has a bright flame (#ff6e1a / #ffb43a)');
+  ok(sootIdx >= 0, '24: fire puff has thick dark smoke (0x1e1d1c)');
+  if (flameIdx >= 0) {
+    const life = fp.puffs.maxLife[flameIdx];
+    ok(life >= 0.6 && life <= 1.1, '24: flame life is 0.6-1.1 s', life.toFixed(2));
+    ok(fp.puffs.vy[flameIdx] > 3, '24: flame rises fast', fp.puffs.vy[flameIdx].toFixed(2));
+  }
+  if (sootIdx >= 0) {
+    const life = fp.puffs.maxLife[sootIdx];
+    ok(life >= 2.8 && life <= 4.5, '24: soot life is 2.8-4.5 s', life.toFixed(2));
+    ok(fp.puffs.windF[sootIdx] > 0.5, '24: soot drifts with the wind',
+      String(fp.puffs.windF[sootIdx]));
+    const x0 = fp.puffs.pos[sootIdx * 3];
+    fp.update(0.5, zero, weather(8, 0, 0.1), null);
+    ok(fp.puffs.pos[sootIdx * 3] > x0 + 0.5, '24: soot puff drifts downwind',
+      (fp.puffs.pos[sootIdx * 3] - x0).toFixed(2) + ' m');
+  }
+
+  const r = fp.update(1 / 60, zero, wx, null);
+  ok(r.activeParticles >= 2, '24: fire puffs count as active particles',
+    String(r.activeParticles));
+
+  // Headless safety with hostile input.
+  let threw = null;
+  try {
+    fp.spawnFirePuff(null);
+    fp.spawnFirePuff(undefined, NaN);
+    fp.spawnFirePuff({ x: NaN, y: undefined, z: 'x' }, -5);
+    fp.spawnFirePuff({}, Infinity);
+  } catch (err) {
+    threw = err;
+  }
+  ok(!threw, '24: spawnFirePuff is headless-safe with hostile input', threw && threw.message);
+  const finitePuffs = fp.puffs.pos.every((v) => Number.isFinite(v));
+  ok(finitePuffs, '24: spawnFirePuff never writes NaN positions');
+}
+
 // --------------------------------------------------------------- 5. reset()
 {
   const vfx = new CombatVFX(null);
