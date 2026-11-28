@@ -94,7 +94,7 @@ setActiveTerrainEdits(null);
 // ---------------------------------------------------------------------------
 const hc = 100000 / (513 - 1); // 195.3125 m on the default bounds
 
-// raise: +0.6 m per 0.05 s at strength 1, exact on the centre cell
+// raise: +1.2 m per 0.05 s at strength 1, exact on the centre cell
 const raised = new TerrainEdits({ heightGrid: 513, colorGrid: 513 });
 const raiseRes = raised.applyHeightBrush({
   mode: 'raise', x: 0, z: 0, radius: 1000, strength: 1, dt: 0.05,
@@ -102,8 +102,8 @@ const raiseRes = raised.applyHeightBrush({
 check(raiseRes.changed === true, 'raise brush reported no change');
 check(raised.hasHeightEdits === true && raised.heightCount > 0,
   'raise brush did not flag height edits');
-near(raised.sampleHeightDelta(0, 0), 0.6, 1e-9, 'raise centre is not +0.6 m');
-near(raised.getHeightCell(256, 256), 0.6, 1e-9, 'raise centre cell is not 6 quanta');
+near(raised.sampleHeightDelta(0, 0), 1.2, 1e-9, 'raise centre is not +1.2 m');
+near(raised.getHeightCell(256, 256), 1.2, 1e-9, 'raise centre cell is not 24 quanta');
 check(raised.sampleHeightDelta(1000, 0) === 0, 'raise leaked onto the brush edge');
 check(raised.sampleHeightDelta(1200, 0) === 0, 'raise leaked outside the radius');
 check(raised.sampleHeightDelta(0, -1400) === 0, 'raise leaked outside the radius (z)');
@@ -128,7 +128,7 @@ check(raiseRes.bounds.zMin < -1000 && raiseRes.bounds.zMax > 1000,
 // lower
 const lowered = new TerrainEdits({ heightGrid: 513, colorGrid: 513 });
 lowered.applyHeightBrush({ mode: 'lower', x: 0, z: 0, radius: 1000, strength: 1, dt: 0.05 });
-near(lowered.sampleHeightDelta(0, 0), -0.6, 1e-9, 'lower centre is not -0.6 m');
+near(lowered.sampleHeightDelta(0, 0), -1.2, 1e-9, 'lower centre is not -1.2 m');
 check(lowered.sampleHeightDelta(900, 900) === 0, 'lower leaked outside the radius');
 
 // flatten: one step is exact, many steps converge on targetY
@@ -139,8 +139,8 @@ const flatStep = flattened.applyHeightBrush({
   targetY: 2, baseHeightAt: () => BASE_Y,
 });
 check(flatStep.changed === true, 'flatten brush reported no change');
-near(flattened.sampleHeightDelta(0, 0), -29.4, 1e-6,
-  'flatten step is not (target - total) * 0.3');
+near(flattened.sampleHeightDelta(0, 0), -58.8, 1e-6,
+  'flatten step is not (target - total) * 0.6');
 for (let i = 0; i < 40; i++) {
   flattened.applyHeightBrush({
     mode: 'flatten', x: 0, z: 0, radius: 1000, strength: 1, dt: 0.05,
@@ -151,7 +151,7 @@ near(BASE_Y + flattened.sampleHeightDelta(0, 0), 2, 0.05,
   'flatten did not converge on targetY');
 check(flattened.sampleHeightDelta(1400, 0) === 0, 'flatten leaked outside the radius');
 
-// smooth: a lone spike relaxes toward its 4-neighbour average by 25% / step
+// smooth: a lone spike relaxes toward its 4-neighbour average by 50% / step
 const smoothed = new TerrainEdits({ heightGrid: 513, colorGrid: 513 });
 smoothed.setHeightCell(256, 256, 10);
 near(smoothed.sampleHeightDelta(0, 0), 10, 1e-9, 'spike was not planted');
@@ -159,14 +159,14 @@ const smoothStep = smoothed.applyHeightBrush({
   mode: 'smooth', x: 0, z: 0, radius: 500, strength: 1, dt: 0.05,
 });
 check(smoothStep.changed === true, 'smooth brush reported no change');
-near(smoothed.getHeightCell(256, 256), 7.5, 1e-9, 'smooth step is not 25% toward the mean');
+near(smoothed.getHeightCell(256, 256), 5, 1e-9, 'smooth step is not 50% toward the mean');
 check(smoothed.getHeightCell(256, 256) > 0, 'smooth erased the spike outright');
 check(smoothed.sampleHeightDelta(1500, 1500) === 0, 'smooth leaked outside the radius');
 
 // erase_height: back to flat, and the counters clear themselves
 const erased = new TerrainEdits({ heightGrid: 513, colorGrid: 513 });
 erased.applyHeightBrush({ mode: 'raise', x: 0, z: 0, radius: 1000, strength: 1, dt: 0.05 });
-near(erased.sampleHeightDelta(0, 0), 0.6, 1e-9, 'erase fixture did not raise');
+near(erased.sampleHeightDelta(0, 0), 1.2, 1e-9, 'erase fixture did not raise');
 for (let i = 0; i < 40; i++) {
   erased.applyHeightBrush({ mode: 'erase_height', x: 0, z: 0, radius: 1000, strength: 1, dt: 0.05 });
 }
@@ -218,28 +218,28 @@ function freshPaint() {
   return new TerrainEdits({ bounds: { xMin: -300, xMax: 300, zMin: -300, zMax: 300 }, heightGrid: 65, colorGrid: 7 });
 }
 
-// custom tint is exact in a single step (rate 0.7 at the centre, w = 1)
+// custom tint is exact in a single step (rate clamped to 1 at the centre, w = 1)
 const custom = freshPaint();
 const customRes = custom.applyColorBrush({
   mode: 'custom', x: 0, z: 0, radius: 300, strength: 1, dt: 0.2,
   tintRgb: [200, 20, 20, 255],
 });
 check(customRes.changed === true, 'custom colour brush reported no change');
-equalArrays(custom.getColorPixel(3, 3), [178, 52, 52, 217], 'custom tint step is wrong');
+equalArrays(custom.getColorPixel(3, 3), [200, 20, 20, 255], 'custom tint step is wrong');
 check(custom.hasColorEdits === true, 'custom tint did not flag colour edits');
-check(custom.sampleColor(0, 0)[0] === 178, 'sampleColor does not read the painted pixel');
+check(custom.sampleColor(0, 0)[0] === 200, 'sampleColor does not read the painted pixel');
 check(customRes.bounds.xMin < -300 * 0.999 && customRes.bounds.xMax > 300 * 0.999,
   'colour brush bounds do not span the painted area');
 check(custom.applyColorBrush({ mode: 'custom', x: 0, z: 0, radius: 200 }).changed === false,
   'custom mode without tintRgb reported a change');
 
 const MODES = [
-  ['desaturate', [126, 118, 114], 58],
-  ['darken', [76, 78, 74], 128],
-  ['lighten', [178, 176, 170], 128],
-  ['deep_forest', [92, 104, 86], 106],
-  ['warm_olive', [146, 132, 102], 96],
-  ['karst_stone', [154, 150, 140], 72],
+  ['desaturate', [118, 108, 104], 24],
+  ['darken', [34, 36, 34], 128],
+  ['lighten', [226, 224, 216], 128],
+  ['deep_forest', [54, 68, 50], 84],
+  ['warm_olive', [164, 140, 88], 82],
+  ['karst_stone', [188, 182, 168], 44],
 ];
 for (const [mode, rgb, alpha] of MODES) {
   const e = freshPaint();
@@ -319,7 +319,7 @@ undoing.applyHeightBrush({ mode: 'raise', x: 0, z: 0, radius: 150, strength: 1, 
 undoing.applyHeightBrush({ mode: 'raise', x: 0, z: 0, radius: 150, strength: 1, dt: 0.05 });
 undoing.endStroke();
 const centreAfterStroke1 = undoing.sampleHeightDelta(0, 0);
-near(centreAfterStroke1, 1.2, 1e-9, 'two raise steps in one stroke are not 1.2 m');
+near(centreAfterStroke1, 2.4, 1e-9, 'two raise steps in one stroke are not 2.4 m');
 
 undoing.beginStroke('height');
 const bRes = undoing.applyHeightBrush({ mode: 'raise', x: 600, z: 600, radius: 150, strength: 1, dt: 0.05 });
@@ -328,7 +328,7 @@ check(undoing.undoCount === 2, `undoCount should be 2 (${undoing.undoCount})`);
 check(bRes.bounds.xMin <= 450 && bRes.bounds.xMax >= 750
   && bRes.bounds.zMin <= 450 && bRes.bounds.zMax >= 750,
   'the second stroke bounds do not cover its brush');
-near(undoing.sampleHeightDelta(600, 600), 0.6, 0.05, 'second stroke did not paint');
+near(undoing.sampleHeightDelta(600, 600), 1.2, 0.1, 'second stroke did not paint');
 
 const undo1 = undoing.undo();
 check(!!undo1 && undo1.kind === 'height', 'undo() did not report a height stroke');

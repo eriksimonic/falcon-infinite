@@ -264,13 +264,19 @@ export class CloudSystem {
           if (vSeed > 0.5) uv.x = 1.0 - uv.x;
           vec4 t = texture2D(uTex, uv);
 
+          // True per-fragment camera distance: billboard corners can be 400 m
+          // away even when the quad slices 5 m in front of the chase camera
+          // right across the F-16. vDist is corner-interpolated across a
+          // 300-1500 m billboard, so it reads ~300 m at the quad centre even
+          // when the sheet is a few metres from the lens.
+          vec3 viewVec = vWorldPos - cameraPosition;
+          float viewLen = length(viewVec);
+
           float a = t.a * uOpacity;
-          // Close-range fly-through: silky feathering instead of the old hard
-          // 120..420 m pop, plus extra opacity softening under 110 m so puffs
-          // drift past the wings and canopy without snapping.
-          a *= smoothstep(18.0, 130.0, vDist);
-          a *= 0.72 + 0.28 * smoothstep(10.0, 120.0, vDist);
-          a *= 1.0 - smoothstep(21000.0, 31000.0, vDist);
+          // Fading smoothly over 48..200 m guarantees no cloud sheet ever
+          // washes out the player aircraft into a blurry white silhouette.
+          a *= smoothstep(48.0, 200.0, viewLen);
+          a *= 1.0 - smoothstep(21000.0, 31000.0, viewLen);
           if (a < 0.004) discard;
 
           // --- Height-based ambient occlusion & sunlit crown ---------------
@@ -298,8 +304,6 @@ export class CloudSystem {
           topCol = mix(topCol, vec3(0.020, 0.028, 0.048), nightT);
 
           vec3 sunDir = normalize(uSunDir);
-          vec3 viewVec = vWorldPos - cameraPosition;
-          float viewLen = length(viewVec);
           vec3 viewDir = viewLen > 0.001 ? viewVec / viewLen : vec3(0.0, 0.0, 1.0);
           float sunDot = dot(viewDir, sunDir);
 

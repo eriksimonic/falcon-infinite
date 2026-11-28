@@ -262,6 +262,9 @@ export class TerrainEditorUI {
     this.onTeleport = typeof cb.onTeleport === 'function' ? cb.onTeleport : null;
     this.onExit = typeof cb.onExit === 'function' ? cb.onExit : null;
     this.onToast = typeof cb.onToast === 'function' ? cb.onToast : null;
+    // Optional: fired when a *height* change is committed (stroke end, undo,
+    // import, reset) so world systems can re-ground houses, roads and props.
+    this._onStrokeEnd = typeof cb.onStrokeEnd === 'function' ? cb.onStrokeEnd : null;
 
     this.active = false;
     this.mode = 'raise';
@@ -593,6 +596,21 @@ export class TerrainEditorUI {
     }
   }
 
+  /**
+   * Tell the host that a height edit has been committed, so actors that are
+   * welded to the old surface (houses, roads, trees, landmarks, water) can be
+   * re-grounded. Colour-only strokes never fire this.
+   */
+  _notifyStrokeEnd(kind, bounds) {
+    if (kind !== 'height' || !this._onStrokeEnd) return;
+    const b = bounds || this._lastBounds;
+    try {
+      this._onStrokeEnd({ kind, bounds: b ? { ...b } : null });
+    } catch (err) {
+      console.warn('[terrain-editor] onStrokeEnd failed:', err);
+    }
+  }
+
   _refreshUndoCount() {
     const n = this.edits && isFiniteNum(this.edits.undoCount) ? this.edits.undoCount : 0;
     if (this._undoLabelEl) this._undoLabelEl.textContent = String(n);
@@ -614,6 +632,7 @@ export class TerrainEditorUI {
     const bounds = normalizeBounds(res);
     if (bounds) this._lastBounds = bounds;
     this._emitHeightChanged(bounds || this._lastBounds || null);
+    if (res && res.kind === 'height') this._notifyStrokeEnd('height', bounds);
     this._updateTelemetry();
   }
 
@@ -1013,6 +1032,7 @@ export class TerrainEditorUI {
       this._refreshUndoCount();
       this._lastBounds = FULL_BOUNDS;
       this._emitHeightChanged(FULL_BOUNDS);
+      this._notifyStrokeEnd('height', FULL_BOUNDS);
       this._toast(`Imported ${file.name}`);
     };
     reader.onerror = () => this._toast('Could not read file');
@@ -1053,6 +1073,7 @@ export class TerrainEditorUI {
     this._refreshUndoCount();
     this._lastBounds = FULL_BOUNDS;
     this._emitHeightChanged(FULL_BOUNDS);
+    this._notifyStrokeEnd('height', FULL_BOUNDS);
     this._toast('All terrain edits cleared');
   }
 
@@ -1220,9 +1241,10 @@ export class TerrainEditorUI {
     this._paintHeld = false;
     this._strokeStartElev = null;
 
+    let stroke = null;
     if (this.edits && typeof this.edits.endStroke === 'function') {
       try {
-        this.edits.endStroke();
+        stroke = this.edits.endStroke();
       } catch (err) {
         console.warn('[terrain-editor] endStroke failed:', err);
       }
@@ -1233,6 +1255,9 @@ export class TerrainEditorUI {
       console.warn('[terrain-editor] localStorage save failed:', err);
     }
     this._refreshUndoCount();
+    if (stroke && stroke.kind === 'height') {
+      this._notifyStrokeEnd('height', normalizeBounds(stroke.bounds));
+    }
     if (this._hoverWorld) this.updateCursorRing(this._hoverWorld.x, this._hoverWorld.z, this._heightFn);
     this._updateTelemetry();
   }

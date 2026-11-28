@@ -67,6 +67,12 @@ tests/vegetation_perf_test.mjs
 
 Diff volume: **9,126 insertions / 1,628 deletions** across the modified files.
 
+### Post-`fd73755` upgrades (latest pass)
+
+- **Cloud near-fade fixed:** `src/sim/clouds.js` fades cloud alpha per fragment over `smoothstep(48..200 m)` of `viewLen`, so the chase cam no longer washes the jet out in milky white when it flies through a deck.
+- **Stronger `F9` brushes + live object re-grounding:** height and colour brushes are 2× stronger, and `src/main.js` now re-grounds every terrain-dependent object live as you sculpt — houses/roofs/harbor quays, roads + bridge piers, 3D trees (throttled mid-drag at 160 ms) and, on stroke end / undo / reset / import, landmarks, highway traffic and inland water.
+- **Rebuilt Smart Autopilot:** `src/aircraft/autopilot.js` flies a multi-leg plan (`PATTERN → INTERCEPT → FINAL → FLARE → ROLLOUT`, and polar-orbit KC-135 `RENDEZVOUS → JOIN → CONTACT`) with a fixed `gearTarget` and an airborne speedbrake schedule. It is driven by the interactive hold-`H` **Command Prompt** + **Live Flight Plan Strip** (`src/ui/autopilot_menu.js`): hold `H` ≥ 380 ms to open the card (click a row or press `1`–`5` / `0` / `Esc`), and the strip renders the live leg pipeline while a smart mode is engaged. `update()` hands the autopilot `this.tanker` (the live orbit object, not the `_tankerState` telemetry snapshot) so orbit bank feedforward has `velocity` / `_omega` / `radius` / `anchor`.
+
 ### New test suites wired into `npm test`
 
 The gate grew from 26 to **33** suites (all passing). The seven added this session:
@@ -259,7 +265,7 @@ Key bindings:
 |---|---|
 | `F7` / `Ctrl+F` | Detached 6-DOF Free Cam (`src/main.js:704`) |
 | `H` tap | Toggle Controls Help |
-| `H` hold 450 ms | Smart autopilot cycle: `AUTO_LAND` → `AUTO_REFUEL` → manual |
+| `H` hold 380 ms | Smart Autopilot Command Prompt: `1`–`3` auto-land · `4` KC-135 · `5` ALT & HDG · `0` disengage · `Esc` cancel (click a row or press the digit) |
 | `M` | Big map (in Free Cam) |
 | `1–9` | Map / Free Cam jump presets |
 | `F9` | **Terrain & Color Paint Editor** (`src/ui/terrain_editor.js`, §2.8) |

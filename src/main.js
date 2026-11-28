@@ -34,6 +34,7 @@ import { TacticalOverlay } from './ui/tactical.js';
 import { KneeboardMap } from './ui/kneeboard.js';
 import { InspectorMap, camYawToHeadingDeg } from './ui/inspector_map.js';
 import { TerrainEditorUI } from './ui/terrain_editor.js';
+import { AutopilotPromptUI } from './ui/autopilot_menu.js';
 import { UI } from './ui/menu.js';
 import { spawnPoint, airportNear, airportsNear, setActiveDEM, setCustomAirports, terrainHeight } from './world/terrain.js';
 import { loadVipavaDEM, loadVipavaOSM, loadVipavaBuildings, loadVipavaWater } from './world/dem.js';
@@ -246,6 +247,21 @@ class App {
     this.hud = new HUD(document.getElementById('hud'));
     this.hud.setVisible(false);
 
+    // Hold-H Smart Autopilot Command Prompt + live flight-plan strip. The
+    // callbacks are the only action surface: the module owns its own DOM and
+    // never installs a global key hook (main.js routes keys to it).
+    this.autopilotPrompt = new AutopilotPromptUI({
+      onSelectLand: (ap) => this._startAutoLand(ap),
+      onSelectRefuel: () => this._startAutoRefuel(),
+      onSelectHold: () => this._startCruiseHold(),
+      onDisengage: () => this._disengageAutopilot(),
+      onClose: () => {
+        if (this.mode === 'fly' && !this.freeCam.active && !this.terrainEditor.active) {
+          this.input.requestPointerLock();
+        }
+      },
+    });
+
     // Feature 30/32 runtime systems: Soča canyon gates, selective bloom,
     // flight juice, weapon follow-cam and the frozen-photo camera.
     this.canyonRun = new CanyonRunSystem(this.scene);
@@ -272,6 +288,9 @@ class App {
     };
     this._vipavaRoads = [];
     this._vipavaWater = null;
+    this._vipavaLandmarks = null;
+    // Throttle clock for mid-stroke object re-grounding in the F9 editor.
+    this._lastRegroundAt = 0;
     this.inspectorMap = new InspectorMap({
       onTeleport: (x, z, agl, closeMap) => {
         const ground = this.world.heightAt(x, z);
@@ -309,6 +328,7 @@ class App {
       scene: this.scene,
       edits: this.terrainEdits,
       onHeightChanged: (bounds) => this._onTerrainEditsHeightChanged(bounds),
+      onStrokeEnd: (ev) => this._onTerrainEditsStrokeEnd(ev),
       onSaveProject: (jsonObj) => this._saveTerrainEditsToProject(jsonObj),
       onTeleport: (spot) => this._teleportTerrainEditor(spot),
       onExit: () => this.exitTerrainEditor(),
@@ -618,6 +638,7 @@ class App {
         this.world.landmarks.setLandmarks(osm?.landmarks || null);
         this._vipavaRoads = osm?.roads || [];
         this._vipavaWater = water || null;
+        this._vipavaLandmarks = osm?.landmarks || null;
         // Kneeboard map origin: the DEM centre is Ajdovščina (LJAJ).
         this._vipavaGeoOrigin = dem.meta
           ? { lat0: dem.meta.lat0, lon0: dem.meta.lon0 }
@@ -698,6 +719,7 @@ class App {
         this.world.landmarks.setLandmarks(null);
         this._vipavaGeoOrigin = null;
         this._vipavaPlaces = null;
+        this._vipavaLandmarks = null;
         if (this._proceduralSpawn) this.spawn = this._proceduralSpawn;
       }
     } else {
@@ -710,6 +732,7 @@ class App {
       this.world.landmarks.setLandmarks(null);
       this._vipavaGeoOrigin = null;
       this._vipavaPlaces = null;
+      this._vipavaLandmarks = null;
       if (this._proceduralSpawn) this.spawn = this._proceduralSpawn;
       this.carrier.placeNear(this.spawn.x, this.spawn.z);
     }
@@ -773,6 +796,14 @@ class App {
 
   onKey(e) {
     const code = e.code;
+    // Smart Autopilot Command Prompt owns 1-5 / 0 / Esc while it is open, so
+    // digits never reach the camera views and Esc never pauses the sim.
+    if (this.autopilotPrompt && this.autopilotPrompt.open) {
+      if (this.autopilotPrompt.handleKey(code)) {
+        e.preventDefault();
+        return;
+      }
+    }
     // F9: in-game Terrain & Color Paint Editor (works from flight and Free Cam).
     if (code === 'F9' && this.ready) {
       e.preventDefault();
@@ -955,52 +986,125 @@ class App {
   }
 
   /**
-   * Smart hold-H cycle: AUTO_LAND -> AUTO_REFUEL -> manual. Low fuel inside
-   * 18 km of the tanker prefers a refuel join straight away.
+   * Press-and-hold H: open (or close) the Smart Autopilot Command Prompt. The
+   * pilot then clicks an option OR presses 1-5 / 0 / Esc. The prompt releases
+   * the pointer lock so the OS cursor can hit the rows.
    */
   _engageSmartHoldH() {
     const f = this.aircraft.flight;
     if (!f || f.crashed) return;
 
-    const ap = this.world.airports.nearest(f.position.x, f.position.z, 80000);
-    const tanker = this._tankerState || this.tanker;
+    // Holding H again closes the prompt (onClose re-locks the pointer).
+    if (this.autopilotPrompt.open) {
+      this.autopilotPrompt.hide(true);
+      this.audio.click();
+      return;
+    }
+
     const fuelPct = this._fuelState
       ? (Number.isFinite(this._fuelState.pct) ? this._fuelState.pct : this._fuelState.fraction ?? 1)
       : 1;
 
-    if (this.autopilot.mode === 'AUTO_LAND') {
-      if (this.autopilot.engageAutoRefuel(f, tanker)) {
-        this.audio.click();
-        this.ui.toast('AUTO-REFUEL · JOINING KC-135 TANKER (HOLD H TO CANCEL)');
-      } else {
-        this.ui.toast('AUTO-REFUEL · TANKER UNAVAILABLE');
-      }
-      return;
+    // Up to three nearest airbases, closest first, with the distance/bearing
+    // the prompt renders. The procedural grid can report nothing, so fall back
+    // to the airport system's nearest().
+    let airports = this.world.airportsNear(f.position.x, f.position.z, 6) || [];
+    if (!airports.length && this.world.airports && typeof this.world.airports.nearest === 'function') {
+      const near = this.world.airports.nearest(f.position.x, f.position.z, 120000);
+      if (near) airports = [near];
     }
-    if (this.autopilot.mode === 'AUTO_REFUEL') {
-      this.autopilot.disengage();
-      this.audio.click();
-      this.ui.toast('AUTOPILOT · MANUAL CONTROL');
-      return;
+    airports = airports
+      .filter((ap) => ap && Number.isFinite(ap.x) && Number.isFinite(ap.z))
+      .map((ap) => {
+        const dx = ap.x - f.position.x;
+        const dz = ap.z - f.position.z;
+        return Object.assign({}, ap, {
+          distM: Math.hypot(dx, dz),
+          bearingDeg: (Math.atan2(dx, -dz) * 180 / Math.PI + 360) % 360,
+        });
+      })
+      .sort((a, b) => a.distM - b.distM)
+      .slice(0, 3);
+
+    // Tanker summary: orbit kinematics live on this.tanker, so read it directly.
+    let tanker = null;
+    if (this.tanker && this.tanker.position) {
+      const dx = this.tanker.position.x - f.position.x;
+      const dz = this.tanker.position.z - f.position.z;
+      tanker = {
+        distanceM: Math.hypot(dx, dz),
+        distM: Math.hypot(dx, dz),
+        bearingDeg: (Math.atan2(dx, -dz) * 180 / Math.PI + 360) % 360,
+        position: this.tanker.position,
+        speed: this.tanker.speed,
+        altitude: this.tanker.orbitAltitude,
+        altitudeM: this.tanker.orbitAltitude,
+        altM: this.tanker.orbitAltitude,
+        fuelPct,
+      };
     }
 
-    const tankerDist = tanker && tanker.position
-      ? Math.hypot(tanker.position.x - f.position.x, tanker.position.z - f.position.z)
-      : Infinity;
-    if (fuelPct < 0.30 && tankerDist <= 18000 && this.autopilot.engageAutoRefuel(f, tanker)) {
-      this.audio.click();
-      this.ui.toast('AUTO-REFUEL (LOW FUEL) · JOINING KC-135 (HOLD H FOR AIRBASE)');
-      return;
-    }
+    this.input.releasePointerLock();
+    this.autopilotPrompt.show({
+      airports,
+      tanker,
+      fuelPct,
+      onGround: !!f.onGround,
+      apMode: this.autopilot.mode,
+      apTarget: this.autopilot.targetLabel,
+      apPhase: this.autopilot.phase,
+    });
+  }
 
-    if (ap && this.autopilot.engageAutoLand(f, ap)) {
+  /** Prompt row 1-3: engage the multi-leg auto-land computer for `ap`. */
+  _startAutoLand(ap) {
+    if (!ap) return;
+    if (this.autopilot.engageAutoLand(this.aircraft.flight, ap)) {
       this._autoLandAirport = ap;
       this.audio.click();
-      this.ui.toast('AUTO-LAND · ' + (ap.code || ap.name) + ' (HOLD H FOR TANKER)');
-      return;
+      this.ui.toast('AUTO-LAND · ' + (ap.code || ap.name) + ' · PLAN ENGAGED');
+    } else {
+      this.ui.toast('AUTO-LAND · UNAVAILABLE');
     }
+    if (this.mode === 'fly' && !this.freeCam.active && !this.terrainEditor.active) {
+      this.input.requestPointerLock();
+    }
+  }
+
+  /** Prompt row 4: join the KC-135 polar orbit (full tanker kinematics). */
+  _startAutoRefuel() {
+    if (this.autopilot.engageAutoRefuel(this.aircraft.flight, this.tanker)) {
+      this.audio.click();
+      this.ui.toast('AUTO-REFUEL · KC-135 PLAN ENGAGED');
+    } else {
+      this.ui.toast('TANKER UNAVAILABLE');
+    }
+    if (this.mode === 'fly' && !this.freeCam.active && !this.terrainEditor.active) {
+      this.input.requestPointerLock();
+    }
+  }
+
+  /** Prompt row 5: latch the current altitude + heading as a cruise hold. */
+  _startCruiseHold() {
+    if (this.autopilot.mode !== 'ALT_HDG') {
+      this.autopilot.mode = 'OFF';
+      this.autopilot.cycleMode(this.aircraft.flight);
+      this.audio.click();
+      this.ui.toast('AUTOPILOT · ALT & HDG HOLD');
+    }
+    if (this.mode === 'fly' && !this.freeCam.active && !this.terrainEditor.active) {
+      this.input.requestPointerLock();
+    }
+  }
+
+  /** Prompt row 0: hand stick and throttle back to the pilot. */
+  _disengageAutopilot() {
+    this.autopilot.disengage();
     this.audio.click();
-    this.ui.toast('AUTOPILOT · NO AIRBASE IN RANGE');
+    this.ui.toast('AUTOPILOT · MANUAL CONTROL');
+    if (this.mode === 'fly' && !this.freeCam.active && !this.terrainEditor.active) {
+      this.input.requestPointerLock();
+    }
   }
 
   /**
@@ -1014,6 +1118,56 @@ class App {
     if (typeof t.invalidateBounds !== 'function') return;
     t.invalidateBounds(bounds.xMin, bounds.xMax, bounds.zMin, bounds.zMax);
     if (typeof t._buildPending === 'function') t._buildPending(6, 8);
+    // Live object re-grounding: houses, quays, roads, bridges and trees follow
+    // the sculpt. Throttled so a fast drag still paints at 60 FPS.
+    const now = performance.now();
+    if (now - this._lastRegroundAt >= 160) {
+      this._lastRegroundAt = now;
+      this._regroundTerrainFeatures(false);
+    }
+  }
+
+  /**
+   * Re-ground every world object that samples terrainHeight(): buildings,
+   * roads + bridge piers and 3D trees on every call; landmarks, highway traffic
+   * and inland water only on a full pass (stroke end / undo / reset / import).
+   */
+  _regroundTerrainFeatures(full = false) {
+    if (!this.world || !this.camera) return;
+    // Re-ground buildings (houses, roofs, harbor quays, street lamps)
+    this.world.buildings?.invalidateGroundCache?.();
+    this.world.buildings?.rebuild?.(this.camera);
+    // Re-drape roads and bridge piers
+    this.world.roads?.invalidate?.();
+    this.world.roads?.update?.(this.camera);
+    // Re-ground 3D trees
+    this.world.vegetation?.clearCaches?.();
+    this.world.vegetation?.clearCellCache?.();
+    this.world.vegetation?.rebuild?.(this.camera);
+    if (full) {
+      // Re-ground landmarks, highway traffic, and inland water after stroke end / undo / reset / import
+      if (this._vipavaLandmarks) this.world.landmarks?.setLandmarks?.(this._vipavaLandmarks);
+      if (this._vipavaRoads?.length) {
+        this.world.roadTraffic?.setCustomRoads?.(this._vipavaRoads, (x, z) => this.world.heightAt(x, z));
+      }
+      if (this._vipavaWater) this.world.inlandWater?.setWaterData?.(this._vipavaWater);
+    }
+  }
+
+  /**
+   * A height stroke committed (stroke end / undo / reset / import): rebuild the
+   * touched tiles properly, then do a full re-ground of every dependent object.
+   */
+  _onTerrainEditsStrokeEnd(ev) {
+    if (ev && ev.bounds && this.world?.terrain) {
+      const t = this.world.terrain;
+      if (typeof t.invalidateBounds === 'function') {
+        t.invalidateBounds(ev.bounds.xMin, ev.bounds.xMax, ev.bounds.zMin, ev.bounds.zMax);
+      }
+      if (typeof t._buildPending === 'function') t._buildPending(12, 16);
+    }
+    this._regroundTerrainFeatures(true);
+    this._lastRegroundAt = performance.now();
   }
 
   /**
@@ -1059,6 +1213,8 @@ class App {
    */
   toggleTerrainEditor() {
     if (!this.ready) return;
+    this.autopilotPrompt?.hide(false);
+    this.autopilotPrompt?.updatePlanStrip(null);
     if (this.terrainEditor.active) {
       this.exitTerrainEditor();
       return;
@@ -1088,6 +1244,8 @@ class App {
 
   /** F7: detached 6-DOF spectator camera for fast world inspection without flying. */
   toggleFreeCam() {
+    this.autopilotPrompt?.hide(false);
+    this.autopilotPrompt?.updatePlanStrip(null);
     if (this.freeCam.active) {
       // Leaving Free Cam also closes the painter: it cannot paint without a
       // streaming camera under the cursor.
@@ -1766,6 +1924,9 @@ class App {
 
   pause() {
     if (this.mode !== 'fly') return;
+    // The prompt/strip are flight-only glass: never linger over the pause card.
+    this.autopilotPrompt?.hide(false);
+    this.autopilotPrompt?.updatePlanStrip(null);
     this.mode = 'pause';
     // ESC unlocks the pointer so the player can click Reload — persist the
     // exact flight pose here, before the unload flush can see 'pause' mode.
@@ -1937,6 +2098,8 @@ class App {
   }
 
   returnToMenu() {
+    this.autopilotPrompt?.hide(false);
+    this.autopilotPrompt?.updatePlanStrip(null);
     this.mode = 'menu';
     this.audio.setPaused(true);
     // Feature 30/32/33: tear down every in-flight overlay system before the
@@ -2102,9 +2265,9 @@ class App {
 
     let cmd = NEUTRAL_CMD;
     if (fly) {
-      // Press-and-hold H: after 450 ms the smart autopilot takes over.
+      // Press-and-hold H: after 380 ms the Smart Autopilot Prompt opens.
       if (!this.ejection.active && this._keyHDownAt > 0 && !this._keyHHeldFired
-        && (performance.now() - this._keyHDownAt) >= 450) {
+        && (performance.now() - this._keyHDownAt) >= 380) {
         this._keyHHeldFired = true;
         this._engageSmartHoldH();
       }
@@ -2113,7 +2276,10 @@ class App {
       if (!this.ejection.active) {
         const apCtx = this._apContext;
         apCtx.airport = this._autoLandAirport;
-        apCtx.tanker = this._tankerState || this.tanker;
+        // The LIVE tanker object is the only one carrying the orbit kinematics
+        // (velocity, _omega, radius, anchor) the polar-orbit bank feedforward
+        // needs — `_tankerState` is its flat telemetry snapshot.
+        apCtx.tanker = this.tanker;
         apCtx.fuel = this._fuelState;
         cmd = this.autopilot.computeCommand(this.aircraft.flight, cmd, apCtx);
         const apNotice = this.autopilot.consumeNotice();
@@ -2125,6 +2291,20 @@ class App {
       if (this._fuelState && this._fuelState.empty) {
         this.aircraft.flight.targetThrottle = 0;
       }
+
+      // Live flight-plan strip: AUTO_LAND / AUTO_REFUEL only, rebuilt only when
+      // the printed markup changes (safe to call every frame).
+      if (!this.ejection.active && typeof this.autopilot.getPlanSummary === 'function') {
+        const fuelPct = this._fuelState
+          ? (Number.isFinite(this._fuelState.pct) ? this._fuelState.pct : this._fuelState.fraction ?? 1)
+          : 1;
+        this.autopilotPrompt.updatePlanStrip(this.autopilot.getPlanSummary(), { fuelPct });
+      } else {
+        this.autopilotPrompt.updatePlanStrip(null);
+      }
+    } else {
+      // Menu / pause / crash: the plan strip is flight-only glass.
+      this.autopilotPrompt.updatePlanStrip(null);
     }
 
     this._replayActive = fly && this.replay.playing && this.replay.count >= 2;
@@ -2615,6 +2795,8 @@ class App {
   }
 
   onCrash() {
+    this.autopilotPrompt?.hide(false);
+    this.autopilotPrompt?.updatePlanStrip(null);
     this.mode = 'crash';
     this._crashTimer = 0;
     this.aircraft.setMode('chase');

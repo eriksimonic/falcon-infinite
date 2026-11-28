@@ -27,13 +27,15 @@ const Q_MAX = 32767;
 
 // Colour brush targets, in 0..255 bytes where 128 == 1.0x.
 // `rgbMul` softens the RGB pull for modes that should mostly cool things down.
+// Every target leans hard on purpose: a 50% slider must already read as a
+// decisive change, not a hint of one.
 const COLOR_MODES = {
-  desaturate: { rgb: [126, 118, 114], a: 58, rgbMul: 0.55 },
-  darken: { rgb: [76, 78, 74], a: null },
-  lighten: { rgb: [178, 176, 170], a: null },
-  deep_forest: { rgb: [92, 104, 86], a: 106 },
-  warm_olive: { rgb: [146, 132, 102], a: 96 },
-  karst_stone: { rgb: [154, 150, 140], a: 72 },
+  desaturate: { rgb: [118, 108, 104], a: 24, rgbMul: 0.55 },
+  darken: { rgb: [34, 36, 34], a: null },
+  lighten: { rgb: [226, 224, 216], a: null },
+  deep_forest: { rgb: [54, 68, 50], a: 84 },
+  warm_olive: { rgb: [164, 140, 88], a: 82 },
+  karst_stone: { rgb: [188, 182, 168], a: 44 },
   erase_color: { rgb: [NEUTRAL, NEUTRAL, NEUTRAL], a: NEUTRAL },
 };
 
@@ -46,13 +48,16 @@ function quantize(metres) {
   return q < Q_MIN ? Q_MIN : q > Q_MAX ? Q_MAX : q;
 }
 
-function lerpByte(from, to, k) {
+function lerpByte(from, to, k, force = false) {
   if (from === to) return to;
+  if (!(k > 0)) return from;
   const v = from + (to - from) * k;
   let r = Math.round(v);
   // A sub-unit pull would otherwise stall one byte short of the target
   // forever, so force at least one byte of progress while the rate is real.
-  if (r === from && k >= 0.05) r = from + (to > from ? 1 : -1);
+  // Erase passes `force` because a tint stranded one or two bytes off neutral
+  // inside a wide, faint ring would keep `hasColorEdits` true forever.
+  if (r === from && (force || k >= 0.05)) r = from + (to > from ? 1 : -1);
   return clampNum(r, 0, 255);
 }
 
@@ -423,12 +428,14 @@ export class TerrainEdits {
         const cur = curQ / HEIGHT_SCALE;
         let next = cur;
         let goal = null; // where this cell is heading (for sub-quantum snapping)
+        // Rates are deliberately aggressive: 50% strength == the old 100%
+        // feel, so a half-slider stroke is never sluggish.
         if (mode === 'raise') {
-          next = cur + strength * 12 * dt * w;
+          next = cur + strength * 24 * dt * w;
         } else if (mode === 'lower') {
-          next = cur - strength * 12 * dt * w;
+          next = cur - strength * 24 * dt * w;
         } else if (mode === 'flatten') {
-          const k = clampNum(strength * 6 * dt * w, 0, 1);
+          const k = clampNum(strength * 12 * dt * w, 0, 1);
           const base = typeof baseHeightAt === 'function'
             ? (Number(baseHeightAt(wx, wz)) || 0) : 0;
           const total = base + cur;
@@ -436,7 +443,7 @@ export class TerrainEdits {
           next = (total + (goalY - total) * k) - base;
           goal = goalY - base;
         } else if (mode === 'smooth') {
-          const k = clampNum(strength * 5 * dt * w, 0, 0.85);
+          const k = clampNum(strength * 10 * dt * w, 0, 0.90);
           const nz0 = Math.max(0, iz - 1);
           const nz1 = Math.min(n - 1, iz + 1);
           const avg = (
@@ -448,7 +455,7 @@ export class TerrainEdits {
           next = cur + (avg - cur) * k;
           goal = avg;
         } else { // erase_height
-          const k = clampNum(strength * 6 * dt * w, 0, 1);
+          const k = clampNum(strength * 12 * dt * w, 0, 1);
           next = cur + (0 - cur) * k;
           goal = 0;
         }
@@ -539,17 +546,18 @@ export class TerrainEdits {
         const d = Math.hypot(wx - x, wz - z);
         const w = falloff(d, radius);
         if (w <= 0) continue;
-        const rate = Math.min(1, strength * 3.5 * dt * w);
+        const rate = Math.min(1, strength * 7.8 * dt * w);
         if (rate <= 0) continue;
 
         const p = this._getColorPixelIndex(ix, iz);
         const o = p * 4;
         const cur = this.colorData;
+        const erase = mode === 'erase_color';
         const kr = rate * rgbMul;
-        const nr = lerpByte(cur[o], def.rgb[0], kr);
-        const ng = lerpByte(cur[o + 1], def.rgb[1], kr);
-        const nb = lerpByte(cur[o + 2], def.rgb[2], kr);
-        const na = def.a === null ? cur[o + 3] : lerpByte(cur[o + 3], def.a, rate);
+        const nr = lerpByte(cur[o], def.rgb[0], kr, erase);
+        const ng = lerpByte(cur[o + 1], def.rgb[1], kr, erase);
+        const nb = lerpByte(cur[o + 2], def.rgb[2], kr, erase);
+        const na = def.a === null ? cur[o + 3] : lerpByte(cur[o + 3], def.a, rate, erase);
         if (nr === cur[o] && ng === cur[o + 1] && nb === cur[o + 2] && na === cur[o + 3]) continue;
 
         updates.push(ix, iz, nr, ng, nb, na);

@@ -94,7 +94,6 @@ KRAS_LON_W, KRAS_LON_E = 13.74, 13.88
 
 CAL_MIN, CAL_MAX = 0.50, 2.50   # sanity guard; gain=1 on Kras is guaranteed below
 GAIN_MIN, GAIN_MAX = 0.52, 1.28  # per-pixel multiplicative correction
-GAIN_EPS = 12.0                  # keeps the ratio sane in near-black pixels
 LUM_GAIN_MIN = 0.90              # never pull a survey down harder than 10%
 LUM_R, LUM_G, LUM_B = 0.2126, 0.7152, 0.0722
 BLUR_RADIUS = 6                  # px on the 512-wide grid (~0.5-6 km)
@@ -386,8 +385,7 @@ def build_gain_maps(esri_small, s2_small, cal, kras_box):
     ep = esri_lf.tobytes()
     sp = s2_lf.tobytes()
     n = w * h
-    c0, c1, c2 = cal
-    cal_r, cal_g, cal_b = c0, c1, c2
+    cal_r, cal_g, cal_b = cal
     gmin, gmax = GAIN_MIN, GAIN_MAX
     gains = [array("f", bytes(4 * n)) for _ in range(3)]
     g_r, g_g, g_b = gains

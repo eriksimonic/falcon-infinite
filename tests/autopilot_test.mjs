@@ -7,6 +7,7 @@ import * as THREE from 'three';
 import { FlightModel } from '../src/aircraft/flight.js';
 import { AutopilotSystem, ILSComputer } from '../src/aircraft/autopilot.js';
 import { events, on, off } from '../src/core/events.js';
+import { TankerSystem, FuelSystem } from '../src/sim/fuel.js';
 
 let checks = 0;
 const failures = [];
@@ -752,6 +753,227 @@ function ilsFlight(x, z, y, heading = 90, onGround = false, agl) {
   ok(apSim.mode === 'ALT_HDG', 'closed-loop refuel ends in ALT_HDG');
   ok(apSim.consumeNotice() === 'REFUEL COMPLETE · BREAKING AWAY',
     'closed-loop refuel posts REFUEL COMPLETE');
+}
+
+// -------------- 10. real FlightModel closed-loop off-axis auto-land
+{
+  const RAD = Math.PI / 180;
+
+  const landAp = {
+    x: 0, z: 0, elevation: 100, heading: 90, length: 3000, width: 45,
+    code: 'LJAJ', name: 'Ajdovščina',
+  };
+  const world = { heightAt: () => 100, slopeAt: () => 0 };
+  const weather = {
+    windAt: (x, z, alt, out) => { out.set(0, 0, 0); return out; },
+    state: { turbulence: 0, gust: 0 },
+  };
+  const base = () => ({
+    pitch: 0, roll: 0, yaw: 0, throttleDelta: 0,
+    gearToggle: false, flapsToggle: false, brake: false,
+  });
+
+  // 2.5 km east / 7.5 km north of the field, 1100 m above it and pointed
+  // away from the approach: a genuine off-axis engagement, gear up.
+  const f = new FlightModel();
+  f.reset({ x: 2500, y: 1200, z: -7500, heading: 200 });
+  f.onGround = false;
+  f.gearDown = false;
+  f.gearTarget = 0;
+  f.gearPos = 0;
+  f.speed = 195;
+  f.velocity.set(Math.sin(200 * RAD) * 195, 0, -Math.cos(200 * RAD) * 195);
+  f.throttle = 0.55;
+  f.targetThrottle = 0.55;
+  ok(!f.gearDown && f.gearPos === 0, 'auto-land starts with the gear up');
+
+  const ap = new AutopilotSystem();
+  ok(ap.engageAutoLand(f, landAp) === true, 'auto-land engages on a real FlightModel');
+
+  const plan0 = ap.getPlanSummary();
+  ok(Array.isArray(plan0.steps) && plan0.steps.length === 5,
+    'auto-land plan exposes 5 steps', plan0.steps && plan0.steps.length);
+  ok(plan0.steps.map((s) => s.id).join(',') === 'PATTERN,INTERCEPT,FINAL,FLARE,ROLLOUT',
+    'auto-land plan is the full approach sequence', plan0.steps.map((s) => s.id).join(','));
+  ok(plan0.steps.every((s) => typeof s.label === 'string' && s.label.length > 0
+    && ['done', 'active', 'pending'].includes(s.status)),
+    'every plan step carries a label and a status');
+  ok(plan0.steps.some((s) => s.status === 'active'), 'plan marks the active leg',
+    plan0.steps.map((s) => s.status).join(','));
+
+  const ctx = { airport: landAp, terrainHeight: () => 100 };
+  const dt = 1 / 60;
+  const phases = new Set();
+  let touchdown = null;
+  let frames = 0;
+
+  for (let i = 0; i < 60 * 240; i++) {
+    frames = i + 1;
+    const cmd = ap.computeCommand(f, base(), ctx);
+    phases.add(ap.phase);
+    const wasAir = !f.onGround;
+    f.update(dt, cmd, world, weather);
+    if (wasAir && f.onGround && !touchdown) {
+      // RWY 09/27 lies along z = 0, so |z| is the cross-track error and the
+      // 3 km pavement spans |x| <= 1500.
+      touchdown = {
+        t: frames / 60,
+        lateral: f.position.z,
+        x: f.position.x,
+        gearPos: f.gearPos,
+        sink: -f.verticalSpeed,
+        speed: f.speed,
+      };
+    }
+    if (ap.mode === 'OFF') break;
+  }
+
+  ok(phases.has('PATTERN') && phases.has('INTERCEPT') && phases.has('FINAL')
+    && phases.has('FLARE') && phases.has('ROLLOUT'),
+    'real-airframe auto-land flies the whole pattern', [...phases].join(','));
+  ok(!!touchdown, 'real-airframe auto-land reaches the runway');
+  if (touchdown) {
+    ok(touchdown.gearPos > 0.9, 'gear is down and locked at touchdown',
+      touchdown.gearPos.toFixed(2));
+    ok(Math.abs(touchdown.lateral) < 80, 'touchdown is on the runway centreline',
+      `${touchdown.lateral.toFixed(1)} m lateral`);
+    ok(Math.abs(touchdown.x) < 1500, 'touchdown is on the pavement',
+      `${touchdown.x.toFixed(0)} m along`);
+    ok(touchdown.sink < 3.5, 'touchdown sink rate is inside the gear limit',
+      `${touchdown.sink.toFixed(2)} m/s`);
+    ok(touchdown.speed < 100, 'touchdown speed is near on-speed',
+      `${touchdown.speed.toFixed(0)} m/s`);
+  }
+  ok(!f.crashed, 'real-airframe auto-land never crashes', f.crashReason);
+  ok(ap.mode === 'OFF', 'real-airframe auto-land rolls to a stop and disengages', ap.mode);
+  ok(f.speed < 5, 'jet is stopped after the rollout', f.speed.toFixed(2));
+  const notice = ap.consumeNotice();
+  ok(String(notice).startsWith('AUTO-LAND COMPLETE'),
+    'real-airframe auto-land posts its completion notice', String(notice));
+  ok(ap.getPlanSummary().steps.every((s) => s.status === 'done'),
+    'completed plan marks every leg done');
+  ok(frames < 60 * 240, 'auto-land finishes inside the 240 s budget',
+    `${(frames / 60).toFixed(1)} s`);
+}
+
+// ---- 11. real FlightModel + real orbiting TankerSystem auto-refuel
+{
+  const RAD = Math.PI / 180;
+
+  const world = { heightAt: () => 100, slopeAt: () => 0 };
+  const weather = {
+    windAt: (x, z, alt, out) => { out.set(0, 0, 0); return out; },
+    state: { turbulence: 0, gust: 0 },
+  };
+  const base = () => ({
+    pitch: 0, roll: 0, yaw: 0, throttleDelta: 0,
+    gearToggle: false, flapsToggle: false, brake: false,
+  });
+
+  const tanker = new TankerSystem(null);
+  const fuel = new FuelSystem();
+  fuel.fuelLb = 3500;
+  fuel.fraction = 0.5;
+  tanker.update(0, null); // prime the orbit pose before engaging
+  ok(Math.abs(tanker.radius - 7500) < 1e-9 && tanker._omega > 0,
+    'live tanker flies a clockwise 7.5 km orbit', `${tanker.radius} m / ${tanker._omega} rad/s`);
+  ok(Math.abs(Math.hypot(tanker.position.x - tanker.anchor.x, tanker.position.z - tanker.anchor.z)
+    - tanker.radius) < 1, 'primed tanker sits on its orbit');
+
+  // Spawn 3.2 km astern and 1.4 km inside the circle, 45° off the tanker's
+  // heading, 400 m low and 35 m/s fast: a full off-axis rejoin.
+  const fwd = new THREE.Vector3(tanker.velocity.x, 0, tanker.velocity.z).normalize();
+  const inward = new THREE.Vector3(-fwd.z, 0, fwd.x); // orbit-centre side
+  const spawn = tanker.position.clone().addScaledVector(fwd, -3200).addScaledVector(inward, 1400);
+  const spawnHdg = ((tanker.heading + 45) % 360 + 360) % 360;
+
+  const f = new FlightModel();
+  f.reset({ x: spawn.x, y: 2600, z: spawn.z, heading: spawnHdg });
+  f.onGround = false;
+  f.gearDown = false;
+  f.gearTarget = 0;
+  f.gearPos = 0;
+  f.speed = 200;
+  f.throttle = 0.6;
+  f.targetThrottle = 0.6;
+  f.velocity.set(Math.sin(spawnHdg * RAD) * 200, 0, -Math.cos(spawnHdg * RAD) * 200);
+
+  // A custom orbiting tanker that exposes no `anchor` must produce identical
+  // commands: the law reconstructs the centre from position/velocity/radius.
+  const mockTanker = {
+    position: tanker.position.clone(),
+    velocity: tanker.velocity.clone(),
+    heading: tanker.heading,
+    speed: tanker.speed,
+    radius: tanker.radius,
+    _omega: tanker._omega,
+  };
+  const probe = makeJet({ x: spawn.x, y: spawn.y, z: spawn.z, heading: spawnHdg, speed: 200 });
+  const apReal = new AutopilotSystem();
+  apReal.engageAutoRefuel(probe, tanker);
+  const realCmd = apReal.computeCommand(probe, neutral(),
+    { tanker, fuel: { fraction: 0.5 }, terrainHeight: () => 100 });
+  const apMock = new AutopilotSystem();
+  apMock.engageAutoRefuel(probe, mockTanker);
+  const mockCmd = apMock.computeCommand(probe, neutral(),
+    { tanker: mockTanker, fuel: { fraction: 0.5 }, terrainHeight: () => 100 });
+  ok(apMock.phase === 'RENDEZVOUS', 'anchor-less orbit mock starts in RENDEZVOUS', apMock.phase);
+  ok(Math.abs(realCmd.roll - mockCmd.roll) < 1e-9 && Math.abs(realCmd.pitch - mockCmd.pitch) < 1e-9,
+    'orbit centre is recovered from position/velocity without an anchor',
+    `roll ${realCmd.roll.toFixed(6)} vs ${mockCmd.roll.toFixed(6)}`);
+
+  const ap = new AutopilotSystem();
+  ok(ap.engageAutoRefuel(f, tanker) === true, 'auto-refuel engages on a real FlightModel');
+  ok(ap.mode === 'AUTO_REFUEL' && ap.phase === 'RENDEZVOUS',
+    'real-airframe auto-refuel starts in RENDEZVOUS', ap.phase);
+
+  const ctx = { tanker, fuel, terrainHeight: () => 100 };
+  const dt = 1 / 60;
+  const phases = new Set();
+  let contactTicks = 0;
+  let firstContact = null;
+  let bestRange = Infinity;
+  let ended = '';
+  let secs = 0;
+
+  for (let i = 0; i < 60 * 220; i++) {
+    secs = (i + 1) / 60;
+    const cmd = ap.computeCommand(f, base(), ctx);
+    phases.add(ap.phase);
+    tanker.update(dt, f);
+    fuel.update(dt, f, tanker.contact);
+    f.update(dt, cmd, world, weather);
+    if (f.crashed) { ended = 'crash · ' + f.crashReason; break; }
+    if (tanker.contact) {
+      contactTicks++;
+      if (firstContact === null) firstContact = secs;
+    }
+    bestRange = Math.min(bestRange, Math.hypot(
+      f.position.x - tanker.position.x,
+      f.position.y - tanker.position.y,
+      f.position.z - tanker.position.z));
+    if (ap.mode !== 'AUTO_REFUEL') { ended = ap.mode; break; }
+  }
+
+  ok(phases.has('RENDEZVOUS'), 'real refuel rejoins from the far side of the orbit',
+    [...phases].join(','));
+  ok(phases.has('JOIN'), 'real refuel passes through JOIN', [...phases].join(','));
+  ok(phases.has('CONTACT'), 'real refuel reaches boom CONTACT', [...phases].join(','));
+  ok(!f.crashed, 'real-airframe auto-refuel never crashes', f.crashReason);
+  ok(contactTicks >= 60, 'boom contact is sustained for at least a second',
+    `${contactTicks} ticks, first at ${firstContact === null ? 'never' : firstContact.toFixed(1)} s (${secs.toFixed(0)} s flown, ended ${ended || 'still flying'})`);
+  ok(bestRange < 45, 'the jet closes onto the boom', `${bestRange.toFixed(1)} m`);
+  ok(Math.abs(f.position.y - tanker.position.y) < 40,
+    'real refuel holds station below the tanker',
+    `${(f.position.y - tanker.position.y).toFixed(1)} m`);
+  const fullBreakaway = fuel.fraction >= 0.995 && ap.mode === 'ALT_HDG';
+  ok(fuel.fraction > 0.70 || fullBreakaway,
+    'the boom actually transfers fuel', `fraction ${fuel.fraction.toFixed(3)} (${ended || 'still flying'})`);
+  if (fullBreakaway) {
+    const breakaway = ap.consumeNotice();
+    ok(breakaway === 'REFUEL COMPLETE · BREAKING AWAY',
+      'a full tank breaks away cleanly with a notice', String(breakaway));
+  }
 }
 
 // ---------------------------------------------------------------- summary

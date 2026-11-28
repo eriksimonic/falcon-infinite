@@ -1830,6 +1830,16 @@ export class BuildingSystem {
     this.stats.ruinFires = 0;
   }
 
+  /**
+   * Drop cached building ground elevations so rebuild() re-samples edited
+   * terrain. Called after a height stroke, undo, import or reset.
+   */
+  invalidateGroundCache() {
+    this._groundCache = new WeakMap();
+    this._lastX = Infinity;
+    this._lastZ = Infinity;
+  }
+
   // -------------------------------------------------------------------------
   // Grounding cache: 5-point rotated corners + center + terrain-LOD sag margin.
   // -------------------------------------------------------------------------

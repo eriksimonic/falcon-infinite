@@ -706,6 +706,16 @@ export class RoadNetwork {
     this.stats.piers = 0;
   }
 
+  /**
+   * Drop the baked ribbon and bridge piers so the next update() re-samples
+   * terrainHeight() for every road and pier (used after terrain sculpting).
+   */
+  invalidate() {
+    this._lastX = Infinity;
+    this._lastZ = Infinity;
+    if (this._built) this._clear();
+  }
+
   _rebuild(camera) {
     const cx = camera.position.x;
     const cz = camera.position.z;
