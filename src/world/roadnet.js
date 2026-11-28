@@ -441,6 +441,63 @@ export class RoadNetwork {
       polygonOffsetFactor: -3,
       polygonOffsetUnits: -3,
     });
+
+    // VI PER-ATMOS parity for asphalt: a far ribbon must dissolve into the same
+    // height-aware Rayleigh + Mie air as the terrain heightfield instead of
+    // staying a crisp dark line across a hazy valley. The formula is injected
+    // into the stock Lambert program so the map, lighting and fog chain stay
+    // untouched; `uRoad*` uniforms are shared with `update(camera, sky)`.
+    this._atmosUniforms = {
+      uRoadSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.2) },
+      uRoadSunColor: { value: new THREE.Color(0xfff2d0) },
+      uRoadSkyColor: { value: new THREE.Color(0x8fb4c8) },
+    };
+    this.material.customProgramCacheKey = () => 'road-aerial-v1';
+    this.material.onBeforeCompile = (shader) => {
+      shader.uniforms.uRoadSunDir = this._atmosUniforms.uRoadSunDir;
+      shader.uniforms.uRoadSunColor = this._atmosUniforms.uRoadSunColor;
+      shader.uniforms.uRoadSkyColor = this._atmosUniforms.uRoadSkyColor;
+
+      shader.vertexShader = 'varying vec3 vRoadWorld;\n' + shader.vertexShader.replace(
+        '#include <worldpos_vertex>',
+        /* glsl */`#include <worldpos_vertex>
+        vRoadWorld = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz;`,
+      );
+
+      shader.fragmentShader = 'uniform vec3 uRoadSunDir, uRoadSunColor, uRoadSkyColor;\n'
+        + 'varying vec3 vRoadWorld;\n' + shader.fragmentShader.replace(
+          '#include <opaque_fragment>',
+          /* glsl */`
+        // Identical Rayleigh + Mie aerial perspective to terrainview.js
+        // (VI PER-ATMOS), driven by the same uSunDir/uSunColor/uSkyColor. It is
+        // applied to the linear outgoingLight BEFORE tonemapping and color-space
+        // encoding — exactly where terrainview.js runs it — so asphalt hazes on
+        // the same physical curve as the heightfield instead of on an encoded one.
+        {
+          float roadDist = length( cameraPosition - vRoadWorld );
+          vec3 roadViewDir = normalize( vRoadWorld - cameraPosition );
+          float dayVis = smoothstep( -0.05, 0.25, uRoadSunDir.y );
+          float lowAir = 1.0 - smoothstep( 100.0, 2600.0, 0.5 * ( cameraPosition.y + vRoadWorld.y ) );
+          float aerialT = 1.0 - exp( -roadDist * ( 0.000024 + lowAir * 0.000020 ) );
+          aerialT = clamp( aerialT * smoothstep( 2500.0, 9000.0, roadDist ), 0.0, 0.72 );
+          vec3 rayleighBlue = mix( vec3( 0.42, 0.58, 0.80 ), vec3( 0.54, 0.68, 0.86 ),
+            smoothstep( 0.0, 0.5, uRoadSunDir.y ) );
+          rayleighBlue = mix( rayleighBlue, uRoadSkyColor, 0.16 * dayVis );
+          float sunAlign = max( dot( roadViewDir, uRoadSunDir ), 0.0 );
+          float miePhase = pow( sunAlign, 4.0 ) * 0.65 + pow( sunAlign, 18.0 ) * 0.35;
+          vec3 dustGlow = mix( vec3( 0.92, 0.76, 0.56 ), uRoadSunColor, 0.55 );
+          vec3 atmosCol = mix( rayleighBlue, dustGlow,
+            clamp( miePhase * ( 0.45 + lowAir * 0.40 ), 0.0, 0.72 ) );
+          float distDesat = aerialT * 0.35 * dayVis;
+          float roadLum = dot( outgoingLight, vec3( 0.2126, 0.7152, 0.0722 ) );
+          outgoingLight = mix( outgoingLight, vec3( roadLum ), distDesat );
+          outgoingLight = mix( outgoingLight, atmosCol, aerialT * 0.62 * dayVis );
+          outgoingLight += dustGlow * miePhase * aerialT * 0.14 * dayVis * ( 0.5 + 0.5 * lowAir );
+        }
+        #include <opaque_fragment>`,
+        );
+    };
+
     this.mesh = new THREE.Mesh(new THREE.BufferGeometry(), this.material);
     this.mesh.name = 'highways';
     // Drawn after inland water (renderOrder 0) so highways/viaducts layer on
@@ -691,8 +748,16 @@ export class RoadNetwork {
     this.stats.piers = data.piers.length;
   }
 
-  update(camera) {
+  update(camera, sky = null) {
     if (!camera || !camera.position) return;
+    // Keep the road haze in the same atmosphere as the sky dome. `sky` is
+    // optional so a one-argument caller (and headless tests) behaves as before.
+    if (sky) {
+      const a = this._atmosUniforms;
+      if (sky.sunDir) a.uRoadSunDir.value.copy(sky.sunDir);
+      if (sky.sunColor) a.uRoadSunColor.value.copy(sky.sunColor);
+      if (sky.skyColor) a.uRoadSkyColor.value.copy(sky.skyColor);
+    }
     if (!this.preset || (!this.preset.roadDetail && !this.customRoads)) {
       if (this._built) this._clear();
       return;

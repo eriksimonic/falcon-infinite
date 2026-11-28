@@ -5,7 +5,7 @@ export const CONFIG = {
   render: {
     fov: 62,
     near: 0.3,
-    far: 70000,
+    far: 160000, // 160 km: the horizon mountain ring reaches 135 km
     fogDensity: 0.000016,
     exposure: 1.18,
   },
@@ -16,8 +16,10 @@ export const CONFIG = {
     terrainMinSize: 128,
     terrainMaxLevel: 8,
     terrainDetailDistance: 1.55,
-    tileCacheLimit: 900,
-    waterSize: 260000,
+    tileCacheLimit: 1100,
+    // Water plane must outlive the 160 km far plane so the sea never shows an
+    // edge seam at the horizon.
+    waterSize: 360000,
   },
 
   aircraft: {
@@ -42,8 +44,8 @@ export const CONFIG = {
     chaseDistance: 26,
     chaseHeight: 7.5,
     wingOffset: [7.5, 1.6, 4.0],
-    cockpitFov: 52,
-    externalFov: 50,
+    cockpitFov: 84,
+    externalFov: 66,
     mouseSensitivity: 0.0022,
   },
 
@@ -84,7 +86,7 @@ export const QUALITY = {
     treeLimit: 9000,
     airportRadius: 45000,
     roadDetail: true,
-    shadows: false,
+    shadows: true,
   },
   high: {
     name: 'high',
@@ -100,7 +102,7 @@ export const QUALITY = {
     treeLimit: 18000,
     airportRadius: 60000,
     roadDetail: true,
-    shadows: false,
+    shadows: true,
   },
 };
 

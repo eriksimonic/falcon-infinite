@@ -289,7 +289,12 @@ export class AirTrafficSystem {
     if (t.count < TRAIL_POINTS) t.count++;
 
     t.line.geometry.setDrawRange(0, t.count);
-    t.line.geometry.attributes.position.needsUpdate = true;
+    // Only the live vertices moved (copyWithin shifted the rest down), so
+    // upload the active prefix instead of the whole TRAIL_POINTS buffer.
+    const posAttr = t.line.geometry.attributes.position;
+    posAttr.clearUpdateRanges();
+    posAttr.addUpdateRange(0, t.count * 3);
+    posAttr.needsUpdate = true;
   }
 
   // ---------------------------------------------------------------- wingman

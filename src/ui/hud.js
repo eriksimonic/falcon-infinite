@@ -9,6 +9,13 @@ const MUTED = 'rgba(186,214,199,0.62)';
 const AMBER = '#ffc46b';
 const RED = '#ff6b5e';
 
+// Monospace stacks for the two HUD dialects (external telemetry dock vs cockpit).
+const MONO_EXT = 'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
+const MONO_CPT = 'ui-monospace, monospace';
+// Full-screen 2D redraw: above DPR 1.5 the extra backing-store pixels buy no
+// legible sharpness for HUD text but cost ~44 % more fill, so cap them.
+const DEFAULT_MAX_DPR = 1.5;
+
 function roundRect(ctx, x, y, w, h, r) {
   const rad = Math.min(r, w * 0.5, h * 0.5);
   ctx.beginPath();
@@ -40,20 +47,99 @@ export class HUD {
     this.w = 0;
     this.h = 0;
     this.dpr = 1;
+    this.maxDpr = DEFAULT_MAX_DPR;
+    // Last string written to ctx.font; null forces the next write.
+    this._lastFont = null;
+    // Prebuilt font strings, rebuilt whenever the viewport changes.
+    this._fonts = null;
+    this.extS = 1;
+    this.cptS = 1;
     this.resize();
-    window.addEventListener('resize', () => this.resize());
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      window.addEventListener('resize', () => this.resize());
+    }
   }
 
   resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const win = typeof window !== 'undefined' ? window : null;
+    const cap = Number.isFinite(this.maxDpr) && this.maxDpr > 0 ? this.maxDpr : DEFAULT_MAX_DPR;
+    const dpr = Math.min((win && win.devicePixelRatio) || 1, cap);
     this.dpr = dpr;
-    this.w = window.innerWidth;
-    this.h = window.innerHeight;
+    this.w = (win && win.innerWidth) || 0;
+    this.h = (win && win.innerHeight) || 0;
     this.canvas.width = Math.floor(this.w * dpr);
     this.canvas.height = Math.floor(this.h * dpr);
-    this.canvas.style.width = this.w + 'px';
-    this.canvas.style.height = this.h + 'px';
-    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (this.canvas.style) {
+      this.canvas.style.width = this.w + 'px';
+      this.canvas.style.height = this.h + 'px';
+    }
+    if (typeof this.ctx.setTransform === 'function') {
+      this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    // Scale factors and font strings depend only on the viewport, so they are
+    // rebuilt here instead of on every animation frame.
+    this._buildFonts();
+    this._lastFont = null;
+  }
+
+  // Overrides the backing-store DPR cap (defaults to DEFAULT_MAX_DPR).
+  setMaxDpr(dpr) {
+    const v = Number(dpr);
+    if (!Number.isFinite(v) || v <= 0) return;
+    this.maxDpr = v;
+    this.resize();
+  }
+
+  _buildFonts() {
+    const w = this.w;
+    const h = this.h;
+    const extS = Math.max(0.76, Math.min(1.12, Math.min(w / 1440, h / 820)));
+    const cptS = Math.max(0.58, Math.min(1.12, Math.min(w / 1600, h / 900) * 0.88));
+    const px = (size, scale) => Math.round(size * scale);
+    const strip = (scale) => ({
+      title: `700 ${px(12, scale)}px ${MONO_EXT}`,
+      sub: `${px(9, scale)}px ${MONO_EXT}`,
+      banner: `700 ${px(10, scale)}px ${MONO_EXT}`,
+    });
+    this.extS = extS;
+    this.cptS = cptS;
+    this._fonts = {
+      ext: {
+        ticks: `${px(9.5, extS)}px ${MONO_EXT}`,
+        hdgPill: `700 ${px(11.5, extS)}px ${MONO_EXT}`,
+        badgeMode: `700 ${px(10.5, extS)}px ${MONO_EXT}`,
+        hint: `${px(8.5, extS)}px ${MONO_EXT}`,
+        label: `600 ${px(8.5, extS)}px ${MONO_EXT}`,
+        windValue: `700 ${px(10, extS)}px ${MONO_EXT}`,
+        big: `700 ${px(18, extS)}px ${MONO_EXT}`,
+        unit: `${px(9, extS)}px ${MONO_EXT}`,
+        thrPct: `700 ${px(11, extS)}px ${MONO_EXT}`,
+        pill: `700 ${px(8.5, extS)}px ${MONO_EXT}`,
+        tiny: `${px(7.5, extS)}px ${MONO_EXT}`,
+        replay: `700 ${px(11, extS)}px ${MONO_EXT}`,
+      },
+      cpt: {
+        base: `${px(12, cptS)}px ${MONO_CPT}`,
+        tick: `${px(10, cptS)}px ${MONO_CPT}`,
+        hdgNum: `bold ${px(13, cptS)}px ${MONO_CPT}`,
+        data: `${px(11, cptS)}px ${MONO_CPT}`,
+        thrLabel: `${px(9, cptS)}px ${MONO_CPT}`,
+        warn: `bold ${px(15, cptS)}px ${MONO_CPT}`,
+        label: `600 ${px(8.5, cptS)}px ${MONO_CPT}`,
+        replay: `700 ${px(11, cptS)}px ${MONO_CPT}`,
+        hint: `${px(8.5, cptS)}px ${MONO_CPT}`,
+      },
+      stripExt: strip(extS),
+      stripCpt: strip(cptS),
+    };
+  }
+
+  // Assigns ctx.font only when the string actually changes. ctx.save()/restore()
+  // reverts the live font, so each font-scoped block clears _lastFont on exit.
+  _setFont(ctx, fontStr) {
+    if (this._lastFont === fontStr) return;
+    ctx.font = fontStr;
+    this._lastFont = fontStr;
   }
 
   setVisible(v) {
@@ -73,6 +159,10 @@ export class HUD {
 
   draw(t, tactical = null) {
     const ctx = this.ctx;
+    if (!this._fonts) this._buildFonts();
+    // A new frame starts from an unknown ctx.font (the previous frame ended
+    // inside save/restore scopes), so the cache cannot be carried across.
+    this._lastFont = null;
     ctx.clearRect(0, 0, this.w, this.h);
     if (!t) return;
     // Mist wash sits under all symbology so instruments stay crisp in cloud.
@@ -102,9 +192,9 @@ export class HUD {
     const ctx = this.ctx;
     const w = this.w;
     const h = this.h;
-    const s = Math.max(0.76, Math.min(1.12, Math.min(w / 1440, h / 820)));
+    const s = this.extS;
     const accent = t.night > 0.5 ? '#a8ffc2' : GREEN;
-    const mono = 'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
+    const f = this._fonts.ext;
 
     ctx.save();
     ctx.textBaseline = 'middle';
@@ -130,7 +220,7 @@ export class HUD {
     const hdg = ((t.heading % 360) + 360) % 360;
     const pxPerDeg = 3.2 * s;
     const baseTick = Math.floor(hdg / 5) * 5;
-    ctx.font = `${Math.round(9.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.ticks);
     ctx.textAlign = 'center';
 
     for (let off = -65; off <= 65; off += 5) {
@@ -168,6 +258,7 @@ export class HUD {
       ctx.fill();
     }
     ctx.restore();
+    this._lastFont = null;
 
     // Center heading pill floating seamlessly over the strip
     const pillW = 48 * s;
@@ -179,15 +270,15 @@ export class HUD {
     ctx.lineWidth = 1.1;
     ctx.stroke();
     ctx.fillStyle = accent;
-    ctx.font = `700 ${Math.round(11.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.hdgPill);
     ctx.textAlign = 'center';
     ctx.fillText(String(Math.round(hdg) % 360).padStart(3, '0') + '°', cx, cy + ch * 0.5 + 0.5);
 
     // 1b. Minimal ILS approach pill (top-left) — never blocks the jet -------
-    this._drawExternalILS(ctx, t, s, mono);
+    this._drawExternalILS(ctx, t, s, f);
 
     // 1c. Instant replay badge, tucked below the compass strip --------------
-    this._drawReplayBanner(ctx, t, s, mono, cy + ch + 42 * s);
+    this._drawReplayBanner(ctx, t, s, f, cy + ch + 42 * s);
 
     // 2. Top-right camera mode badge ----------------------------------------
     const modeLabel = 'EXT · ' + (t.mode || 'CHASE').toUpperCase();
@@ -205,10 +296,10 @@ export class HUD {
 
     ctx.textAlign = 'right';
     ctx.fillStyle = accent;
-    ctx.font = `700 ${Math.round(10.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.badgeMode);
     ctx.fillText(modeLabel, bx + badgeW - 11 * s, by + 13 * s);
     ctx.fillStyle = MUTED;
-    ctx.font = `${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.hint);
     ctx.fillText(hintLabel, bx + badgeW - 11 * s, by + 27 * s);
 
     // 2b. Compact live wind indicator pill tucked below camera badge
@@ -231,10 +322,10 @@ export class HUD {
 
     ctx.textAlign = 'right';
     ctx.fillStyle = MUTED;
-    ctx.font = `600 ${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.label);
     ctx.fillText('WND', wPillX + 54 * s, wPillY + wPillH * 0.5 + 0.5);
     ctx.fillStyle = windKts >= 25 ? AMBER : INK;
-    ctx.font = `700 ${Math.round(10 * s)}px ${mono}`;
+    this._setFont(ctx, f.windValue);
     ctx.fillText(`${String(windDir).padStart(3, '0')}°/${String(windKts).padStart(2, '0')}KT`, wPillX + wPillW - 10 * s, wPillY + wPillH * 0.5 + 0.5);
 
     // 3. Warnings banner (compact, tucked below compass — never over jet!) --
@@ -248,7 +339,7 @@ export class HUD {
       const flash = Math.sin(this._t * 12) > 0;
       const warnText = warnings.map((item) => item.text).join('  ·  ');
       const primaryCol = warnings[0].color;
-      ctx.font = `700 ${Math.round(11.5 * s)}px ${mono}`;
+      this._setFont(ctx, f.hdgPill);
       const ww = Math.max(110 * s, ctx.measureText(warnText).width + 28 * s);
       const wh = 24 * s;
       const wy = cy + ch + 10 * s;
@@ -285,7 +376,7 @@ export class HUD {
     // Sized cleanly to avoid overlapping #atc (left: 24px, ~210px wide)
     // and well below #toast (bottom: 12vh).
     const dockW = Math.min(640 * s, Math.max(460 * s, w - 490 * s));
-    const dockH = 58 * s;
+    const dockH = 64 * s;
     const dockX = cx - dockW * 0.5;
     const dockY = h - dockH - 18 * s;
 
@@ -324,16 +415,16 @@ export class HUD {
     // (a) Airspeed & Mach
     ctx.textAlign = 'left';
     ctx.fillStyle = MUTED;
-    ctx.font = `600 ${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.label);
     ctx.fillText('IAS', spdX, dockY + 13 * s);
     ctx.fillStyle = INK;
-    ctx.font = `700 ${Math.round(18 * s)}px ${mono}`;
+    this._setFont(ctx, f.big);
     ctx.fillText(String(Math.round(t.kts)).padStart(3, '0'), spdX, dockY + 31 * s);
     ctx.fillStyle = GREEN_DIM;
-    ctx.font = `${Math.round(9 * s)}px ${mono}`;
+    this._setFont(ctx, f.unit);
     ctx.fillText('KTS', spdX + 41 * s, dockY + 33 * s);
     ctx.fillStyle = MUTED;
-    ctx.font = `${Math.round(9 * s)}px ${mono}`;
+    this._setFont(ctx, f.unit);
     ctx.fillText('M ' + t.mach.toFixed(2), spdX, dockY + 47 * s);
 
     // (b) Throttle bar & AB indicator
@@ -342,10 +433,10 @@ export class HUD {
     const thrPct = Math.round(t.throttle * 100);
     ctx.textAlign = 'left';
     ctx.fillStyle = MUTED;
-    ctx.font = `600 ${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.label);
     ctx.fillText('THR', thrX, dockY + 13 * s);
     ctx.fillStyle = t.afterburner ? AMBER : accent;
-    ctx.font = `700 ${Math.round(11 * s)}px ${mono}`;
+    this._setFont(ctx, f.thrPct);
     ctx.textAlign = 'right';
     ctx.fillText(t.afterburner ? 'AB ' + thrPct + '%' : thrPct + '%', thrX + thrBarW, dockY + 13 * s);
 
@@ -366,9 +457,12 @@ export class HUD {
 
     ctx.textAlign = 'left';
     ctx.fillStyle = t.refueling ? '#6fe3ff' : (t.fuelLb != null && t.fuelLb <= 1500 ? AMBER : MUTED);
-    ctx.font = `${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.hint);
     const fuelStr = t.fuelLb != null ? ` · ${Math.round(t.fuelLb)}LB` : '';
-    const apStr = t.autopilot && t.autopilot !== 'OFF' ? ` · AP ${t.autopilot === 'ALT_HDG' ? 'ALT' : 'ATT'}` : '';
+    const apLabel = t.autopilot && t.autopilot !== 'OFF'
+      ? (t.autopilot === 'ALT_HDG' ? 'ALT' : t.autopilot.replace(/^AUTO_/, ''))
+      : '';
+    const apStr = apLabel ? ` · AP ${apLabel}` : '';
     const baseThrLabel = t.refueling ? 'REFUELING' : (t.onGround ? 'GROUND' : (t.afterburner ? 'AB' : 'DRY'));
     ctx.fillText(baseThrLabel + fuelStr + apStr, thrX, dockY + 47 * s);
 
@@ -423,52 +517,69 @@ export class HUD {
     const vsSign = vsVal >= 0 ? '+' : '';
     ctx.textAlign = 'left';
     ctx.fillStyle = MUTED;
-    ctx.font = `600 ${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.label);
     ctx.fillText('ALT', altX, dockY + 13 * s);
     ctx.fillStyle = INK;
-    ctx.font = `700 ${Math.round(18 * s)}px ${mono}`;
+    this._setFont(ctx, f.big);
     const altStr = altVal.toLocaleString();
     ctx.fillText(altStr, altX, dockY + 31 * s);
     const altW = ctx.measureText(altStr).width;
     ctx.fillStyle = GREEN_DIM;
-    ctx.font = `${Math.round(9 * s)}px ${mono}`;
+    this._setFont(ctx, f.unit);
     ctx.fillText('FT', altX + altW + 5 * s, dockY + 33 * s);
     ctx.fillStyle = MUTED;
-    ctx.font = `${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.hint);
     ctx.fillText(`AGL ${aglVal} · ${vsSign}${vsVal} FPM`, altX, dockY + 47 * s);
 
     // (e) G-load & Angle of Attack
     ctx.textAlign = 'left';
     ctx.fillStyle = MUTED;
-    ctx.font = `600 ${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.label);
     ctx.fillText('G', aeroX, dockY + 19 * s);
     ctx.fillText('AOA', aeroX, dockY + 40 * s);
     ctx.textAlign = 'right';
     ctx.fillStyle = Math.abs(t.g) > 7.5 ? AMBER : INK;
-    ctx.font = `700 ${Math.round(11.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.hdgPill);
     ctx.fillText(t.g.toFixed(1), aeroX + 54 * s, dockY + 19 * s);
     ctx.fillStyle = t.stall ? RED : INK;
     ctx.fillText((t.aoa * 57.3).toFixed(1) + '°', aeroX + 54 * s, dockY + 40 * s);
+
+    // (e2) Stores mode badge: CAT I clean vs CAT III heavy air-to-ground load.
+    const catMode = t.catMode || 'CAT I';
+    const catIII = catMode === 'CAT III';
+    const catY = dockY + 55 * s;
+    ctx.textAlign = 'left';
+    this._setFont(ctx, f.hint);
+    ctx.fillStyle = catIII ? AMBER : GREEN_DIM;
+    ctx.fillText(catMode, aeroX, catY);
+    // Rollout aids: anti-skid / aerodynamic braking only advertise while active.
+    if (t.antiSkid || t.aerobraking) {
+      ctx.textAlign = 'right';
+      ctx.fillStyle = t.aerobraking ? '#6fe3ff' : AMBER;
+      ctx.fillText(t.aerobraking ? 'AERO' : 'A-SKID', sysX, catY);
+      ctx.textAlign = 'left';
+    }
 
     // (f) Compact System Status Pills (GEAR, FLAPS, BRK)
     const gearMoving = t.gearPos > 0.05 && t.gearPos < 0.95;
     const gearText = gearMoving ? 'GEAR TRN' : (t.gear ? 'GEAR DN' : 'GEAR UP');
     const gearColor = gearMoving ? AMBER : (t.gear ? accent : MUTED);
-    this._drawStatusPill(ctx, sysX - 78 * s, dockY + 10 * s, 78 * s, 17 * s, gearText, gearColor, s, mono);
+    this._drawStatusPill(ctx, sysX - 78 * s, dockY + 10 * s, 78 * s, 17 * s, gearText, gearColor, s, f);
 
     const flapText = 'FLP ' + t.flaps;
     const flapCol = t.flaps > 0 ? accent : MUTED;
     const brkCol = t.brake ? AMBER : 'rgba(140, 160, 150, 0.35)';
-    this._drawStatusPill(ctx, sysX - 78 * s, dockY + 32 * s, 40 * s, 17 * s, flapText, flapCol, s, mono);
-    this._drawStatusPill(ctx, sysX - 35 * s, dockY + 32 * s, 35 * s, 17 * s, 'BRK', brkCol, s, mono);
+    this._drawStatusPill(ctx, sysX - 78 * s, dockY + 32 * s, 40 * s, 17 * s, flapText, flapCol, s, f);
+    this._drawStatusPill(ctx, sysX - 35 * s, dockY + 32 * s, 35 * s, 17 * s, 'BRK', brkCol, s, f);
 
     // Carrier FLOLS meatball on the left edge (clear of the dock/viewport)
-    this._drawMeatball(ctx, t, s, mono);
+    this._drawMeatball(ctx, t, s, f);
 
     ctx.restore();
+    this._lastFont = null;
   }
 
-  _drawStatusPill(ctx, x, y, w, h, text, color, s, mono) {
+  _drawStatusPill(ctx, x, y, w, h, text, color, s, f) {
     roundRect(ctx, x, y, w, h, 3 * s);
     ctx.fillStyle = 'rgba(255, 255, 255, 0.04)';
     ctx.fill();
@@ -478,7 +589,7 @@ export class HUD {
     ctx.stroke();
     ctx.globalAlpha = 0.95;
     ctx.fillStyle = color;
-    ctx.font = `700 ${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.pill);
     ctx.textAlign = 'center';
     ctx.fillText(text, x + w * 0.5, y + h * 0.5 + 0.5);
   }
@@ -511,16 +622,17 @@ export class HUD {
     const w = this.w;
     const h = this.h;
 
-    const s = Math.max(0.58, Math.min(1.12, Math.min(w / 1600, h / 900) * 0.88));
+    const s = this.cptS;
     const cx = w * 0.5;
     const cy = h * 0.46;
     const color = t.night > 0.5 ? '#a8ffc2' : GREEN;
+    const f = this._fonts.cpt;
 
     ctx.save();
     ctx.lineWidth = 1.3;
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
-    ctx.font = `${Math.round(12 * s)}px ui-monospace, monospace`;
+    this._setFont(ctx, f.base);
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.globalAlpha = 0.95;
@@ -546,7 +658,7 @@ export class HUD {
       ctx.lineTo(half, y);
       ctx.stroke();
       if (a % 10 === 0) {
-        ctx.font = `${Math.round(10 * s)}px ui-monospace, monospace`;
+        this._setFont(ctx, f.tick);
         ctx.textAlign = 'right';
         ctx.fillText(String(Math.abs(a)), -half - 6 * s, y);
         ctx.textAlign = 'left';
@@ -586,7 +698,40 @@ export class HUD {
       ctx.lineTo(fx, fy - 13 * s);
       ctx.stroke();
     }
+
+    // AERO-2: authentic F-16 on-speed AoA bracket ("["). Gear down on approach,
+    // gate centred on the 12° on-speed AoA line so the FPM wing sits inside it.
+    if (t.gearDown && !t.onGround) {
+      const alphaDeg = (t.aoa || 0) * 57.3;
+      const betaDeg = (t.sideSlip || 0) * 57.3;
+      const fx = Math.max(-130 * s, Math.min(130 * s, betaDeg * DEG));
+      const fy = Math.max(-130 * s, Math.min(130 * s, alphaDeg * DEG));
+      // Slide the gate onto the 12° line, clamped so it stays inside the glass.
+      const shift = Math.max(-60 * s, Math.min(60 * s, (12 - alphaDeg) * DEG));
+      const bx = fx - 24 * s;
+      const by = fy + shift;
+      const half = DEG; // 11°..13° aperture around on-speed
+      const onSpeed = alphaDeg >= 11 && alphaDeg <= 13;
+      ctx.globalAlpha = onSpeed ? 0.95 : 0.85;
+      ctx.strokeStyle = onSpeed ? color : (alphaDeg > 14.5 ? RED : AMBER);
+      ctx.lineWidth = 2 * s;
+      ctx.beginPath();
+      ctx.moveTo(bx + 6 * s, by - half);
+      ctx.lineTo(bx, by - half);
+      ctx.lineTo(bx, by + half);
+      ctx.lineTo(bx + 6 * s, by + half);
+      ctx.stroke();
+      // Centre pip aimed at the velocity vector.
+      ctx.beginPath();
+      ctx.moveTo(bx, by);
+      ctx.lineTo(bx + 3.5 * s, by);
+      ctx.stroke();
+      ctx.lineWidth = 1.3;
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = 0.95;
+    }
     ctx.restore();
+    this._lastFont = null;
 
     // bank scale arc
     ctx.globalAlpha = 0.6;
@@ -649,7 +794,7 @@ export class HUD {
       ctx.stroke();
       if (hd % 30 === 0) {
         ctx.fillStyle = color;
-        ctx.font = `${Math.round(10 * s)}px ui-monospace, monospace`;
+        this._setFont(ctx, f.tick);
         ctx.textAlign = 'center';
         ctx.fillText(String(hd / 10).padStart(2, '0'), x, 22 * s);
       }
@@ -661,14 +806,15 @@ export class HUD {
     ctx.lineTo(5 * s, -10 * s);
     ctx.closePath();
     ctx.fill();
-    ctx.font = `bold ${Math.round(13 * s)}px ui-monospace, monospace`;
+    this._setFont(ctx, f.hdgNum);
     ctx.textAlign = 'center';
     ctx.fillText(String(Math.round(t.heading) % 360).padStart(3, '0'), 0, -22 * s);
     ctx.restore();
+    this._lastFont = null;
 
     // ------------------------------------------------------------- data column
     ctx.globalAlpha = 0.92;
-    ctx.font = `${Math.round(11 * s)}px ui-monospace, monospace`;
+    this._setFont(ctx, f.data);
     ctx.textAlign = 'left';
     const dx = cx + 360 * s;
     const dy = cy - 44 * s;
@@ -688,6 +834,18 @@ export class HUD {
       ctx.textAlign = 'left';
     });
 
+    // AERO-2: CAT I / CAT III stores-mode badge under the G & AOA column.
+    const catY = dy + 5 * 18 * s + 6 * s;
+    const catIII = (t.catMode || 'CAT I') === 'CAT III';
+    this._setFont(ctx, f.data);
+    ctx.fillStyle = catIII ? AMBER : color;
+    ctx.fillText(t.catMode || 'CAT I', dx, catY);
+    // Rollout aids: only advertise while anti-skid / aero-braking is working.
+    if (t.antiSkid || t.aerobraking) {
+      ctx.fillStyle = t.aerobraking ? '#6fe3ff' : AMBER;
+      ctx.fillText(t.aerobraking ? 'AERO' : 'A-SKID', dx, catY + 16 * s);
+    }
+
     // throttle bar
     const tx = cx - 350 * s;
     const ty = cy + 54 * s;
@@ -698,7 +856,7 @@ export class HUD {
     const th = 90 * s * t.throttle;
     ctx.fillRect(tx, ty + 90 * s - th, 7 * s, th);
     ctx.fillStyle = GREEN_DIM;
-    ctx.font = `${Math.round(9 * s)}px ui-monospace, monospace`;
+    this._setFont(ctx, f.thrLabel);
     ctx.save();
     ctx.translate(tx - 8 * s, ty + 90 * s);
     ctx.rotate(-Math.PI / 2);
@@ -728,14 +886,14 @@ export class HUD {
     const wy = gy + 54 * s;
     this._drawWindArrow(ctx, gx + 7 * s, wy, 7 * s, cRelRad, cWindKts >= 25 ? AMBER : color);
     ctx.fillStyle = cWindKts >= 25 ? AMBER : color;
-    ctx.font = `${Math.round(10 * s)}px ui-monospace, monospace`;
+    this._setFont(ctx, f.tick);
     ctx.textAlign = 'left';
     ctx.fillText(`${String(cWindDir).padStart(3, '0')}/${String(cWindKts).padStart(2, '0')}K`, gx + 19 * s, wy + 1);
 
     // ------------------------------------------------------------- warnings
     const flash = Math.sin(this._t * 12) > 0;
     ctx.textAlign = 'center';
-    ctx.font = `bold ${Math.round(15 * s)}px ui-monospace, monospace`;
+    this._setFont(ctx, f.warn);
     if (t.stall) {
       ctx.fillStyle = flash ? RED : 'rgba(255,107,94,0.4)';
       ctx.fillText('STALL', cx, cy + 102 * s);
@@ -754,14 +912,14 @@ export class HUD {
     }
 
     // ------------------------------------------------------- ILS approach cues
-    this._drawCockpitILS(ctx, t, cx, cy, s, color);
+    this._drawCockpitILS(ctx, t, cx, cy, s, color, f);
 
     // Carrier FLOLS meatball + instant replay badge
-    const cockpitMono = 'ui-monospace, monospace';
-    this._drawMeatball(ctx, t, s, cockpitMono);
-    this._drawReplayBanner(ctx, t, s, cockpitMono, 12 * s);
+    this._drawMeatball(ctx, t, s, f);
+    this._drawReplayBanner(ctx, t, s, f, 12 * s);
 
     ctx.restore();
+    this._lastFont = null;
   }
 
   // -------------------------------------------------------------------------
@@ -787,7 +945,7 @@ export class HUD {
     ctx.restore();
   }
 
-  _drawCockpitILS(ctx, t, cx, cy, s, color) {
+  _drawCockpitILS(ctx, t, cx, cy, s, color, f) {
     const ils = t.ils;
     if (!ils || !ils.active) return;
     const locDev = clamp1(ils.locDev);
@@ -829,13 +987,14 @@ export class HUD {
 
     // Compact approach label below the pitch ladder
     ctx.globalAlpha = 0.9;
-    ctx.font = `${Math.round(11 * s)}px ui-monospace, monospace`;
+    this._setFont(ctx, f.data);
     ctx.textAlign = 'center';
     ctx.fillText(`ILS ${ils.runwayLabel || ''} · ${distNm} NM`, cx, cy + 178 * s);
     ctx.restore();
+    this._lastFont = null;
   }
 
-  _drawExternalILS(ctx, t, s, mono) {
+  _drawExternalILS(ctx, t, s, f) {
     const ils = t.ils;
     if (!ils || !ils.active) return;
     const locDev = clamp1(ils.locDev);
@@ -857,7 +1016,7 @@ export class HUD {
 
     ctx.textAlign = 'left';
     ctx.fillStyle = MUTED;
-    ctx.font = `600 ${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.label);
     ctx.fillText(`ILS ${ils.runwayLabel || ''} · ${distNm} NM`, px + 10 * s, py + 13 * s);
 
     // Localizer mini bar
@@ -877,7 +1036,7 @@ export class HUD {
     ctx.arc(locX + locDev * locHalf, locY, 2.6 * s, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillStyle = GREEN_DIM;
-    ctx.font = `${Math.round(7.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.tiny);
     ctx.textAlign = 'right';
     ctx.fillText('LOC', locX - locHalf - 4 * s, locY);
 
@@ -900,9 +1059,10 @@ export class HUD {
     ctx.textAlign = 'left';
     ctx.fillText('GS', gsX + 8 * s, gsY);
     ctx.restore();
+    this._lastFont = null;
   }
 
-  _drawMeatball(ctx, t, s, mono) {
+  _drawMeatball(ctx, t, s, f) {
     const mb = t.meatball;
     if (!mb || !mb.active) return;
     const w = this.w;
@@ -942,13 +1102,14 @@ export class HUD {
 
     // Carrier caption
     ctx.fillStyle = 'rgba(186, 214, 199, 0.72)';
-    ctx.font = `600 ${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.label);
     ctx.textAlign = 'center';
     ctx.fillText(`CVN-71 ${distNm}NM`, x, cy + 42 * s);
     ctx.restore();
+    this._lastFont = null;
   }
 
-  _drawReplayBanner(ctx, t, s, mono, y) {
+  _drawReplayBanner(ctx, t, s, f, y) {
     if (!t.replaying) return;
     const w = this.w;
     const rate = Number(t.replayRate) || 1;
@@ -959,9 +1120,9 @@ export class HUD {
 
     ctx.save();
     ctx.textBaseline = 'middle';
-    ctx.font = `700 ${Math.round(11 * s)}px ${mono}`;
+    this._setFont(ctx, f.replay);
     const tw = ctx.measureText(text).width;
-    ctx.font = `${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.hint);
     const hw = ctx.measureText(hint).width;
     const bw = Math.max(tw, hw) + 56 * s;
     const bh = 36 * s;
@@ -983,15 +1144,20 @@ export class HUD {
     const tx = bx + bw * 0.5 + 4 * s;
     ctx.textAlign = 'center';
     ctx.fillStyle = AMBER;
-    ctx.font = `700 ${Math.round(11 * s)}px ${mono}`;
+    this._setFont(ctx, f.replay);
     ctx.fillText(text, tx, y + bh * 0.5 - 6 * s);
     ctx.fillStyle = 'rgba(255, 216, 160, 0.72)';
-    ctx.font = `${Math.round(8.5 * s)}px ${mono}`;
+    this._setFont(ctx, f.hint);
     ctx.fillText(hint, tx, y + bh * 0.5 + 8 * s);
     ctx.restore();
+    this._lastFont = null;
   }
 
-  drawTape(ctx, x, cy, half, value, minor, major, s, isSpeed, color) {
+  drawTape(ctx, x, cy, half, value, minor, major, s, isSpeed, color, f = null) {
+    if (!f) {
+      if (!this._fonts) this._buildFonts();
+      f = this._fonts.cpt;
+    }
     const scale = isSpeed ? 2.4 * s : 0.14 * s;
     const range = half / scale;
     const step = minor;
@@ -1002,7 +1168,7 @@ export class HUD {
     ctx.fillStyle = color;
     ctx.globalAlpha = 0.55;
     ctx.textAlign = isSpeed ? 'right' : 'left';
-    ctx.font = `${Math.round(10 * s)}px ui-monospace, monospace`;
+    this._setFont(ctx, f.tick);
     for (let v = bottom; v <= top; v += step) {
       if (v < 0) continue;
       const y = cy - (v - value) * scale;
@@ -1022,7 +1188,7 @@ export class HUD {
     }
     // current value box
     ctx.globalAlpha = 0.9;
-    ctx.font = `bold ${Math.round(13 * s)}px ui-monospace, monospace`;
+    this._setFont(ctx, f.hdgNum);
     ctx.textAlign = isSpeed ? 'right' : 'left';
     const bw = 54 * s;
     const bx = isSpeed ? x - bw - 20 * s : x + 20 * s;
@@ -1033,6 +1199,7 @@ export class HUD {
     ctx.fillStyle = color;
     ctx.fillText(String(Math.round(value)), bx + bw - 5 * s, cy + 1);
     ctx.restore();
+    this._lastFont = null;
   }
 
   // -------------------------------------------------------------------------
@@ -1101,10 +1268,8 @@ export class HUD {
     const w = this.w;
     const h = this.h;
     const cockpit = t.mode === 'cockpit';
-    const s = cockpit
-      ? Math.max(0.58, Math.min(1.12, Math.min(w / 1600, h / 900) * 0.88))
-      : Math.max(0.76, Math.min(1.12, Math.min(w / 1440, h / 820)));
-    const mono = 'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
+    const s = cockpit ? this.cptS : this.extS;
+    const f = this._fonts[cockpit ? 'stripCpt' : 'stripExt'];
     const total = c.totalGates || 8;
     const finished = !!c.finished;
     const gateNo = Math.min((c.gateIndex || 0) + 1, total);
@@ -1120,9 +1285,9 @@ export class HUD {
 
     ctx.save();
     ctx.textBaseline = 'middle';
-    ctx.font = `700 ${Math.round(12 * s)}px ${mono}`;
+    this._setFont(ctx, f.title);
     const tw = ctx.measureText(line1).width;
-    ctx.font = `${Math.round(9 * s)}px ${mono}`;
+    this._setFont(ctx, f.sub);
     const tw2 = ctx.measureText(line2).width;
     const bw = Math.max(228 * s, Math.max(tw, tw2) + 46 * s);
     const bh = finished ? 44 * s : 46 * s;
@@ -1139,14 +1304,15 @@ export class HUD {
 
     ctx.textAlign = 'center';
     ctx.fillStyle = accent;
-    ctx.font = `700 ${Math.round(12 * s)}px ${mono}`;
+    this._setFont(ctx, f.title);
     ctx.fillText(line1, w * 0.5, by + bh * (finished ? 0.5 : 0.36));
     if (!finished) {
       ctx.fillStyle = 'rgba(196, 240, 228, 0.86)';
-      ctx.font = `${Math.round(9 * s)}px ${mono}`;
+      this._setFont(ctx, f.sub);
       ctx.fillText(line2, w * 0.5, by + bh * 0.72);
     }
     ctx.restore();
+    this._lastFont = null;
   }
 
   // -------------------------------------------------------------------------
@@ -1159,10 +1325,8 @@ export class HUD {
     const w = this.w;
     const h = this.h;
     const cockpit = t.mode === 'cockpit';
-    const s = cockpit
-      ? Math.max(0.58, Math.min(1.12, Math.min(w / 1600, h / 900) * 0.88))
-      : Math.max(0.76, Math.min(1.12, Math.min(w / 1440, h / 820)));
-    const mono = 'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace';
+    const s = cockpit ? this.cptS : this.extS;
+    const f = this._fonts[cockpit ? 'stripCpt' : 'stripExt'];
 
     const roundel = wc.lingering ? 'IMPACT · LINGER' : (wc.label || 'ORDNANCE').split(' ')[0];
     const telemetry = wc.lingering
@@ -1171,7 +1335,7 @@ export class HUD {
 
     ctx.save();
     ctx.textBaseline = 'middle';
-    ctx.font = `700 ${Math.round(10 * s)}px ${mono}`;
+    this._setFont(ctx, f.banner);
     const tw = ctx.measureText(telemetry).width;
     const bw = tw + 54 * s;
     const bh = 22 * s;
@@ -1193,8 +1357,9 @@ export class HUD {
 
     ctx.textAlign = 'center';
     ctx.fillStyle = 'rgba(255, 214, 206, 0.95)';
-    ctx.font = `700 ${Math.round(10 * s)}px ${mono}`;
+    this._setFont(ctx, f.banner);
     ctx.fillText(telemetry, w * 0.5 + 6 * s, by + bh * 0.5 + 0.5);
     ctx.restore();
+    this._lastFont = null;
   }
 }

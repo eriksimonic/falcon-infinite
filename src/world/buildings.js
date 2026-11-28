@@ -35,6 +35,11 @@ const CUSTOM_SETTLEMENT_RADIUS = 52000; // reachable everywhere inside the 100 k
 const LARGE_SETTLEMENT_RADIUS = 24000; // per-building stream radius for the OSM city
 const LARGE_SETTLEMENT_MIN_SIZE = 3000; // settlements larger than this stream per building
 const SPATIAL_CELL_SIZE = 1000; // 1 km spatial hash cells for O(visible) queries
+// PERF-11 / PKT-09: only buildings this close to the camera are allowed into
+// the sun shadow map, through layer-1 proxy meshes that share the main
+// instance buffers. Everything further out is drawn but casts no shadow, which
+// the +-1,400 m shadow box cannot show anyway.
+export const SHADOW_NEAR_R = 2400;
 const CUSTOM_KINDS = ['house', 'apartment', 'industrial', 'tower', 'church', 'shed'];
 // LJAJ (Ajdovscina) is a true East-West strip at the DEM centre: RWY 09/27 runs
 // along +-X. Nothing built by OSM may sit on the pavement or the graded strip.
@@ -97,6 +102,37 @@ const BAYER_GLSL = /* glsl */`
   }
 `;
 
+// Same Rayleigh + Mie aerial perspective as terrainview.js (VIPER-ATMOS) and
+// water.js, so distant towns dissolve into the exact hazy blue valley air the
+// hills sit in instead of reading as dark high-contrast blocks. `col` must
+// still be linear HDR when this runs (immediately before gl_FragColor and the
+// fog / tonemapping / colorspace includes).
+// NOTE: at night `update()` copies the moon direction into uSunDir, so the
+// daylight gate is `(1.0 - uNight)` rather than the sun elevation alone.
+const AERIAL_HAZE_GLSL = /* glsl */`
+  {
+    float bDist = length(vWorld - cameraPosition);
+    vec3 bViewDir = normalize(vWorld - cameraPosition);
+    float dayVis = (1.0 - uNight) * smoothstep(-0.05, 0.25, uSunDir.y);
+    float lowAir = 1.0 - smoothstep(100.0, 2600.0, 0.5 * (cameraPosition.y + vWorld.y));
+    float aerialT = 1.0 - exp(-bDist * (0.000024 + lowAir * 0.000020));
+    aerialT = clamp(aerialT * smoothstep(2500.0, 9000.0, bDist), 0.0, 0.72);
+    vec3 rayleighBlue = mix(vec3(0.42, 0.58, 0.80), vec3(0.54, 0.68, 0.86),
+      smoothstep(0.0, 0.5, uSunDir.y));
+    rayleighBlue = mix(rayleighBlue, uSkyColor, 0.16 * dayVis);
+    float sunAlign = max(dot(bViewDir, uSunDir), 0.0);
+    float miePhase = pow(sunAlign, 4.0) * 0.65 + pow(sunAlign, 18.0) * 0.35;
+    vec3 dustGlow = mix(vec3(0.92, 0.76, 0.56), uSunColor, 0.55);
+    vec3 atmosCol = mix(rayleighBlue, dustGlow,
+      clamp(miePhase * (0.45 + lowAir * 0.40), 0.0, 0.72));
+    float distDesat = aerialT * 0.35 * dayVis;
+    float bLum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    col = mix(col, vec3(bLum), distDesat);
+    col = mix(col, atmosCol, aerialT * 0.62 * dayVis);
+    col += dustGlow * miePhase * aerialT * 0.14 * dayVis * (0.5 + 0.5 * lowAir);
+  }
+`;
+
 function makeBuildingMaterial() {
   return new THREE.ShaderMaterial({
     fog: true,
@@ -109,6 +145,7 @@ function makeBuildingMaterial() {
         uNight: { value: 0 },
         uTime: { value: 0 },
         uCullDist: { value: 24000 },
+        uSkyColor: { value: new THREE.Color(0x8fb4c8) },
       },
     ]),
     vertexShader: /* glsl */`
@@ -148,6 +185,7 @@ function makeBuildingMaterial() {
     `,
     fragmentShader: /* glsl */`
       uniform vec3 uSunDir, uSunColor, uAmbient;
+      uniform vec3 uSkyColor;
       uniform float uNight, uCullDist, uTime;
       varying vec3 vWorld;
       varying vec3 vN;
@@ -243,49 +281,56 @@ function makeBuildingMaterial() {
         // Rooms also switch on and off slowly over uTime, with a sliver of rooms
         // lit by flickering television blue.
         col *= 1.0 - glass * 0.55 * uNight;
+        // PERF-13: the per-building identity is declared before the night
+        // branch because the roof shading below hashes buildingSeed too.
+        // Everything that only feeds the lit-window emission sits inside the
+        // branch and costs nothing by day (uNight == 0), where the previous
+        // code still ran 9 h21 calls and 2 sin per facade pixel.
         vec2 instCell = floor(vInstXZ * 0.25);
         float buildingSeed = h21(instCell + floor(vCol.xy * 97.0) + 3.7);
-        float isBig = clamp(smoothstep(10.0, 14.5, vScale.y) +
-                            smoothstep(16.0, 24.0, max(vScale.x, vScale.z)), 0.0, 1.0);
-        // Residential: 10..18% of bays lit, and roughly one house in five is
-        // dark all night, which keeps village rows from glowing like a lantern.
-        float resOcc = (0.10 + 0.08 * buildingSeed) *
-                       step(0.18, h21(instCell + 19.3));
-        // Larger blocks: 20..30% of bays lit, ~25% on average.
-        float bigOcc = 0.20 + 0.10 * buildingSeed;
-        float occupancy = mix(resOcc, bigOcc, isBig);
+        if (uNight > 0.001) {
+          float isBig = clamp(smoothstep(10.0, 14.5, vScale.y) +
+                              smoothstep(16.0, 24.0, max(vScale.x, vScale.z)), 0.0, 1.0);
+          // Residential: 10..18% of bays lit, and roughly one house in five is
+          // dark all night, which keeps village rows from glowing like a lantern.
+          float resOcc = (0.10 + 0.08 * buildingSeed) *
+                         step(0.18, h21(instCell + 19.3));
+          // Larger blocks: 20..30% of bays lit, ~25% on average.
+          float bigOcc = 0.20 + 0.10 * buildingSeed;
+          float occupancy = mix(resOcc, bigOcc, isBig);
 
-        float roomSeed = h21(cell * 1.37 + instCell + 11.3);
-        // Every room rolls a fresh on/off state every 45-140 s and cross-fades
-        // over the first ~1.5% of that period, so lights fade in and out over a
-        // minute or two instead of popping or strobing.
-        float swPeriod = 45.0 + 95.0 * h21(cell * 1.9 + instCell + 23.1);
-        float swT = uTime / swPeriod + roomSeed * 17.0;
-        float swRoll = floor(swT);
-        float swFade = smoothstep(0.0, 0.015, fract(swT));
-        float rollA = step(1.0 - occupancy,
-                           h21(cell * 2.13 + instCell + swRoll * 7.7 + 31.7));
-        float rollB = step(1.0 - occupancy,
-                           h21(cell * 2.13 + instCell + (swRoll + 1.0) * 7.7 + 31.7));
-        float lit = mix(rollA, rollB, swFade) * glass;
-        // Palette in shares: ~46% tungsten, ~28% amber, ~14% cool LED/office and
-        // ~12% television blue.
-        float tone = h21(cell * 2.71 + instCell + 5.9);
-        vec3 winColor = mix(vec3(1.0, 0.78, 0.42), vec3(1.0, 0.62, 0.25), step(0.46, tone));
-        winColor = mix(winColor, vec3(0.78, 0.90, 1.0), step(0.74, tone));
-        float isTV = step(0.88, tone);
-        float rndTv = h21(cell * 3.83 + instCell + 47.9);
-        // Two incommensurate sines give an organic living-room screen flicker
-        // (never a hard strobe), and the glow drifts to cool cyan as it brightens.
-        float tvWave = 0.70 + 0.30 * (0.5 + 0.5 * sin(uTime * (2.6 + rndTv * 2.8) + roomSeed * 41.0) * sin(uTime * 5.9 + rndTv * 17.0));
-        vec3 tvColor = mix(vec3(0.34, 0.60, 1.0), vec3(0.36, 0.64, 1.0), tvWave);
-        tvColor = mix(tvColor, vec3(0.68, 0.84, 1.0), tvWave * 0.45);
-        winColor = mix(winColor, tvColor, isTV);
-        // Wide per-room intensity spread: a dim bedside lamp (0.38) up to a
-        // bright kitchen/living room (1.05). Overall emission sits ~20% below the
-        // old 1.45x so facades read as lived-in, not floodlit.
-        float brightness = 0.38 + 0.60 * h21(cell * 3.17 + instCell + 7.1) + 0.07 * rnd;
-        col += winColor * lit * uNight * 1.15 * brightness;
+          float roomSeed = h21(cell * 1.37 + instCell + 11.3);
+          // Every room rolls a fresh on/off state every 45-140 s and cross-fades
+          // over the first ~1.5% of that period, so lights fade in and out over a
+          // minute or two instead of popping or strobing.
+          float swPeriod = 45.0 + 95.0 * h21(cell * 1.9 + instCell + 23.1);
+          float swT = uTime / swPeriod + roomSeed * 17.0;
+          float swRoll = floor(swT);
+          float swFade = smoothstep(0.0, 0.015, fract(swT));
+          float rollA = step(1.0 - occupancy,
+                             h21(cell * 2.13 + instCell + swRoll * 7.7 + 31.7));
+          float rollB = step(1.0 - occupancy,
+                             h21(cell * 2.13 + instCell + (swRoll + 1.0) * 7.7 + 31.7));
+          float lit = mix(rollA, rollB, swFade) * glass;
+          // Palette in shares: ~46% tungsten, ~28% amber, ~14% cool LED/office and
+          // ~12% television blue.
+          float tone = h21(cell * 2.71 + instCell + 5.9);
+          vec3 winColor = mix(vec3(1.0, 0.78, 0.42), vec3(1.0, 0.62, 0.25), step(0.46, tone));
+          winColor = mix(winColor, vec3(0.78, 0.90, 1.0), step(0.74, tone));
+          float isTV = step(0.88, tone);
+          float rndTv = h21(cell * 3.83 + instCell + 47.9);
+          // Two incommensurate sines give an organic living-room screen flicker
+          // (never a hard strobe), and the glow drifts to cool cyan as it brightens.
+          float tvWave = 0.70 + 0.30 * (0.5 + 0.5 * sin(uTime * (2.6 + rndTv * 2.8) + roomSeed * 41.0) * sin(uTime * 5.9 + rndTv * 17.0));
+          vec3 tvColor = mix(vec3(0.34, 0.60, 1.0), vec3(0.36, 0.64, 1.0), tvWave);
+          tvColor = mix(tvColor, vec3(0.68, 0.84, 1.0), tvWave * 0.45);
+          winColor = mix(winColor, tvColor, isTV);
+          // Wide per-room intensity spread: a dim bedside lamp (0.38) up to a
+          // bright kitchen/living room (1.05). Overall emission sits ~20% below the
+          // old 1.45x so facades read as lived-in, not floodlit.
+          float brightness = 0.38 + 0.60 * h21(cell * 3.17 + instCell + 7.1) + 0.07 * rnd;
+          col += winColor * lit * uNight * 1.15 * brightness;
+        }
 
         // Ground contact ambient occlusion over the bottom of each block so every
         // building sits firmly anchored on the satellite imagery instead of
@@ -331,6 +376,8 @@ function makeBuildingMaterial() {
         roofCol *= mix(1.0, 1.08, isLarge);
         col = mix(col, roofCol, roof);
 
+        ${AERIAL_HAZE_GLSL}
+
         gl_FragColor = vec4(col, 1.0);
         #include <fog_fragment>
         #include <tonemapping_fragment>
@@ -352,6 +399,7 @@ function makePlinthMaterial() {
         uAmbient: { value: new THREE.Color(0x334455) },
         uNight: { value: 0 },
         uCullDist: { value: 24000 },
+        uSkyColor: { value: new THREE.Color(0x8fb4c8) },
       },
     ]),
     vertexShader: /* glsl */`
@@ -383,6 +431,7 @@ function makePlinthMaterial() {
     `,
     fragmentShader: /* glsl */`
       uniform vec3 uSunDir, uSunColor, uAmbient;
+      uniform vec3 uSkyColor;
       uniform float uNight, uCullDist;
       varying vec3 vWorld;
       varying vec3 vN;
@@ -421,6 +470,8 @@ function makePlinthMaterial() {
         col *= mix(0.76, 1.0, smoothstep(0.0, 0.35, vLocal.y));
         col *= 1.0 - uNight * 0.25;
 
+        ${AERIAL_HAZE_GLSL}
+
         gl_FragColor = vec4(col, 1.0);
         #include <fog_fragment>
         #include <tonemapping_fragment>
@@ -442,6 +493,7 @@ function makeRoofMaterial() {
         uAmbient: { value: new THREE.Color(0x334455) },
         uNight: { value: 0 },
         uCullDist: { value: 24000 },
+        uSkyColor: { value: new THREE.Color(0x8fb4c8) },
       },
     ]),
     vertexShader: /* glsl */`
@@ -481,6 +533,7 @@ function makeRoofMaterial() {
     `,
     fragmentShader: /* glsl */`
       uniform vec3 uSunDir, uSunColor, uAmbient;
+      uniform vec3 uSkyColor;
       uniform float uNight, uCullDist;
       varying vec3 vWorld;
       varying vec3 vN;
@@ -528,6 +581,8 @@ function makeRoofMaterial() {
         col += skyFill * (1.0 - uNight);
         col *= 1.04;
         col *= 1.0 - uNight * 0.20;
+
+        ${AERIAL_HAZE_GLSL}
 
         gl_FragColor = vec4(col, 1.0);
         #include <fog_fragment>
@@ -966,16 +1021,26 @@ export class BuildingSystem {
     this.plinthMesh = null;
     this.gableRoofMesh = null;
     this.hipRoofMesh = null;
+    // Layer-1 shadow proxies (PERF-11): identical draws of the four pools that
+    // only the sun's shadow camera sees, capped to the near ring.
+    this.shadowMesh = null;
+    this.plinthShadowMesh = null;
+    this.gableRoofShadowMesh = null;
+    this.hipRoofShadowMesh = null;
     this.plinthMaterial = null;
     this.roofMaterial = null;
     this.roadMesh = null;
     this.craterMesh = null;
     this.lightMesh = null;
     this.ruinMesh = null;
+    this.collapseMesh = null;
     this.craterTexture = null;
     this.groundMaterial = null;
     this.grounds = new Map();
     this._groundUse = new Set();
+    // Upload bookkeeping: how many instances each pool drew on its last
+    // upload, so an empty pool does not re-upload its whole allocation.
+    this._prevCounts = { mesh: 0, plinth: 0, gable: 0, hip: 0, ruin: 0, light: 0, collapse: 0 };
     if (!this.scene) {
       this._lastX = Infinity;
       this._lastZ = Infinity;
@@ -997,8 +1062,10 @@ export class BuildingSystem {
     this.mesh.name = 'buildings';
     // Instanced depth material means every block casts a real-time shadow onto
     // the satellite-draped terrain; the custom shader never samples the shadow
-    // map itself, so receiving is explicitly off.
-    this.mesh.castShadow = true;
+    // map itself, so receiving is explicitly off. The mesh itself no longer
+    // casts (PERF-11): the layer-1 `shadowMesh` proxy below does, capped to the
+    // buildings near enough to land inside the sun shadow box.
+    this.mesh.castShadow = false;
     this.mesh.receiveShadow = false;
     this.scene.add(this.mesh);
 
@@ -1012,7 +1079,7 @@ export class BuildingSystem {
     this.plinthMesh.frustumCulled = false;
     this.plinthMesh.count = 0;
     this.plinthMesh.name = 'building-plinths';
-    this.plinthMesh.castShadow = true;
+    this.plinthMesh.castShadow = false;
     this.plinthMesh.receiveShadow = false;
     this.scene.add(this.plinthMesh);
 
@@ -1023,7 +1090,7 @@ export class BuildingSystem {
     this.gableRoofMesh.frustumCulled = false;
     this.gableRoofMesh.count = 0;
     this.gableRoofMesh.name = 'building-gable-roofs';
-    this.gableRoofMesh.castShadow = true;
+    this.gableRoofMesh.castShadow = false;
     this.gableRoofMesh.receiveShadow = false;
     this.scene.add(this.gableRoofMesh);
 
@@ -1032,9 +1099,35 @@ export class BuildingSystem {
     this.hipRoofMesh.frustumCulled = false;
     this.hipRoofMesh.count = 0;
     this.hipRoofMesh.name = 'building-hip-roofs';
-    this.hipRoofMesh.castShadow = true;
+    this.hipRoofMesh.castShadow = false;
     this.hipRoofMesh.receiveShadow = false;
     this.scene.add(this.hipRoofMesh);
+
+    // Layer-1 shadow proxies (PERF-11 / PKT-09). Each proxy is the same
+    // geometry, material and capacity as its main pool, and it *shares* the
+    // main `instanceMatrix` buffer instead of owning one, so the shadow pass
+    // costs no extra upload. `layers.set(1)` puts a proxy on layer 1 only: the
+    // main camera (layer 0) never draws it, while the sun's shadow camera
+    // enables layer 1 (PKT-04 in sky.js) and does. `count` covers only the near
+    // ring written first in rebuild(), which is all that can land inside the
+    // +-1,400 m shadow box; the remaining ~90 % of building triangles leave the
+    // shadow pass entirely.
+    const makeShadowProxy = (main, name) => {
+      const proxy = new THREE.InstancedMesh(main.geometry, main.material, main.instanceMatrix.count);
+      proxy.instanceMatrix = main.instanceMatrix;
+      proxy.layers.set(1);
+      proxy.castShadow = true;
+      proxy.receiveShadow = false;
+      proxy.frustumCulled = false;
+      proxy.count = 0;
+      proxy.name = name;
+      this.scene.add(proxy);
+      return proxy;
+    };
+    this.shadowMesh = makeShadowProxy(this.mesh, 'buildings-shadow');
+    this.plinthShadowMesh = makeShadowProxy(this.plinthMesh, 'building-plinths-shadow');
+    this.gableRoofShadowMesh = makeShadowProxy(this.gableRoofMesh, 'building-gable-roofs-shadow');
+    this.hipRoofShadowMesh = makeShadowProxy(this.hipRoofMesh, 'building-hip-roofs-shadow');
 
     // Ruined footprints live in their own instanced mesh: a bombed block is
     // drawn as a multi-piece debris field (wall stubs, slabs, core) without
@@ -1050,7 +1143,29 @@ export class BuildingSystem {
     this.ruinMesh.frustumCulled = false;
     this.ruinMesh.count = 0;
     this.ruinMesh.name = 'ruin-pieces';
+    // Rubble keeps casting (PERF-11 leaves collapseMesh and ruinMesh on the
+    // main layer 0, both small pools).
+    this.ruinMesh.castShadow = true;
     this.scene.add(this.ruinMesh);
+
+    // Dedicated pool for the handful of buildings that are mid-collapse. They
+    // used to be re-instanced into the main city mesh, which forced a full city
+    // rebuild on every frame of a 2.4-3.8 s collapse (PERF-03): the city mesh is
+    // now rebuilt once when the collapse starts and once when it ends, while the
+    // burning block animates inside this small pool.
+    const collapseCap = 512;
+    this.collapseMesh = new THREE.InstancedMesh(geo, this.material, collapseCap);
+    this.collapseMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.collapseMesh.instanceColor = new THREE.InstancedBufferAttribute(
+      new Float32Array(collapseCap * 3).fill(1), 3,
+    );
+    this.collapseMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+    this.collapseMesh.frustumCulled = false;
+    this.collapseMesh.count = 0;
+    this.collapseMesh.name = 'building-collapse';
+    this.collapseMesh.castShadow = true;
+    this.collapseMesh.receiveShadow = false;
+    this.scene.add(this.collapseMesh);
 
     this.streetTexture = makeStreetTexture();
     this.roadMaterial = new THREE.MeshLambertMaterial({
@@ -1137,15 +1252,21 @@ export class BuildingSystem {
     // Collapse timers are pure data, so they advance headlessly too and a
     // finished building only then becomes permanent rubble (and a new ember).
     if (this.collapsing.size > 0) {
+      let finished = false;
       for (const [key, c] of this.collapsing) {
         c.t += step;
         if (c.t >= c.duration) {
           this.collapsing.delete(key);
           this.destroyed.add(key);
           this._registerRuinFire(c);
+          finished = true;
         }
       }
-      this._needsRebuild = true;
+      // The burn/fall animation lives in its own small pool, so it can advance
+      // without re-streaming the city. Only a finished collapse changes the
+      // standing set (intact block out, permanent ruin in) and needs a rebuild.
+      this._updateCollapseMesh();
+      if (finished) this._needsRebuild = true;
       this.stats.destroyed = this.destroyed.size + this.collapsing.size;
     }
     this.stats.ruinFires = this.ruinFires.length;
@@ -1184,6 +1305,7 @@ export class BuildingSystem {
           .addScalar(0.18)
           .lerp(_nightAmb, night);
         mat.uniforms.uNight.value = night;
+        if (mat.uniforms.uSkyColor && sky.skyColor) mat.uniforms.uSkyColor.value.copy(sky.skyColor);
       }
       this.lightMaterial.opacity = clamp(sky.night * 1.08, 0, 0.80);
       this.lightMesh.visible = sky.night > 0.12 && this.lightMesh.count > 0;
@@ -1697,6 +1819,7 @@ export class BuildingSystem {
   resetDamage() {
     this.destroyed.clear();
     this.collapsing.clear();
+    this._updateCollapseMesh(); // drops the collapse pool back to 0 instances
     this.buildingHp.clear();
     this.ruinFires.length = 0;
     this.craters.length = 0;
@@ -2077,59 +2200,119 @@ export class BuildingSystem {
 
     const builders = { addBox, addPlinth, addGableRoof, addHipRoof };
 
+    // Stream every candidate once, keeping the per-settlement chunk so the
+    // buildings can be written in two passes: the near ring first, then the
+    // rest (PERF-11). The near ring is exactly the set the layer-1 shadow
+    // proxies draw, and they read it as a prefix of the shared buffer.
+    const chunks = [];
+    let streamed = 0;
     for (const s of settlements) {
-      if (n >= limit) break;
-      const stream = this._streamBuildingsLOD(s, camX, camZ, rClose, rMid, rFar, limit - n);
-      for (let i = 0; i < stream.length; i++) {
-        if (n >= limit) break;
-        const { b, lodLevel } = stream[i];
-        const g = this._ground(b);
-        const key = buildingKey(s, b);
-        if (this.destroyed.has(key)) {
-          // Permanent multi-piece ruin: jagged wall stubs, tilted slabs and a
-          // scorched debris core where the tower used to be.
-          this._addRuin(addRuinBox, b, g);
-          continue;
-        }
-        const c = this.collapsing.get(key);
-        if (c) {
-          this._addCollapse(addBox, b, g, c);
-          continue;
-        }
-        if (lodLevel === 0) lodClose++;
-        else if (lodLevel === 1) lodMid++;
-        else lodFar++;
+      if (streamed >= limit) break;
+      const stream = this._streamBuildingsLOD(s, camX, camZ, rClose, rMid, rFar, limit - streamed);
+      if (stream.length === 0) continue;
+      chunks.push({ s, stream });
+      streamed += stream.length;
+    }
 
-        // Partially strafed blocks darken toward char as their HP drains.
-        let tint = 1;
-        const hp = this.buildingHp.get(key);
-        if (hp !== undefined) {
-          const ratio = clamp(hp / this._hpFor(b), 0, 1);
-          tint = 0.58 + 0.42 * ratio;
-        }
-        this._addSilhouette(builders, b, g, lodLevel, tint);
+    const writeBuilding = (s, b, lodLevel) => {
+      if (n >= limit) return;
+      const g = this._ground(b);
+      // g.ground is the minimum elevation across the center and all four
+      // rotated footprint corners. Anything truly stranded in deep open water
+      // is rejected outright (no warehouse standing in the middle of the bay).
+      if (!Number.isFinite(g.ground) || g.ground < -2.2) return;
+
+      // Shallow waterfront (Monfalcone shipyard/port piers, Trieste docks,
+      // Marina Julia boathouses right on the coast): keep the real OSM
+      // building instead of deleting it, and raise it onto an explicit stone/
+      // concrete harbour quay that rises out of the sea to a dry deck.
+      // `g` itself is never mutated: `_groundCache` stays canonical for the
+      // grounding audit, so all placement overrides live in a local copy.
+      let placeG = g;
+      if (g.ground < 0.35) {
+        const quayY = Math.max(g.floorY, 0.85);
+        addPlinth(b.x, -5.5, b.z, b.w + 4.0, quayY - (-5.5), b.d + 4.0, b.rot, 0x8a877d);
+        placeG = { ...g, floorY: quayY, top: quayY + b.h, base: -5.5 };
+      }
+
+      const key = buildingKey(s, b);
+      if (this.destroyed.has(key)) {
+        // Permanent multi-piece ruin: jagged wall stubs, tilted slabs and a
+        // scorched debris core where the tower used to be. Rubble rests on the
+        // quay deck, not on the seabed, so waterfront ruins stay visible.
+        this._addRuin(addRuinBox, b, { ...placeG, base: placeG.floorY });
+        return;
+      }
+      // Mid-collapse blocks are drawn by the dedicated collapse pool, so the
+      // city rebuild neither re-instances them nor touches their animation.
+      if (this.collapsing.has(key)) return;
+      if (lodLevel === 0) lodClose++;
+      else if (lodLevel === 1) lodMid++;
+      else lodFar++;
+
+      // Partially strafed blocks darken toward char as their HP drains.
+      let tint = 1;
+      const hp = this.buildingHp.get(key);
+      if (hp !== undefined) {
+        const ratio = clamp(hp / this._hpFor(b), 0, 1);
+        tint = 0.58 + 0.42 * ratio;
+      }
+      this._addSilhouette(builders, b, placeG, lodLevel, tint);
+    };
+
+    const shadowR2 = SHADOW_NEAR_R * SHADOW_NEAR_R;
+
+    // Pass 1: buildings close enough to land inside the sun shadow box.
+    for (let ci = 0; ci < chunks.length; ci++) {
+      const { s, stream } = chunks[ci];
+      for (let i = 0; i < stream.length; i++) {
+        const item = stream[i];
+        const b = item.b;
+        const dx = b.x - camX;
+        const dz = b.z - camZ;
+        if (dx * dx + dz * dz > shadowR2) continue;
+        writeBuilding(s, b, item.lodLevel);
+      }
+    }
+    const nearN = n;
+    const nearPN = pn;
+    const nearGN = gn;
+    const nearHN = hn;
+
+    // Pass 2: everything beyond the shadow ring (drawn, but casting nothing).
+    for (let ci = 0; ci < chunks.length; ci++) {
+      const { s, stream } = chunks[ci];
+      for (let i = 0; i < stream.length; i++) {
+        const item = stream[i];
+        const b = item.b;
+        const dx = b.x - camX;
+        const dz = b.z - camZ;
+        if (dx * dx + dz * dz <= shadowR2) continue;
+        writeBuilding(s, b, item.lodLevel);
       }
     }
 
+    // The proxies share the main instance buffers, so the shadow-pass geometry
+    // is just this prefix. Nothing else needs uploading for them.
+    if (this.shadowMesh) this.shadowMesh.count = nearN;
+    if (this.plinthShadowMesh) this.plinthShadowMesh.count = nearPN;
+    if (this.gableRoofShadowMesh) this.gableRoofShadowMesh.count = nearGN;
+    if (this.hipRoofShadowMesh) this.hipRoofShadowMesh.count = nearHN;
+
     this.mesh.count = n;
-    this.mesh.instanceMatrix.needsUpdate = true;
-    if (colorDirty && this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
+    this._uploadInstances('mesh', this.mesh, n, colorDirty);
 
     this.plinthMesh.count = pn;
-    this.plinthMesh.instanceMatrix.needsUpdate = true;
-    if (plinthColorDirty && this.plinthMesh.instanceColor) this.plinthMesh.instanceColor.needsUpdate = true;
+    this._uploadInstances('plinth', this.plinthMesh, pn, plinthColorDirty);
 
     this.gableRoofMesh.count = gn;
-    this.gableRoofMesh.instanceMatrix.needsUpdate = true;
-    if (gableColorDirty && this.gableRoofMesh.instanceColor) this.gableRoofMesh.instanceColor.needsUpdate = true;
+    this._uploadInstances('gable', this.gableRoofMesh, gn, gableColorDirty);
 
     this.hipRoofMesh.count = hn;
-    this.hipRoofMesh.instanceMatrix.needsUpdate = true;
-    if (hipColorDirty && this.hipRoofMesh.instanceColor) this.hipRoofMesh.instanceColor.needsUpdate = true;
+    this._uploadInstances('hip', this.hipRoofMesh, hn, hipColorDirty);
 
     this.ruinMesh.count = rn;
-    this.ruinMesh.instanceMatrix.needsUpdate = true;
-    if (ruinColorDirty && this.ruinMesh.instanceColor) this.ruinMesh.instanceColor.needsUpdate = true;
+    this._uploadInstances('ruin', this.ruinMesh, rn, ruinColorDirty);
 
     // Streets: one ribbon mesh for every settlement road in range. Distant
     // roads are sub-pixel, so they are culled, and the ribbon is only rebuilt
@@ -2168,7 +2351,10 @@ export class BuildingSystem {
           const nz = dx / len;
           const lx = mx + nx * (r.width * 0.5 + 4.5) * side;
           const lz = mz + nz * (r.width * 0.5 + 4.5) * side;
-          _p.set(lx, terrainHeight(lx, lz) + 6.2, lz);
+          // Never float a lamp post out over open water.
+          const ly = terrainHeight(lx, lz);
+          if (!Number.isFinite(ly) || ly < 0.25) continue;
+          _p.set(lx, ly + 6.2, lz);
           _e.set(0, 0, 0);
           _q.setFromEuler(_e);
           _s.set(1.4, 1.4, 1.4);
@@ -2181,7 +2367,7 @@ export class BuildingSystem {
     }
 
     this.lightMesh.count = ln;
-    this.lightMesh.instanceMatrix.needsUpdate = true;
+    this._uploadInstances('light', this.lightMesh, ln);
 
     if (this._cratersDirty) this._rebuildCraters();
 
@@ -2359,6 +2545,66 @@ export class BuildingSystem {
         }
       }
     }
+  }
+
+  // Mark only the live prefix of an instanced pool for upload (PERF-06).
+  // `instanceMatrix.needsUpdate = true` on its own streams the entire
+  // allocation, so a rebuild that drew 2,500 hip roofs still pushed all 13,000
+  // matrices. The used range is `count * itemSize` (16 floats per instance
+  // matrix, 3 per instance colour), and a pool that is empty now and was empty
+  // on the previous upload is skipped completely.
+  _uploadInstances(key, mesh, count, colorDirty = false) {
+    if (!mesh) return;
+    const prev = this._prevCounts[key] || 0;
+    this._prevCounts[key] = count;
+    if (count <= 0 && prev <= 0) return;
+
+    const mat = mesh.instanceMatrix;
+    if (mat) {
+      mat.clearUpdateRanges();
+      mat.addUpdateRange(0, Math.max(0, count) * 16);
+      mat.needsUpdate = true;
+    }
+    if (colorDirty && mesh.instanceColor) {
+      mesh.instanceColor.clearUpdateRanges();
+      mesh.instanceColor.addUpdateRange(0, Math.max(0, count) * 3);
+      mesh.instanceColor.needsUpdate = true;
+    }
+  }
+
+  // Re-instance every building that is currently mid-collapse into the small
+  // dedicated pool. Called once per frame while `collapsing` is non-empty (and
+  // on the frame it empties, so `count` drops back to 0) instead of rebuilding
+  // the whole city.
+  _updateCollapseMesh() {
+    const mesh = this.collapseMesh;
+    if (!mesh) return;
+    const cap = mesh.instanceMatrix.count;
+    let n = 0;
+
+    const addBox = (x, baseY, z, w, h, d, rot, color, tiltX = 0, tiltZ = 0) => {
+      if (n >= cap || !(h > 0) || !(w > 0) || !(d > 0)) return false;
+      _p.set(x, baseY, z);
+      _e.set(tiltX, rot || 0, tiltZ);
+      _q.setFromEuler(_e);
+      _s.set(w, h, d);
+      _m.compose(_p, _q, _s);
+      mesh.setMatrixAt(n, _m);
+      _c.setHex(color).convertSRGBToLinear();
+      mesh.setColorAt(n, _c);
+      n++;
+      return true;
+    };
+
+    for (const c of this.collapsing.values()) {
+      if (n >= cap) break;
+      // Same grounding record the city rebuild uses, so the leaning block keeps
+      // standing exactly where its intact counterpart stood.
+      this._addCollapse(addBox, c.b, this._ground(c.b), c);
+    }
+
+    mesh.count = n;
+    this._uploadInstances('collapse', mesh, n, n > 0);
   }
 
   // Live burn & collapse: the same footprint leans, shakes, shrinks and turns
@@ -2609,6 +2855,20 @@ export class BuildingSystem {
     this.gableRoofMesh?.removeFromParent();
     this.hipRoofMesh?.removeFromParent();
     this.ruinMesh.removeFromParent();
+    // collapseMesh shares this.mesh's geometry and this.material, so those are
+    // disposed above; only the scene reference is dropped here.
+    this.collapseMesh?.removeFromParent();
+    this.collapseMesh = null;
+    // Shadow proxies share the main geometry, materials and instance buffers,
+    // so they must not dispose any of them — just leave the scene.
+    this.shadowMesh?.removeFromParent();
+    this.shadowMesh = null;
+    this.plinthShadowMesh?.removeFromParent();
+    this.plinthShadowMesh = null;
+    this.gableRoofShadowMesh?.removeFromParent();
+    this.gableRoofShadowMesh = null;
+    this.hipRoofShadowMesh?.removeFromParent();
+    this.hipRoofShadowMesh = null;
     this.roadMesh.removeFromParent();
     this.lightMesh.removeFromParent();
     this.craterMesh.removeFromParent();

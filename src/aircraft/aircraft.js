@@ -16,12 +16,26 @@ const _m = new THREE.Matrix4();
 const _fbRight = new THREE.Vector3();
 const _fbUp = new THREE.Vector3();
 const _fbTmp = new THREE.Vector3();
+const _chaseUp = new THREE.Vector3();
+const _fwdUp = new THREE.Vector3();
 
 // Near planes tuned per rig: the cockpit keeps a tight near so the instrument
 // panel never clips, while every external rig pushes near out to 1.5 (12x more
 // depth precision at the horizon, no shader-side depth hacks needed).
 const COCKPIT_NEAR = 0.22;
 const EXTERNAL_NEAR = 1.5;
+
+// Locked follow camera presets, cycled by repeatedly pressing V. Preset 0 keeps
+// the original 20 m dead-astern / 4% climb rigid stick; presets 1-4 add distance,
+// elevation and an exponential "catch-up" lag so the rig glides cinematically
+// behind the jet instead of being welded to it.
+const FOLLOW_PRESETS = [
+  { label: 'TIGHT', dist: 20, elevRad: Math.atan(0.04), elevLabel: '4%', catchup: 0, lead: 12 }, // 1/5: exact original rigid stick
+  { label: 'CLOSE', dist: 35, elevRad: 6 * Math.PI / 180, elevLabel: '6°', catchup: 9.5, lead: 14 }, // 2/5: subtle cinematic catch-up
+  { label: 'MEDIUM', dist: 60, elevRad: 10 * Math.PI / 180, elevLabel: '10°', catchup: 6.2, lead: 16 }, // 3/5: 60m / 10° tactical cinematic
+  { label: 'WIDE', dist: 95, elevRad: 14 * Math.PI / 180, elevLabel: '14°', catchup: 4.4, lead: 18 }, // 4/5: sweeping dogfight catch-up
+  { label: 'HERO', dist: 140, elevRad: 18 * Math.PI / 180, elevLabel: '18°', catchup: 3.1, lead: 20 }, // 5/5: dramatic inertial catch-up
+];
 
 export class Aircraft {
   constructor(scene, world) {
@@ -45,6 +59,13 @@ export class Aircraft {
     this.chaseYaw = 0;
     this.chasePitch = 0;
     this.chaseDist = CONFIG.camera.chaseDistance;
+    this.chaseLocked = false;
+    // Detach-jerk accumulator: sub-4px jitter is ignored and slow drift bleeds
+    // off, so only a real flick or quick swipe unlocks the follow camera.
+    this._detachAccum = 0;
+    // Index into FOLLOW_PRESETS; survives setMode()/detach so re-pressing V
+    // returns to the preset the pilot was flying. Reset zeroes it.
+    this.followPresetIndex = 0;
     this.orbitAngle = 0;
     // Telephoto flyby camera anchor + Doppler shift fed to the engine audio.
     this.dopplerRatio = 1.0;
@@ -54,6 +75,13 @@ export class Aircraft {
     this._camPos = new THREE.Vector3();
     this._camInit = false;
     this._shake = 0;
+    // Helmet-cam head inertia (metres / radians). Small smoothed scalars driven
+    // by G-load and roll rate so the eye socket never snaps: vertical sag under
+    // positive G, lateral lean and a subtle bank lag with roll rate. Allocated
+    // once at construction so the per-frame camera path stays allocation-free.
+    this._headSag = 0;
+    this._headLean = 0;
+    this._headTilt = 0;
     this._airport = null;
     this._airportTimer = 0;
 
@@ -76,6 +104,7 @@ export class Aircraft {
     this._env = {
       airport: null, windX: 0, windZ: 0,
       night: 0, rain: 0, lowFuel: false, rwrThreat: false, flameout: false, time: 0,
+      cockpitView: false, sunDir: null, sunColor: null, overcast: 0,
     };
     this._state = { time: 0 };
   }
@@ -88,6 +117,9 @@ export class Aircraft {
     this.lookPitch = 0;
     this._camInit = false;
     this.mode = 'cockpit';
+    this.chaseLocked = false;
+    this._detachAccum = 0;
+    this.followPresetIndex = 0;
     this._airport = null;
     this._airportTimer = 0;
   }
@@ -97,6 +129,9 @@ export class Aircraft {
     this._camInit = false;
     this._flybyAnchored = false;
     this.dopplerRatio = 1.0;
+    // Any mode switch drops the rigid follow lock so the new rig is free.
+    this.chaseLocked = false;
+    this._detachAccum = 0;
     if (mode === 'cockpit') {
       this.camera.fov = CONFIG.camera.cockpitFov;
     } else {
@@ -116,6 +151,36 @@ export class Aircraft {
   toggleCockpit() {
     this.setMode(this.mode === 'cockpit' ? 'chase' : 'cockpit');
     return this.mode;
+  }
+
+  // Locked "follow" view: dead astern at 20 m on a 4% climb by default, hard-
+  // locked until the pilot moves the mouse. Repeated presses while locked cycle
+  // through the 5 cinematic presets; re-pressing after a detach or from another
+  // camera mode snaps back to the preset the pilot was last using.
+  snapFollowCamera() {
+    const wasChase = this.mode === 'chase';
+    const wasLocked = wasChase && this.chaseLocked;
+    if (wasLocked) {
+      this.followPresetIndex = (this.followPresetIndex + 1) % FOLLOW_PRESETS.length;
+    }
+    const p = FOLLOW_PRESETS[this.followPresetIndex];
+    // setMode() clears _camInit and the lock; re-apply the preset pose below.
+    this.setMode('chase');
+    this.chaseDist = p.dist;
+    this.chaseYaw = 0;
+    this.chasePitch = p.elevRad;
+    this.chaseLocked = true;
+    this._detachAccum = 0;
+    // Glide from the current camera position only when stepping into a preset
+    // that has catch-up; from another camera mode or onto the rigid preset 0,
+    // snap cleanly to the new pose instead.
+    this._camInit = wasChase && p.catchup > 0;
+    return {
+      mode: 'chase',
+      index: this.followPresetIndex,
+      count: FOLLOW_PRESETS.length,
+      preset: p,
+    };
   }
 
   update(dt, cmd, weather, input, started, cockpitAlerts = null) {
@@ -139,6 +204,9 @@ export class Aircraft {
     this.beacon.visible = night > 0.25 && strobe > 0.5;
     this.landingLight.intensity = night > 0.2 && flight.gearPos > 0.5
       ? 700 * smoothstep(0.2, 0.7, night) : 0;
+    // A zero-intensity light still costs a full loop in every lit shader;
+    // hiding it drops the shadow-casting SpotLight from the program.
+    this.landingLight.visible = night > 0.2 && flight.gearPos > 0.5;
 
     // cockpit screens
     this._airportTimer -= dt;
@@ -173,6 +241,14 @@ export class Aircraft {
     env.rwrThreat = !!alerts?.rwrThreat;
     env.flameout = !!alerts?.flameout;
     env.time = this._state.time;
+    // Cockpit sun self-shadowing: the live world sun direction/colour and the
+    // overcast fraction drive the cockpit-only shadow spotlight in cockpit.js.
+    env.sunDir = weather?.sunDir || null;
+    env.sunColor = weather?.sunColor || null;
+    env.overcast = weather?.state?.overcast ?? 0;
+    // Same test as updateF16Visual (f16.js): only the cockpit view needs the
+    // interior lights and the 10 Hz MFD redraw.
+    env.cockpitView = !!(started && this.mode === 'cockpit');
 
     this.cockpit.update(dt, flight, env);
 
@@ -245,19 +321,43 @@ export class Aircraft {
           }
         }
       }
-      _v.set(0, 1.048, -2.18).applyQuaternion(q).add(pos);
+      // Helmet-cam head inertia: positive G compresses the head down onto the
+      // spine, roll rate makes it lean and lag the airframe's bank. Exponential
+      // smoothing at 6.5 Hz keeps it weighty without ever lagging behind a
+      // snap roll; dt === 0 (restore path) snaps straight to the target.
+      const targetSag = clamp(-((flight.gLoad || 1) - 1) * 0.0085, -0.042, 0.022);
+      const rollRate = flight.rates ? flight.rates.z : 0;
+      const targetLean = clamp(-rollRate * 0.022, -0.042, 0.042);
+      const targetTilt = clamp(-rollRate * 0.025, -0.045, 0.045);
+      if (dt > 0) {
+        const hk = 1 - Math.exp(-6.5 * dt);
+        this._headSag += (targetSag - this._headSag) * hk;
+        this._headLean += (targetLean - this._headLean) * hk;
+        this._headTilt += (targetTilt - this._headTilt) * hk;
+      } else {
+        this._headSag = targetSag;
+        this._headLean = targetLean;
+        this._headTilt = targetTilt;
+      }
+      // Wide helmet-cam eye: sits just forward of the ACES II headrest front
+      // face (-2.06) and high enough that the 70° lens frames both MFDs, the
+      // 3D ICP, EHSI, throttle/sidestick hands, knees and both sill rails with
+      // sky above the glare shield.
+      _v.set(this._headLean, 1.14 + this._headSag, -2.13).applyQuaternion(q).add(pos);
       cam.position.copy(_v);
       _e.set(0, 0, 0);
       _lookQ.setFromEuler(_e);
       _q.copy(q).multiply(_lookQ);
-      // apply head look in aircraft local frame
-      _e.set(this.lookPitch, this.lookYaw, 0, 'YXZ');
+      // apply head look in aircraft local frame, plus a fixed -3.2° framing
+      // pitch that puts the boresight/WAR-HUD combiner on the 0.46h line at 70°.
+      _e.set(this.lookPitch - 0.056, this.lookYaw, this._headTilt, 'YXZ');
       _lookQ.setFromEuler(_e);
       _q.multiply(_lookQ);
       cam.quaternion.copy(_q);
 
-      // buffet / g shake
-      const buffet = flight.stall ? 1 : 0;
+      // buffet / g shake — stall buffet plus the ISA AoA/transonic buffet the
+      // flight model publishes (smooth blend so it swells in instead of snapping).
+      const buffet = Math.max(flight.stall ? 1 : 0, flight.buffet || 0);
       this._shake += ((buffet * 0.8 + flight.turbulence * 0.4) - this._shake) * (1 - Math.exp(-3 * dt));
       if (this._shake > 0.001) {
         const t = this._state.time;
@@ -272,11 +372,38 @@ export class Aircraft {
     }
 
     if (this.mode === 'chase' || this.mode === 'orbit') {
-      if (input) {
+      // Locked follow rig: only real mouse motion (pointer-lock look or
+      // left-drag) detaches it. Keys and the wheel are deliberately ignored so
+      // the camera "sticks" to the jet until the pilot grabs the mouse.
+      const locked = this.mode === 'chase' && this.chaseLocked;
+      const p = FOLLOW_PRESETS[this.followPresetIndex] || FOLLOW_PRESETS[0];
+      // Detach intent. Small mouse bumps must never steal the locked view, so
+      // sub-4px jitter is discarded outright, the accumulator bleeds off at
+      // 90 px/s (spaced-out nudges can never pile up), and only a real jerk —
+      // a single-frame >= 22 px flick or a quick swipe summing >= 42 px —
+      // hands the camera back to the pilot.
+      let moveMag = 0;
+      if (locked) {
+        this._detachAccum = Math.max(0, this._detachAccum - dt * 90);
+        if (input && (input.pointerLocked || (input.mouse.buttons & 1))) {
+          moveMag = Math.hypot(input.mouse.dx || 0, input.mouse.dy || 0);
+          if (moveMag >= 4) this._detachAccum += moveMag;
+        }
+      }
+      const hasMouseMove = locked && (moveMag >= 22 || this._detachAccum >= 42);
+
+      if (hasMouseMove) {
+        this._detachAccum = 0;
+        this.chaseLocked = false;
+        this.chaseYaw = -(input.mouse.dx || 0) * 0.005;
+        this.chasePitch = clamp(p.elevRad + (input.mouse.dy || 0) * 0.004, -0.8, 1.1);
+        // Seed the free rig from the active preset so the hand-off never jumps.
+        this.chaseDist = p.dist;
+      } else if (!locked && input) {
         if (input.mouse.wheel) {
           this.chaseDist = clamp(this.chaseDist + input.mouse.wheel * 3, 12, 90);
         }
-        if ((input.mouse.buttons & 1) && (input.mouse.dx || input.mouse.dy)) {
+        if ((input.pointerLocked || (input.mouse.buttons & 1)) && (input.mouse.dx || input.mouse.dy)) {
           this.chaseYaw -= input.mouse.dx * 0.005;
           this.chasePitch = clamp(this.chasePitch + input.mouse.dy * 0.004, -0.8, 1.1);
         }
@@ -291,11 +418,74 @@ export class Aircraft {
           if (zoom) this.chaseDist = clamp(this.chaseDist + zoom * 38 * dt, 12, 120);
         }
       }
+
+      if (this.chaseLocked && this.mode === 'chase') {
+        // Preset pose: p.dist dead astern along the jet's 3D tail vector, raised
+        // by p.dist * sin(elev). Camera-up follows world +Y projected
+        // perpendicular to the flight vector so the horizon stays level in
+        // climbs and turns, easing into the airframe's +Y near-vertical.
+        const fwd = flight.forward;
+        _fwdUp.set(0, 1, 0).applyQuaternion(q);
+        _chaseUp.set(0, 1, 0).addScaledVector(fwd, -fwd.y);
+        const perpLen = _chaseUp.length();
+        if (perpLen > 1e-3) _chaseUp.multiplyScalar(1 / perpLen);
+        else _chaseUp.copy(_fwdUp);
+        if (Math.abs(fwd.y) > 0.96) {
+          const t = clamp((Math.abs(fwd.y) - 0.96) / 0.04, 0, 1);
+          _chaseUp.lerp(_fwdUp, t).normalize();
+        }
+
+        _v.copy(pos)
+          .addScaledVector(fwd, -p.dist * Math.cos(p.elevRad))
+          .addScaledVector(_chaseUp, p.dist * Math.sin(p.elevRad));
+        // keep above terrain
+        const gh = this.world.heightAt(_v.x, _v.z) + 2.5;
+        if (_v.y < gh) _v.y = gh;
+
+        if (p.catchup === 0 || !this._camInit) {
+          // Rigid stick — preset 0 (and every fresh snap) has no spring lag.
+          cam.position.copy(_v);
+        } else {
+          // Cinematic catch-up: exponential lag behind the ideal pose, so the
+          // rig sweeps out in turns and trails the jet under acceleration.
+          const k = 1 - Math.exp(-p.catchup * dt);
+          cam.position.lerp(_v, k);
+          // Cap the trailing lag so even at Mach 2 the jet stays in frame...
+          const maxLag = p.dist * 1.45;
+          _v2.copy(cam.position).sub(_v);
+          const lag = _v2.length();
+          if (lag > maxLag) {
+            cam.position.copy(_v).addScaledVector(_v2.multiplyScalar(1 / lag), maxLag);
+          }
+          // ...and snap outright past the panic radius (teleport / respawn).
+          const panic = p.dist * 2.2;
+          if (cam.position.distanceToSquared(pos) > panic * panic) cam.position.copy(_v);
+          // Catch-up can cut across a ridge; never let the lens go underground.
+          const camGh = this.world.heightAt(cam.position.x, cam.position.z) + 2.5;
+          if (cam.position.y < camGh) cam.position.y = camGh;
+        }
+        this._camInit = true;
+
+        // Smooth look-target framing: lead the jet along its velocity vector and
+        // keep it slightly high in frame so turns and burners read dramatically.
+        // Preset 0 keeps the original +0.35 m framing exactly.
+        const lookRise = p.catchup === 0 ? 0.35 : 0.35 + p.dist * 0.01;
+        _v2.copy(pos).addScaledVector(fwd, p.lead).addScaledVector(_chaseUp, lookRise);
+        cam.up.copy(_chaseUp);
+        cam.lookAt(_v2);
+        cam.fov = CONFIG.camera.externalFov;
+        cam.near = EXTERNAL_NEAR;
+        cam.updateProjectionMatrix();
+        return;
+      }
+
       const hdg = Math.atan2(flight.forward.x, -flight.forward.z);
       const yaw = hdg + Math.PI + this.chaseYaw;
       const pitch = clamp(this.chasePitch, -0.6, 1.2);
       const dist = this.chaseDist;
-      const targetY = pos.y + Math.sin(pitch + 0.18) * dist * 0.55 + 2.4;
+      // Vertical offset is exactly sin(pitch) * dist so detaching from any
+      // follow preset continues from the locked position without a jump.
+      const targetY = pos.y + Math.sin(pitch) * dist + 0.25;
       _v.set(
         pos.x + Math.sin(yaw) * Math.cos(pitch) * dist,
         targetY,
@@ -385,8 +575,9 @@ export class Aircraft {
       dist = Math.hypot(ap.x - f.position.x, ap.z - f.position.z);
     }
     return {
-      kts: f.speed * 1.94384,
-      mach: f.speed / 340.3,
+      kts: (Number.isFinite(f.ias) ? f.ias : f.speed) * 1.94384,
+      tasKts: f.speed * 1.94384,
+      mach: Number.isFinite(f.mach) ? f.mach : f.speed / 340.3,
       altFt: f.position.y * 3.28084,
       aglFt: f.agl * 3.28084,
       vsFpm: f.verticalSpeed * 196.85,
@@ -406,6 +597,15 @@ export class Aircraft {
       brake: f.brake,
       afterburner: f.afterburner,
       speedMs: f.speed,
+      iasMs: Number.isFinite(f.ias) ? f.ias : f.speed,
+      lefDeg: f.lefDeg || 0,
+      catMode: f.catMode || 'CAT I',
+      massKg: f.massKg || CONFIG.aircraft.mass,
+      buffet: f.buffet || 0,
+      brakeTemp: f.brakeTemp || 0,
+      antiSkid: !!f.antiSkid,
+      aerobraking: !!f.aerobraking,
+      gearDown: f.gearPos > 0.5,
       altitude: f.position.y,
       airport: ap,
       bearing,

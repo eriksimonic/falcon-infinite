@@ -15,6 +15,10 @@ import { terrainHeight } from './terrain.js';
 
 const RIVER_STEP_M = 25; // resample distance along a river centreline
 const RIVER_LIFT_M = 0.35; // metres above the terrain surface
+// The drawn strip is a touch wider than the OSM waterway width so the shader
+// has room to feather an organic, noise-warped bank contour into the terrain
+// instead of ending on a hard geometric edge.
+const RIVER_WIDTH_SCALE = 1.38;
 // The Adriatic plane sits 0.45 m below y=0 and the coastal deltas around
 // Monfalcone / Grado are only 0..2 m high. Inland ribbons must stay clear of
 // that band entirely, otherwise the sea plane and the river sheet Z-fight.
@@ -222,11 +226,14 @@ function signedArea2D(pts) {
  *          lakes?: Array<Array<[number,number]>>}|null} data
  * @param {(x:number, z:number) => number} heightAt
  * @returns {{positions: Float32Array, normals: Float32Array,
- *            indices: Uint32Array, riverSegments: number, lakeCount: number}}
+ *            uvs: Float32Array, indices: Uint32Array,
+ *            riverSegments: number, lakeCount: number,
+ *            filteredSlopedBanks: number}}
  */
 export function buildInlandWaterGeometry(data, heightAt) {
   const positions = [];
   const normals = [];
+  const uvs = [];
   const indices = [];
   let riverSegments = 0;
   let lakeCount = 0;
@@ -321,15 +328,39 @@ export function buildInlandWaterGeometry(data, heightAt) {
     // Emit one ribbon per contiguous kept run, with a strictly non-increasing
     // downstream elevation. Both banks share the centreline's level, so a
     // river in a steep canyon (Sabotin) is never tilted sideways up the cliff.
+    //
+    // UVs carry (across, downstream metres): `vUv.x` is the bank parameter
+    // (0 left, 1 right) and `vUv.y` is the cumulative distance `s` travelled
+    // along the run. The shader uses `s` both to advect flow streaks and to
+    // modulate the local width, so a reach swells into pools on the flats and
+    // pinches into rocky drops instead of staying a conveyor belt of constant
+    // width. The phase seed is derived from the first sample, so every river
+    // gets its own deterministic pool/rifle rhythm.
+    const seed = samples[0][0] * 0.013 + samples[0][1] * 0.017;
+
     const emitRun = (run) => {
       let prevPair = null;
       let monoY = NaN;
+      let s = 0;
+      let prevX = NaN;
+      let prevZ = NaN;
       for (let k = 0; k < run.length; k++) {
         const sampleIndex = run[k];
         const [x, z] = samples[sampleIndex];
         const hCentre = hs[sampleIndex];
         monoY = Number.isFinite(monoY) ? Math.min(monoY, hCentre) : hCentre;
         const waterY = monoY + RIVER_LIFT_M;
+
+        // Cumulative downstream distance (metres) along this run.
+        if (Number.isFinite(prevX)) s += Math.hypot(x - prevX, z - prevZ);
+        prevX = x;
+        prevZ = z;
+
+        // Organic width: wide pools, gravel bends and narrow rocky reaches.
+        const wVar = 0.85
+          + 0.16 * Math.sin(s * 0.011 + seed)
+          + 0.10 * Math.cos(s * 0.027 - seed * 1.7);
+        const localHalfWidth = halfWidth * RIVER_WIDTH_SCALE * wVar;
 
         // Tangent from the neighbours (one-sided at the ends).
         const a = samples[Math.max(0, sampleIndex - 1)];
@@ -343,15 +374,17 @@ export function buildInlandWaterGeometry(data, heightAt) {
         }
         dx /= len;
         dz /= len;
-        const nx = -dz * halfWidth;
-        const nz = dx * halfWidth;
+        const nx = -dz * localHalfWidth;
+        const nz = dx * localHalfWidth;
 
         const leftIdx = positions.length / 3;
         positions.push(x - nx, waterY, z - nz);
         normals.push(0, 1, 0);
+        uvs.push(0, s);
         const rightIdx = positions.length / 3;
         positions.push(x + nx, waterY, z + nz);
         normals.push(0, 1, 0);
+        uvs.push(1, s);
 
         if (prevPair) {
           const [pl, pr] = prevPair;
@@ -403,6 +436,9 @@ export function buildInlandWaterGeometry(data, heightAt) {
     for (const [x, z] of winding) {
       positions.push(x, level, z);
       normals.push(0, 1, 0);
+      // Lakes are flagged with a negative across coordinate so the shader can
+      // skip the river ribbon path (banks, flow advection, riffles) entirely.
+      uvs.push(-1, 0);
     }
     for (const face of faces) {
       if (!face || face.length !== 3) continue;
@@ -414,6 +450,7 @@ export function buildInlandWaterGeometry(data, heightAt) {
   return {
     positions: new Float32Array(positions),
     normals: new Float32Array(normals),
+    uvs: new Float32Array(uvs),
     indices: new Uint32Array(indices),
     riverSegments,
     lakeCount,
@@ -443,19 +480,25 @@ export class InlandWaterSystem {
         uSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.2) },
         uSunColor: { value: new THREE.Color(0xfff2d0) },
         uSkyColor: { value: new THREE.Color(0x8fb4c8) },
-        // Natural alpine river palette (linear space, like WaterSurface):
-        // deep muted slate-teal and a glacial emerald-green, never neon blue.
-        uDeep: { value: new THREE.Color(0x0d2b2e).convertSRGBToLinear() },
-        uShallow: { value: new THREE.Color(0x1e4e4a).convertSRGBToLinear() },
+        // Soča-style alpine palette (linear space, like WaterSurface): sampled
+        // from real satellite photography of the river, which reads as a muted
+        // glacial emerald-teal — a dark slate-emerald channel shading up to a
+        // soft desaturated turquoise-green on the gravel shelves.
+        uDeep: { value: new THREE.Color(0x1c555f).convertSRGBToLinear() },
+        uShallow: { value: new THREE.Color(0x326d6a).convertSRGBToLinear() },
         fogColor: { value: new THREE.Color(0x9fb9c9) },
         fogDensity: { value: 0.00002 },
       },
       vertexShader: /* glsl */`
         varying vec3 vWorld;
+        // Ribbon UVs: x = bank parameter (0 left .. 1 right, negative for
+        // lakes), y = cumulative downstream distance in metres.
+        varying vec2 vUv;
         #include <fog_pars_vertex>
         void main() {
           vec4 wp = modelMatrix * vec4(position, 1.0);
           vWorld = wp.xyz;
+          vUv = uv;
           vec4 mvPosition = viewMatrix * wp;
           gl_Position = projectionMatrix * mvPosition;
           #include <fog_vertex>
@@ -465,6 +508,7 @@ export class InlandWaterSystem {
         uniform float uTime;
         uniform vec3 uSunDir, uSunColor, uSkyColor, uDeep, uShallow;
         varying vec3 vWorld;
+        varying vec2 vUv;
         #include <common>
         #include <fog_pars_fragment>
 
@@ -534,13 +578,63 @@ export class InlandWaterSystem {
           vec3 o36 = rLayer(p, 36.0, 1.10, vec2(0.22, -0.16), t * 0.55);
           vec3 m180 = rLayer(p, 180.0, 0.20, vec2(0.035, 0.02), t * 0.30);
 
+          // -- River cross-section frame -------------------------------------
+          // Rivers carry (across, downstream metres) in the uv. The bank
+          // contour is warped by the three world-space noise octaves already
+          // in hand plus a bend asymmetry from the 180 m patch, so gravel bars
+          // crowd the outside of a bend and the rim never shows a straight
+          // polygon edge. Lakes (vUv.x = -1) skip this entirely.
+          float across = clamp(vUv.x, 0.0, 1.0);
+          float centerDist = 1.0 - abs(across * 2.0 - 1.0);
+          bool isRiver = vUv.x > -0.25;
+          float edgeAlpha = 1.0;
+          float riverMask = 1.0;
+          if (isRiver) {
+            float bankWarp = (o36.x - 0.5) * 0.36
+              + (o12.x - 0.5) * 0.24
+              + (o4.x - 0.5) * 0.12
+              + (m180.x - 0.5) * 0.18 * (across * 2.0 - 1.0);
+            riverMask = centerDist + bankWarp;
+            // Feather the outermost rim into the terrain; the fragment is
+            // discarded well before it can read as a cut-out polygon.
+            edgeAlpha = smoothstep(0.06, 0.24, riverMask);
+            if (edgeAlpha < 0.01) discard;
+          }
+
+          // Animated current: noise advected downstream in ribbon space, so
+          // streaks crawl with the water instead of drifting in world space.
+          float flowN = 0.5;
+          float flowAmp = 0.0;
+          float flowStreak = 0.0;
+          float riffle = 0.0;
+          vec2 flowTilt = vec2(0.0);
+          if (isRiver) {
+            vec2 flowCoord = vec2(
+              across * 6.5 + (o12.x - 0.5) * 1.2,
+              vUv.y * 0.045 - t * 0.55);
+            vec3 flowSample = rNoise(flowCoord);
+            flowN = flowSample.x;
+            flowAmp = smoothstep(0.06, 0.30, riverMask);
+            flowStreak = smoothstep(0.44, 0.80, flowN) * flowAmp;
+            // Whitewater riffles: current lines breaking over shallow gravel
+            // ledges only, and faded by the Nyquist filter as they recede.
+            riffle = smoothstep(0.68, 0.88, flowN * 0.65 + o4.x * 0.55)
+              * smoothstep(0.16, 0.34, riverMask)
+              * (1.0 - smoothstep(0.48, 0.78, riverMask))
+              * rNyquist(4.0, pixSize);
+            // Analytic gradient of the flow field: stretched along the
+            // current, giving the thin specular streaks of moving water.
+            flowTilt = vec2(flowSample.y, flowSample.z * 0.45) * 0.020 * flowAmp;
+          }
+
           float rippleH = o4.x * w4 + o12.x * w12 + o36.x * w36
-            + (m180.x - 0.5) * w180;
+            + (m180.x - 0.5) * w180
+            + (flowN - 0.5) * 0.26 * flowAmp;
           vec2 rippleG = o4.yz * w4 + o12.yz * w12 + o36.yz * w36 + m180.yz * w180;
 
           // Gentle normal tilt: cap the horizontal slope at 0.075 so distant
           // water stays a smooth sheet rather than a crumpled mirror.
-          vec2 tilt = rippleG;
+          vec2 tilt = rippleG + flowTilt;
           float tiltLen = length(tilt);
           if (tiltLen > 0.075) tilt *= 0.075 / tiltLen;
           vec3 n = normalize(vec3(tilt.x, 1.0, tilt.y));
@@ -549,16 +643,73 @@ export class InlandWaterSystem {
           float dayLum = mix(0.14, 1.0, smoothstep(-0.08, 0.35, uSunDir.y));
 
           float macroVal = m180.x;
-          vec3 body = mix(uDeep, uShallow,
-            clamp(0.42 + rippleH * 0.8 + (macroVal - 0.5) * 0.35, 0.12, 0.88));
+          float depthMix = clamp(0.42 + rippleH * 0.8 + (macroVal - 0.5) * 0.35, 0.12, 0.88);
+          if (isRiver) {
+            // Cross-channel depth: the ribbon's own rim-to-centre distance
+            // drives the colour far more than world-space noise, so every
+            // reach reads as a shallow gravel shelf shading into a deep
+            // emerald thalweg that follows the meander.
+            depthMix = mix(depthMix, 1.0 - smoothstep(0.18, 0.68, riverMask), 0.72);
+          }
+          vec3 body = mix(uDeep, uShallow, depthMix);
+
+          // Limestone gravel-bar shoals: a very gentle pale green-sand brightening
+          // of the sheet, modulated by the 180 m macro patch and the 36 m octave.
+          // Kept deliberately weak (0.05..0.14) so the water stays true Soča
+          // emerald-teal — natural brightness variation, zero brown muddiness.
+          vec3 shoalCol = vec3(0.18, 0.22, 0.16);
+          float shoalAmt = 0.05
+            + 0.05 * macroVal
+            + 0.04 * o36.x;
+          shoalAmt = clamp(shoalAmt, 0.05, 0.14);
+          body = mix(body, shoalCol, shoalAmt);
+
           body *= dayLum;
+
+          // Fraction of this pixel covered by the dry/damp gravel bar; drives
+          // the specular attenuation after the river block below.
+          float gravelBank = 0.0;
+
+          if (isRiver) {
+            // Alpine karst shingle banks and the wet-to-submerged transition.
+            // Dark river-worn cobbles mottled with pale Soča limestone
+            // pebbles, then a luminous shallow turquoise shelf, then the deep
+            // teal channel — all feathered by the noise-warped rim.
+            vec3 wetCobble = vec3(0.26, 0.27, 0.24);
+            vec3 palePebble = vec3(0.42, 0.42, 0.37);
+            float pebbleMix = clamp(o4.x * 0.62 + o12.x * 0.38, 0.0, 1.0);
+            vec3 gravel = mix(wetCobble, palePebble, pebbleMix) * dayLum;
+
+            float wGravel = 1.0 - smoothstep(0.14, 0.34, riverMask);
+            float wDeep = smoothstep(0.44, 0.62, riverMask);
+            float wShallow = max(1.0 - wGravel - wDeep, 0.0);
+
+            gravelBank = wGravel;
+
+            vec3 riverWater = mix(uDeep, uShallow, depthMix);
+            riverWater = mix(riverWater, uShallow * 1.18, wShallow);
+            riverWater *= (0.94 + 0.12 * rippleH) * dayLum;
+
+            body = mix(riverWater, gravel, wGravel);
+          }
+
+          // Limestone shingle banks are matte-to-damp stones, not water: kill
+          // most of the sky Fresnel and sun glitter where gravel dominates.
+          float waterSpecMask = 1.0 - gravelBank * 0.82;
 
           // Schlick Fresnel toward the sky (F0 = 0.02), soft horizon gradient.
           float F0 = 0.02;
           float fres = F0 + (1.0 - F0) * pow(1.0 - max(dot(n, viewDir), 0.0), 5.0);
-          vec3 horizon = mix(uSkyColor * 0.82, uSkyColor,
+
+          // Inland water sits in a valley and mostly mirrors surrounding terrain and a
+          // hazy horizon, not the cobalt zenith. Desaturate the sky toward its own
+          // luminance and tint it a neutral-cool mist so grazing-angle reaches
+          // never wash the channel electric blue.
+          float skyLuma = dot(uSkyColor, vec3(0.2126, 0.7152, 0.0722));
+          vec3 mutedSky = mix(vec3(skyLuma), uSkyColor, 0.22) * vec3(0.92, 0.99, 0.96);
+          vec3 horizon = mix(mutedSky * 0.82, mutedSky,
             clamp(viewDir.y * 2.0, 0.0, 1.0));
-          vec3 col = mix(body, horizon * dayLum, clamp(fres * 0.9, 0.0, 0.65));
+          vec3 col = mix(body, horizon * dayLum, clamp(fres * 0.45, 0.0, 0.30) * waterSpecMask);
 
           // Soft sun glitter, suppressed when the sun is below the horizon.
           float sunVis = smoothstep(-0.02, 0.12, uSunDir.y);
@@ -566,15 +717,73 @@ export class InlandWaterSystem {
           float rv = max(dot(r, viewDir), 0.0);
           float spec = pow(rv, 220.0);
           float glitter = pow(rv, 40.0) * 0.06;
-          col += uSunColor * (spec * 1.3 + glitter) * sunVis * dayLum;
+          // Shared camera -> surface distance: drives both the far glitter
+          // falloff and the aerial perspective pass below.
+          float waterDist = length(cameraPosition - vWorld);
+          // Distant water must not sparkle through kilometres of valley haze.
+          float farGlit = mix(1.0, 0.35, smoothstep(4000.0, 18000.0, waterDist));
+          col += uSunColor * (spec * 1.3 + glitter) * sunVis * dayLum * farGlit * waterSpecMask;
 
-          gl_FragColor = vec4(col, 1.0);
+          // Thin current streaks: muted sky sheen dragged along the flow
+          // direction, strongest when the sun grazes the water.
+          if (isRiver) {
+            col += vec3(0.42, 0.55, 0.52)
+              * flowStreak * (0.05 + 0.09 * sunVis) * dayLum * farGlit;
+          }
+
+          // Gentle filmic grade: match the natural satellite-photo saturation — richer
+          // than grey, never neon — while sun glitter (added above) and the night
+          // darkening baked into dayLum survive.
+          float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
+          col = mix(vec3(luma), col, 0.80);
+
+          // Whitewater riffles: pale foam breaking over the shallow gravel
+          // ledges. Crisp but restrained — texture, never cartoon noise.
+          if (riffle > 0.001) {
+            col = mix(col, vec3(0.68, 0.74, 0.72) * dayLum, riffle * 0.26);
+          }
+
+          // VI PER-ATMOS parity: rivers & lakes dissolve into the same
+          // height-aware Rayleigh + Mie air as the terrain heightfield, so a
+          // distant reach hazes into the valley instead of cutting a dark,
+          // high-contrast ribbon across it. viewDir above points from the
+          // water surface TO the camera, so the camera -> surface ray is its
+          // negation — exactly like terrViewDir = -terrV in terrainview.js.
+          vec3 wViewDir = -viewDir;
+          float dayVis = smoothstep(-0.05, 0.25, uSunDir.y);
+          float lowAir = 1.0 - smoothstep(100.0, 2600.0, 0.5 * (cameraPosition.y + vWorld.y));
+          float aerialT = 1.0 - exp(-waterDist * (0.000024 + lowAir * 0.000020));
+          aerialT = clamp(aerialT * smoothstep(2500.0, 9000.0, waterDist), 0.0, 0.72);
+          vec3 rayleighBlue = mix(vec3(0.42, 0.58, 0.80), vec3(0.54, 0.68, 0.86),
+            smoothstep(0.0, 0.5, uSunDir.y));
+          rayleighBlue = mix(rayleighBlue, uSkyColor, 0.16 * dayVis);
+          float sunAlign = max(dot(wViewDir, uSunDir), 0.0);
+          float miePhase = pow(sunAlign, 4.0) * 0.65 + pow(sunAlign, 18.0) * 0.35;
+          vec3 dustGlow = mix(vec3(0.92, 0.76, 0.56), uSunColor, 0.55);
+          vec3 atmosCol = mix(rayleighBlue, dustGlow,
+            clamp(miePhase * (0.45 + lowAir * 0.40), 0.0, 0.72));
+          // Distant water loses a little chroma before it is pushed to haze.
+          float distDesat = aerialT * 0.35 * dayVis;
+          float wLum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+          col = mix(col, vec3(wLum), distDesat);
+          col = mix(col, atmosCol, aerialT * 0.62 * dayVis);
+          col += dustGlow * miePhase * aerialT * 0.14 * dayVis * (0.5 + 0.5 * lowAir);
+
+          gl_FragColor = vec4(col, edgeAlpha);
           #include <fog_fragment>
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
       `,
       fog: true,
+      // The noise-warped bank rim feathers into the terrain through the alpha
+      // channel, so the sheet must blend. depthTest stays on so bridge decks
+      // and road viaducts that already wrote depth still win the crossing,
+      // and depthWrite stays off so overlapping translucent bank rims never
+      // leave a dark depth-prepass fringe on the water behind them.
+      transparent: true,
+      depthTest: true,
+      depthWrite: false,
       // Negative polygon offset lifts the water sheet in front of the terrain
       // it lies on, so rivers and lakes never Z-fight with the DEM.
       polygonOffset: true,
@@ -598,6 +807,9 @@ export class InlandWaterSystem {
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(built.positions, 3));
     geometry.setAttribute('normal', new THREE.BufferAttribute(built.normals, 3));
+    if (built.uvs && built.uvs.length === built.positions.length / 3 * 2) {
+      geometry.setAttribute('uv', new THREE.BufferAttribute(built.uvs, 2));
+    }
     geometry.setIndex(new THREE.BufferAttribute(built.indices, 1));
     geometry.computeBoundingSphere();
 

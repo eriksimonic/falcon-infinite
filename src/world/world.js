@@ -78,7 +78,7 @@ export class World {
     this.terrain.setAtmosphere(sky.sunDir, sky.sunColor, sky.skyColor);
     this.airports.update(dt, camera, weather, sky);
     this.buildings.update(dt, camera, sky);
-    this.roads.update(camera);
+    this.roads.update(camera, sky);
     this.vegetation.update(dt, camera, sky);
     this.inlandWater.update(dt, sky);
     this.landmarks.update(dt, sky.night);

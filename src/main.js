@@ -8,6 +8,7 @@ import { CombatAudio } from './core/combat_audio.js';
 import { BitchingBetty } from './core/betty.js';
 import { attachMcpBridge } from './core/mcp_bridge.js';
 import { World } from './world/world.js';
+import { TerrainEdits, setActiveTerrainEdits } from './world/terrain_edits.js';
 import { CarrierGroup } from './world/carrier.js';
 import { TimeSystem } from './sim/time.js';
 import { WeatherSystem } from './sim/weather.js';
@@ -32,11 +33,12 @@ import { HUD } from './ui/hud.js';
 import { TacticalOverlay } from './ui/tactical.js';
 import { KneeboardMap } from './ui/kneeboard.js';
 import { InspectorMap, camYawToHeadingDeg } from './ui/inspector_map.js';
+import { TerrainEditorUI } from './ui/terrain_editor.js';
 import { UI } from './ui/menu.js';
 import { spawnPoint, airportNear, airportsNear, setActiveDEM, setCustomAirports, terrainHeight } from './world/terrain.js';
 import { loadVipavaDEM, loadVipavaOSM, loadVipavaBuildings, loadVipavaWater } from './world/dem.js';
 import { settlementsNear, clearSettlementCaches } from './world/settlements.js';
-import { clamp } from './world/noise.js';
+import { clamp, smoothstep } from './world/noise.js';
 
 const NEUTRAL_CMD = {
   pitch: 0, roll: 0, yaw: 0, throttleDelta: 0,
@@ -59,6 +61,11 @@ const MAP_SPAWN_ALT_M = 5000 * 0.3048;       // 1524 m (5,000 ft MSL)
 const MAP_SPAWN_SPEED_MS = 300 * 0.514444444; // 154.33 m/s (300 kts)
 const MAP_SPAWN_MIN_AGL_M = 305;              // ~1,000 ft AGL floor over high peaks
 
+// VIPER-OPTICS: per-frame scratch for projecting the sun disc into screen
+// space. Module-level so the render loop never allocates a Vector3.
+const _sunProj = new THREE.Vector3();
+const _camFwd = new THREE.Vector3();
+
 class App {
   constructor() {
     this.canvas = document.getElementById('scene');
@@ -72,6 +79,15 @@ class App {
     this.mode = 'boot';
     this.ready = false;
     this.paused = false;
+    // PERF-19: dynamic resolution state. `_dynScale` multiplies the preset
+    // pixel ratio; the EMA and the two dwell timers decide when to step it.
+    // Initialised before the renderer so `_pixelRatio()` is safe at setup.
+    this._dynScale = 1.0;
+    this._frameEmaMs = 16.6;
+    this._dynSlowSec = 0;
+    this._dynFastSec = 0;
+    this._dynLastResizeSec = -10;
+    this._dynClockSec = 0;
     this.uiHidden = false;
     this.debug = false;
     this.muted = false;
@@ -84,20 +100,25 @@ class App {
 
     this.renderer = new THREE.WebGLRenderer({
       canvas: this.canvas,
-      antialias: this.preset.antialias,
+      // No canvas MSAA: Medium/High run PostFX, which rasterises the scene into
+      // a 4x MSAA HalfFloat target and then FXAA the tonemapped result, so the
+      // default framebuffer only ever receives the FXAA quad. Low already used
+      // antialias: false (PERF-04).
+      antialias: false,
       powerPreference: 'high-performance',
       stencil: false,
       alpha: false,
     });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, this.preset.pixelRatio));
+    this.renderer.setPixelRatio(this._pixelRatio());
     this.renderer.setSize(window.innerWidth, window.innerHeight, false);
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = CONFIG.render.exposure;
     // Real-time directional shadows (off on the low preset, which is built for
-    // integrated GPUs; PCFSoft gives soft penumbrae for free).
-    this.renderer.shadowMap.enabled = this.preset.name !== 'low';
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // integrated GPUs). r187 removed PCFSoftShadowMap — it warned once and fell
+    // back to PCFShadowMap (5 hardware PCF taps) — so request PCF directly.
+    this.renderer.shadowMap.enabled = !!this.preset.shadows;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
 
     this.input = new Input();
     this.input.attach(this.canvas);
@@ -112,6 +133,11 @@ class App {
     this._missionSnap = null;
     this._fuelState = null;
     this._tankerState = null;
+    this._autoLandAirport = null;
+    // Press-and-hold H: a quick tap toggles help on keyup, a 450 ms hold
+    // hands the jet to the smart autopilot (auto-land / auto-refuel cycle).
+    this._keyHDownAt = 0;
+    this._keyHHeldFired = false;
     this._ilsState = null;
     this._divertAirport = null;
     this._meatballState = null;
@@ -236,6 +262,14 @@ class App {
     // actually loaded right now (so a restore knows whether to switch).
     this._lastViewTimer = 0;
     this._activeTheater = null;
+    // Reused smart-autopilot context: one object for the whole flight so the
+    // per-frame computeCommand call allocates nothing.
+    this._apContext = {
+      airport: null,
+      tanker: null,
+      fuel: null,
+      terrainHeight: (x, z) => this.world.heightAt(x, z),
+    };
     this._vipavaRoads = [];
     this._vipavaWater = null;
     this.inspectorMap = new InspectorMap({
@@ -264,8 +298,75 @@ class App {
       },
     });
     this.inspectorMap.attach(document.getElementById('inspector-map'));
+
+    // F9 Terrain & Color Paint Editor: sparse height deltas + an RGBA tint grid
+    // over the live Vipava DEM. Headless/Node-safe; the panel and the 3D brush
+    // ring are only built once the editor is actually shown.
+    this.terrainEdits = new TerrainEdits();
+    this._terrainEditsLoaded = false;
+    this._editorOpenedFreeCam = false;
+    this.terrainEditor = new TerrainEditorUI({
+      scene: this.scene,
+      edits: this.terrainEdits,
+      onHeightChanged: (bounds) => this._onTerrainEditsHeightChanged(bounds),
+      onSaveProject: (jsonObj) => this._saveTerrainEditsToProject(jsonObj),
+      onTeleport: (spot) => this._teleportTerrainEditor(spot),
+      onExit: () => this.exitTerrainEditor(),
+      onToast: (msg) => this.ui.toast(msg),
+    });
+
+    // Painting needs the OS cursor: capture-phase canvas handlers, so neither
+    // the camera nor Input._onMouseDown can grab the pointer lock mid-stroke.
+    window.addEventListener('pointerdown', (e) => {
+      if (!this.terrainEditor.active) return;
+      if (e.target !== this.canvas) return;
+      if (this.terrainEditor.isPointerOverUI(e.target)) return;
+      this.terrainEditor.onPointerDown(
+        e, this.camera, this.canvas, (x, z) => this.world.heightAt(x, z),
+      );
+      e.stopPropagation();
+    }, true);
+    window.addEventListener('pointermove', (e) => {
+      if (!this.terrainEditor.active) return;
+      const res = this.terrainEditor.onPointerMove(
+        e, this.camera, this.canvas, (x, z) => this.world.heightAt(x, z),
+      );
+      // Right-drag look: the editor owns the deltas, the free camera applies them.
+      if (res && (res.lookDx || res.lookDy)) this.freeCam.look(res.lookDx, res.lookDy);
+    }, true);
+    window.addEventListener('pointerup', (e) => {
+      if (this.terrainEditor.active) this.terrainEditor.onPointerUp(e);
+    });
+    window.addEventListener('contextmenu', (e) => {
+      if (this.terrainEditor.active) e.preventDefault();
+    });
+    // The canvas mousedown handler inside Input (src/core/input.js) is what
+    // actually requests the pointer lock; swallow it at capture time instead.
+    window.addEventListener('mousedown', (e) => {
+      if (this.terrainEditor.active && e.target === this.canvas) e.stopPropagation();
+    }, true);
     this._canyonState = null;
     this._juiceState = null;
+    // AERO-2: reusable loadout scratch — live fuel/ordnance pushed into the
+    // flight model each frame without allocating a fresh object.
+    this._loadoutScratch = { fuelLb: 0, aim9: 0, mk82: 0, bffg: 0 };
+    // VIPER-OPTICS: one reusable optics scratch, written every frame in the
+    // render loop so the helmet-cam lens never allocates.
+    this._opticsScratch = {
+      cockpitView: false,
+      speedNorm: 0,
+      gLoad: 1,
+      afterburner: false,
+      machPulse: 0,
+      aglNorm: 0,
+      freeCam: false,
+      menu: false,
+      night: 0,
+      sunScreenX: 0.5,
+      sunScreenY: 0.5,
+      sunFlare: 0,
+      sunColor: null,
+    };
     this._weaponCamState = null;
     this._canyonFinishAnnounced = false;
     this._photoDrag = null;
@@ -292,6 +393,7 @@ class App {
 
     window.addEventListener('resize', () => this.resize());
     window.addEventListener('keydown', (e) => this.onKey(e));
+    window.addEventListener('keyup', (e) => this.onKeyUp(e));
 
     // Feature 41: flush the Free Cam pose on tab hide / reload. Guarded so a
     // headless import of this module never touches a missing global.
@@ -409,7 +511,10 @@ class App {
 
   /** Effective device pixel ratio under the active quality preset. */
   _pixelRatio() {
-    return Math.min(window.devicePixelRatio || 1, this.preset.pixelRatio);
+    // PERF-19: the dynamic scale multiplies the preset cap so heavy scenes can
+    // shed fillrate on the GPU. `window` is guarded for headless Node imports.
+    const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+    return Math.min(dpr, this.preset.pixelRatio) * this._dynScale;
   }
 
   resize() {
@@ -427,8 +532,12 @@ class App {
     const q = QUALITY[name];
     if (!q) return;
     this.preset = q;
+    // PERF-19: a quality switch starts fresh at full dynamic scale.
+    this._dynScale = 1.0;
+    this._dynSlowSec = 0;
+    this._dynFastSec = 0;
     this.renderer.setPixelRatio(this._pixelRatio());
-    this.renderer.shadowMap.enabled = q.name !== 'low';
+    this.renderer.shadowMap.enabled = !!q.shadows;
     this.sky.setShadowQuality?.(q.name);
     this.renderer.shadowMap.needsUpdate = true;
     this.world.setPreset(q);
@@ -563,6 +672,22 @@ class App {
           };
         // Gulf of Trieste is ~28 km south of the valley, well offshore.
         this.carrier.placeNear(-24000, 28000);
+
+        // F9 painter: bind the colour grid to the terrain shader and install the
+        // height-delta singleton, so strokes land on the real Vipava DEM.
+        setActiveTerrainEdits(this.terrainEdits);
+        this.world.terrain.setEditColorTexture(
+          this.terrainEdits.createColorTexture(),
+          this.terrainEdits.bounds,
+        );
+        if (!this._terrainEditsLoaded) {
+          this._terrainEditsLoaded = true;
+          const proj = await TerrainEdits.fetchProjectEdits('./media/vipava_edits.json');
+          if (proj) this.terrainEdits.importJSON(proj);
+          // Layer the in-progress draft (strokes since the last project save)
+          // over the shipped edits instead of losing the user's work.
+          this.terrainEdits.loadFromLocalStorage();
+        }
       } else {
         setActiveDEM(null);
         setCustomAirports(null);
@@ -587,6 +712,13 @@ class App {
       this._vipavaPlaces = null;
       if (this._proceduralSpawn) this.spawn = this._proceduralSpawn;
       this.carrier.placeNear(this.spawn.x, this.spawn.z);
+    }
+
+    // Only the baked Vipava field carries user paint: drop the delta hook and
+    // hide the overlay on every other theater.
+    if (name !== 'vipava') {
+      setActiveTerrainEdits(null);
+      this.world.terrain.clearEditColorTexture();
     }
 
     // Terrain, forests, cities and asphalt were all built for the previous
@@ -641,6 +773,12 @@ class App {
 
   onKey(e) {
     const code = e.code;
+    // F9: in-game Terrain & Color Paint Editor (works from flight and Free Cam).
+    if (code === 'F9' && this.ready) {
+      e.preventDefault();
+      this.toggleTerrainEditor();
+      return;
+    }
     const isFreeCamToggle = (e.ctrlKey && !e.shiftKey && !e.altKey && code === 'KeyF') || code === 'F7';
     if (isFreeCamToggle && this.ready) {
       e.preventDefault();
@@ -648,6 +786,27 @@ class App {
       return;
     }
     if (this.freeCam.active) {
+      if (this.terrainEditor.active) {
+        if ((e.ctrlKey || e.metaKey) && code === 'KeyZ') {
+          e.preventDefault();
+          this.terrainEditor.triggerUndo();
+          return;
+        }
+        if (code === 'BracketLeft') {
+          e.preventDefault();
+          this.terrainEditor.adjustRadius(0.82);
+          return;
+        }
+        if (code === 'BracketRight') {
+          e.preventDefault();
+          this.terrainEditor.adjustRadius(1.22);
+          return;
+        }
+        if (code === 'Escape') {
+          this.exitTerrainEditor();
+          return;
+        }
+      }
       if (code === 'KeyM' || code === 'Tab') {
         e.preventDefault();
         this.toggleInspectorMap();
@@ -769,7 +928,11 @@ class App {
       return;
     }
     if (code === 'KeyH') {
-      this.ui.toggleHelp();
+      // Quick tap toggles help on keyup; holding hands over to the smart
+      // autopilot from update(). Never toggle here.
+      if (e.repeat) return;
+      this._keyHDownAt = performance.now();
+      this._keyHHeldFired = false;
       return;
     }
     if (code === 'Escape' || code === 'KeyP') {
@@ -783,9 +946,152 @@ class App {
     }
   }
 
+  /** Keyup companion for press-and-hold H: a quick tap toggles Controls Help. */
+  onKeyUp(e) {
+    if (e.code !== 'KeyH') return;
+    if (!this._keyHHeldFired && this._keyHDownAt > 0) this.ui.toggleHelp();
+    this._keyHDownAt = 0;
+    this._keyHHeldFired = false;
+  }
+
+  /**
+   * Smart hold-H cycle: AUTO_LAND -> AUTO_REFUEL -> manual. Low fuel inside
+   * 18 km of the tanker prefers a refuel join straight away.
+   */
+  _engageSmartHoldH() {
+    const f = this.aircraft.flight;
+    if (!f || f.crashed) return;
+
+    const ap = this.world.airports.nearest(f.position.x, f.position.z, 80000);
+    const tanker = this._tankerState || this.tanker;
+    const fuelPct = this._fuelState
+      ? (Number.isFinite(this._fuelState.pct) ? this._fuelState.pct : this._fuelState.fraction ?? 1)
+      : 1;
+
+    if (this.autopilot.mode === 'AUTO_LAND') {
+      if (this.autopilot.engageAutoRefuel(f, tanker)) {
+        this.audio.click();
+        this.ui.toast('AUTO-REFUEL · JOINING KC-135 TANKER (HOLD H TO CANCEL)');
+      } else {
+        this.ui.toast('AUTO-REFUEL · TANKER UNAVAILABLE');
+      }
+      return;
+    }
+    if (this.autopilot.mode === 'AUTO_REFUEL') {
+      this.autopilot.disengage();
+      this.audio.click();
+      this.ui.toast('AUTOPILOT · MANUAL CONTROL');
+      return;
+    }
+
+    const tankerDist = tanker && tanker.position
+      ? Math.hypot(tanker.position.x - f.position.x, tanker.position.z - f.position.z)
+      : Infinity;
+    if (fuelPct < 0.30 && tankerDist <= 18000 && this.autopilot.engageAutoRefuel(f, tanker)) {
+      this.audio.click();
+      this.ui.toast('AUTO-REFUEL (LOW FUEL) · JOINING KC-135 (HOLD H FOR AIRBASE)');
+      return;
+    }
+
+    if (ap && this.autopilot.engageAutoLand(f, ap)) {
+      this._autoLandAirport = ap;
+      this.audio.click();
+      this.ui.toast('AUTO-LAND · ' + (ap.code || ap.name) + ' (HOLD H FOR TANKER)');
+      return;
+    }
+    this.audio.click();
+    this.ui.toast('AUTOPILOT · NO AIRBASE IN RANGE');
+  }
+
+  /**
+   * A brush stroke touched this world rectangle: drop only the cached tiles that
+   * overlap it, then rebuild the nearest few synchronously so the sculpt reads
+   * live under the cursor at 60 FPS (no blink, no hole).
+   */
+  _onTerrainEditsHeightChanged(bounds) {
+    if (!bounds || !this.world?.terrain) return;
+    const t = this.world.terrain;
+    if (typeof t.invalidateBounds !== 'function') return;
+    t.invalidateBounds(bounds.xMin, bounds.xMax, bounds.zMin, bounds.zMax);
+    if (typeof t._buildPending === 'function') t._buildPending(6, 8);
+  }
+
+  /**
+   * Persist the edit grid: localStorage always, plus the dev-only
+   * `POST /__dev/save-edits` route (vite.config.js) that writes
+   * `public/media/vipava_edits.json` during `npm run dev`.
+   */
+  async _saveTerrainEditsToProject(jsonObj) {
+    this.terrainEdits.saveToLocalStorage();
+    try {
+      const res = await fetch('/__dev/save-edits', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(jsonObj),
+      });
+      if (res && res.ok) {
+        return { ok: true, message: 'SAVED TO public/media/vipava_edits.json' };
+      }
+    } catch (err) {
+      // Static build / preview server: the dev route does not exist.
+    }
+    return { ok: false, message: 'SAVED TO BROWSER (DEV SERVER REQUIRED FOR PROJECT FILE)' };
+  }
+
+  /** Quick-jump button in the F9 panel: park the free camera over a landmark. */
+  _teleportTerrainEditor(spot) {
+    if (!spot) return;
+    const ground = Math.max(0, this.world.heightAt(spot.x, spot.z));
+    this.freeCam.teleport(
+      spot.x,
+      ground + (spot.agl ?? 320),
+      spot.z,
+      spot.yaw ?? 0,
+      spot.pitch ?? -0.42,
+    );
+    this.ui.toast('EDITOR · ' + (spot.name || 'JUMP'));
+  }
+
+  /**
+   * F9: open/close the Terrain & Color Paint Editor. The painter rides on Free
+   * Cam (top-down streaming camera) but with the pointer UNLOCKED, so the brush
+   * follows the real OS cursor instead of a hidden, warped one.
+   */
+  toggleTerrainEditor() {
+    if (!this.ready) return;
+    if (this.terrainEditor.active) {
+      this.exitTerrainEditor();
+      return;
+    }
+    // Remember whether WE opened Free Cam, so exiting only closes what we opened.
+    this._editorOpenedFreeCam = !this.freeCam.active;
+    if (!this.freeCam.active) this.toggleFreeCam();
+    // Unlock immediately after Free Cam grabs it: the brush needs the OS cursor.
+    this.input.releasePointerLock();
+    if (this.inspectorMap.visible) this.inspectorMap.hide();
+    this.terrainEditor.show();
+    this.ui.toast(
+      'TERRAIN & COLOR PAINTER (F9) · L-DRAG PAINT · R-DRAG LOOK · [ ] SIZE · CTRL+Z UNDO',
+    );
+  }
+
+  exitTerrainEditor() {
+    if (!this.terrainEditor.active) return;
+    this.terrainEditor.hide();
+    if (this._editorOpenedFreeCam) {
+      this._editorOpenedFreeCam = false;
+      this.exitFreeCam();
+    } else {
+      this.ui.toast('TERRAIN PAINTER · OFF');
+    }
+  }
+
   /** F7: detached 6-DOF spectator camera for fast world inspection without flying. */
   toggleFreeCam() {
     if (this.freeCam.active) {
+      // Leaving Free Cam also closes the painter: it cannot paint without a
+      // streaming camera under the cursor.
+      if (this.terrainEditor.active) this.exitTerrainEditor();
       this.exitFreeCam();
       return;
     }
@@ -962,8 +1268,12 @@ class App {
     const simDt = Math.min(dt, 0.05);
     const i = this.input;
     const mapOpen = this.inspectorMap.visible;
+    // F9 painter: while the editor is open, right-drag owns camera look (the
+    // pointerdown/move handlers feed freeCam.look), so the raw locked-pointer
+    // deltas must not double-apply.
+    const painting = this.terrainEditor.active;
     if (!mapOpen) {
-      if (i.mouse.dx || i.mouse.dy) {
+      if (!painting && (i.mouse.dx || i.mouse.dy)) {
         this.freeCam.look(i.mouse.dx, i.mouse.dy);
       }
       if (i.mouse.wheel) {
@@ -982,6 +1292,14 @@ class App {
       lookY: (i.isDown('ArrowUp') ? 1 : 0) - (i.isDown('ArrowDown') ? 1 : 0),
     };
     this.freeCam.update(simDt, this.camera, move, (x, z) => this.world.heightAt(x, z));
+
+    // F9 painter tick: re-pick under the cursor, apply the held brush, and let
+    // onHeightChanged rebuild the touched tiles in the same frame.
+    if (painting) {
+      this.terrainEditor.update(
+        simDt, this.camera, this.canvas, (x, z) => this.world.heightAt(x, z),
+      );
+    }
 
     // Keep sky, terrain quadtree, 53k OSM buildings, roads, bridges, traffic
     // and clouds streaming live around the free camera!
@@ -1232,7 +1550,8 @@ class App {
         // Re-ground the world around the restored jet before the first frame.
         this.world.terrain?.refresh?.(this.camera.position, 24);
         this.world.update(0.016, this.camera, this.sky, this.weather);
-        this.sky.update(0.016, this.time, this.weather, this.camera, this.weather.flash);
+        this.sky.update(0.016, this.time, this.weather, this.camera, this.weather.flash,
+          this.aircraft.mode === 'cockpit');
         this.clouds.update(0.016, this.camera, this.weather, this.sky);
 
         this.mode = 'fly';
@@ -1665,9 +1984,14 @@ class App {
     if (cmd.gearToggle && !f.onGround) this.audio.gear(!f.gearDown);
     if (cmd.flapsToggle) this.ui.toast('FLAPS ' + (f.flapsIndex + 1) % 3);
     if (i.wasPressed('KeyV')) {
-      const m = this.aircraft.toggleCockpit();
+      const res = this.aircraft.snapFollowCamera();
+      const m = res.mode;
+      // Legacy toast line is asserted by tests/cinematic_juice_test.mjs and must
+      // sit immediately before _saveLastView(); the rich preset toast is emitted
+      // last so it is the one the player actually sees.
       this.ui.toast('VIEW · ' + m.toUpperCase());
       this._saveLastView();
+      this.ui.toast(`FOLLOW ${res.index + 1}/${res.count} · ${res.preset.label} · ${res.preset.dist}M · ${res.preset.elevLabel}`);
     }
     if (i.wasPressed('KeyC')) {
       const m = this.aircraft.nextMode();
@@ -1778,10 +2102,25 @@ class App {
 
     let cmd = NEUTRAL_CMD;
     if (fly) {
+      // Press-and-hold H: after 450 ms the smart autopilot takes over.
+      if (!this.ejection.active && this._keyHDownAt > 0 && !this._keyHHeldFired
+        && (performance.now() - this._keyHDownAt) >= 450) {
+        this._keyHHeldFired = true;
+        this._engageSmartHoldH();
+      }
       cmd = this.ejection.active ? NEUTRAL_CMD : this.buildCommand();
       this.handleFlightKeys(cmd);
       if (!this.ejection.active) {
-        cmd = this.autopilot.computeCommand(this.aircraft.flight, cmd);
+        const apCtx = this._apContext;
+        apCtx.airport = this._autoLandAirport;
+        apCtx.tanker = this._tankerState || this.tanker;
+        apCtx.fuel = this._fuelState;
+        cmd = this.autopilot.computeCommand(this.aircraft.flight, cmd, apCtx);
+        const apNotice = this.autopilot.consumeNotice();
+        if (apNotice) {
+          this.audio.click();
+          this.ui.toast(apNotice);
+        }
       }
       if (this._fuelState && this._fuelState.empty) {
         this.aircraft.flight.targetThrottle = 0;
@@ -1805,8 +2144,24 @@ class App {
           flameout: !!this._fuelState?.empty,
           time: this.time.hour,
         };
-        this.aircraft.update(simDt, cmd, this.weather, this.input, true, alerts);
+        // AERO-2: live fuel + ordnance loadout drives mass, drag and CAT mode.
+        // Scratch object reused every frame so the update loop allocates nothing.
+        if (typeof f.setLoadout === 'function') {
+          const lo = this._loadoutScratch;
+          lo.fuelLb = Number.isFinite(this.fuel?.fuelLb) ? this.fuel.fuelLb : 0;
+          lo.aim9 = this.weapons?.ammo?.AIM9 ?? 0;
+          lo.mk82 = this.weapons?.ammo?.MK82 ?? 0;
+          lo.bffg = this.weapons?.ammo?.BFFG ?? 0;
+          f.setLoadout(lo);
+        }
+        // Weather mirrors the sky for this frame. The sun direction/colour are
+        // handed over *before* the flight model integrates so anything that
+        // follows the sun (cockpit sun-shadow rig, lighting consumers in
+        // aircraft.js) reads this frame's sun instead of last frame's.
         this.weather.night = this.sky.night;
+        this.weather.sunDir = this.sky.sunDir;
+        this.weather.sunColor = this.sky.sunColor;
+        this.aircraft.update(simDt, cmd, this.weather, this.input, true, alerts);
 
         // Carrier operations: arresting wires, steam catapult, FLOLS meatball.
         const cRes = this.carrier.update(simDt, f, this.weather);
@@ -1842,10 +2197,13 @@ class App {
       }
 
       // Feature 32: flight juice — G-LOC, G-strain, Mach crossing and recoil.
+      // AERO-2: true ISA Mach so the shockwave pulse fires at M 1.0 at altitude,
+      // plus the airframe buffet so high-AoA / transonic shudder is felt.
       const mach = Number.isFinite(f.mach) ? f.mach : f.speed / 340.3;
       this._juiceState = this.juice.update(simDt, {
         gLoad: f.gLoad,
         mach,
+        buffet: f.buffet || 0,
         afterburner: f.afterburner,
         onGround: f.onGround,
         speed: f.speed,
@@ -1881,7 +2239,7 @@ class App {
 
     // atmosphere and streaming keep running (frozen during pause)
     if (this.mode !== 'pause' || !this.ready) {
-      this.sky.update(simDt, this.time, this.weather, this.camera, this.weather.flash);
+      this.sky.update(simDt, this.time, this.weather, this.camera, this.weather.flash, fly && this.aircraft.mode === 'cockpit');
       this.world.update(simDt, this.camera, this.sky, this.weather);
       this.clouds.update(simDt, this.camera, this.weather, this.sky);
     }
@@ -2090,7 +2448,15 @@ class App {
       t.fuelLb = this._fuelState?.fuelLb ?? 7000;
       t.fuelFraction = this._fuelState?.fraction ?? 1;
       t.refueling = !!this._fuelState?.refueling;
-      t.autopilot = this.autopilot.mode;
+      if (this.autopilot.mode === 'AUTO_LAND') {
+        const label = this._autoLandAirport?.code || this._autoLandAirport?.name
+          || this.autopilot.targetLabel || 'AIRBASE';
+        t.autopilot = 'AUTO_LAND · ' + label;
+      } else if (this.autopilot.mode === 'AUTO_REFUEL') {
+        t.autopilot = 'AUTO_REFUEL';
+      } else {
+        t.autopilot = this.autopilot.mode;
+      }
       t.ils = this._ilsState;
       t.meatball = this._meatballState;
       t.cloudMist = this._cloudMist;
@@ -2268,8 +2634,110 @@ class App {
     const dt = Math.min(0.1, Math.max(0.0001, raw));
     this.fps = this.fps * 0.94 + (1 / dt) * 0.06;
 
+    // PERF-19: dynamic resolution. Only steer while actually flying or in Free
+    // Cam — boot, menu and pause are not representative loads. Clamp the
+    // single-frame spike so a tab switch or a long stall cannot look like
+    // sustained slowness and yank the resolution down.
+    if (!this.paused && (this.mode === 'fly' || this.mode === 'freecam')) {
+      const rawMs = Math.min(100, Math.max(4, raw * 1000));
+      this._frameEmaMs += (rawMs - this._frameEmaMs) * (1 - Math.exp(-dt * 2.5));
+      this._dynClockSec += dt;
+
+      if (this._frameEmaMs > 18.5) {
+        this._dynSlowSec += dt;
+        this._dynFastSec = 0;
+      } else if (this._frameEmaMs < 14.0) {
+        this._dynFastSec += dt;
+        this._dynSlowSec = 0;
+      } else {
+        this._dynSlowSec = 0;
+        this._dynFastSec = 0;
+      }
+
+      const sinceResize = this._dynClockSec - this._dynLastResizeSec;
+      if (this._dynSlowSec >= 2.0 && sinceResize >= 1.0 && this._dynScale > 0.75) {
+        this._dynScale = Math.max(0.75, Math.round((this._dynScale - 0.1) * 100) / 100);
+        this._dynSlowSec = 0;
+        this._dynLastResizeSec = this._dynClockSec;
+        this.resize();
+      } else if (this._dynFastSec >= 4.0 && sinceResize >= 1.0 && this._dynScale < 1.0) {
+        this._dynScale = Math.min(1.0, Math.round((this._dynScale + 0.05) * 100) / 100);
+        this._dynFastSec = 0;
+        this._dynLastResizeSec = this._dynClockSec;
+        this.resize();
+      }
+    }
+
     if (this.ready) this.update(dt);
     this.postfx.setNight(this.sky.night);
+
+    // VIPER-OPTICS: hand the helmet-cam lens this frame's flight state. One
+    // preallocated scratch object is reused, so the render loop allocates
+    // nothing. setOptics() only writes targets; update() glides and uploads.
+    {
+      const fl = this.aircraft && this.aircraft.flight;
+      const opt = this._opticsScratch;
+      if (fl) {
+        const speed = Number.isFinite(fl.speed) ? fl.speed : 0;
+        const agl = Number.isFinite(fl.agl) ? fl.agl : 1000;
+        opt.cockpitView = this.aircraft.mode === 'cockpit' && this.mode === 'fly';
+        opt.speedNorm = clamp(speed / 350, 0, 1.4);
+        opt.gLoad = Number.isFinite(fl.gForce) ? fl.gForce : 1;
+        opt.afterburner = !!fl.afterburner;
+        opt.machPulse = this._juiceState?.machPulse || 0;
+        // Low altitude + speed is the classic "ground rush" cue.
+        opt.aglNorm = 1 - smoothstep(15, 220, agl);
+        opt.freeCam = !!(this.freeCam && this.freeCam.active);
+        // Menu/boot only: the frozen pause frame and crash cam keep the lens
+        // they had, so pausing never pops the image back to rectilinear.
+        opt.menu = !opt.freeCam && (this.mode === 'menu' || this.mode === 'boot');
+        opt.night = this.sky.night;
+      }
+
+      // VIPER-OPTICS sun flare: project sky.sunDir through the live camera so
+      // the analytical starburst / anamorphic streak / bokeh ghosts in the
+      // optics shader sit exactly on the sun disc. Scratch vectors only — the
+      // render loop still allocates nothing.
+      const sun = this.sky && this.sky.sunDir;
+      const cam = this.camera;
+      if (sun && cam) {
+        // Refresh the camera matrices so the projection matches this frame's
+        // pose (the renderer would otherwise only update them in render()).
+        cam.updateWorldMatrix(true, false);
+        const e = cam.matrixWorld.elements;
+        // World-space point 10 km down the sun ray, then project to NDC.
+        _sunProj.set(e[12], e[13], e[14]).addScaledVector(sun, 10000).project(cam);
+        const ndcX = Number.isFinite(_sunProj.x) ? _sunProj.x : 0;
+        const ndcY = Number.isFinite(_sunProj.y) ? _sunProj.y : 0;
+
+        cam.getWorldDirection(_camFwd);
+        const sunFacing = _camFwd.dot(sun);
+        const sunElev = sun.y;
+        const overcast = this.weather?.state?.overcast ?? 0;
+
+        // Only a sun that is actually in front of the camera, above the
+        // horizon and not buried in overcast (or Free Cam / menu) flares. The
+        // NDC term fades the flare smoothly as the disc leaves the frame.
+        let sunFlare = 0;
+        if (!opt.freeCam && this.mode !== 'menu' && this.mode !== 'boot' &&
+            sunFacing > 0.12 && sunElev > -0.02) {
+          sunFlare = smoothstep(0.12, 0.55, sunFacing)
+            * smoothstep(-0.02, 0.18, sunElev)
+            * (1 - overcast * 0.85)
+            * (1 - Math.min(1, Math.hypot(ndcX, ndcY) * 0.55));
+        }
+
+        opt.sunScreenX = ndcX * 0.5 + 0.5;
+        opt.sunScreenY = ndcY * 0.5 + 0.5;
+        opt.sunFlare = sunFlare;
+        opt.sunColor = this.sky.sunColor;
+      } else {
+        opt.sunFlare = 0;
+      }
+
+      this.postfx.setOptics(this._opticsScratch);
+    }
+
     this.postfx.update(dt);
     this.postfx.render(this.scene, this.camera);
     this.input.endFrame();

@@ -83,7 +83,7 @@ export class FlightJuiceSystem {
   /**
    * @param {number} dt seconds
    * @param {{gLoad?: number, mach?: number, afterburner?: boolean,
-   *          onGround?: boolean, speed?: number}} [state]
+   *          onGround?: boolean, speed?: number, buffet?: number}} [state]
    * @returns {{blackout:number, redout:number, gStrain:number, machPulse:number,
    *           shakeX:number, shakeY:number, shakeRoll:number,
    *           shockwaveCrossed:boolean}}
@@ -96,6 +96,8 @@ export class FlightJuiceSystem {
     const speed = Number.isFinite(s.speed) ? Math.max(0, s.speed) : 0;
     const afterburner = !!s.afterburner;
     const onGround = !!s.onGround;
+    // Aerodynamic buffet (AoA / transonic shock) adds airframe rumble.
+    const buffet = Number.isFinite(s.buffet) ? clamp(s.buffet, 0, 1) : 0;
 
     this.time += h;
     this.lastGLoad = gLoad;
@@ -158,11 +160,13 @@ export class FlightJuiceSystem {
     }
     list.length = n;
 
-    // Continuous rumble: afterburner buzz, fast taxi/runway roll, Mach 1 edge.
+    // Continuous rumble: afterburner buzz, fast taxi/runway roll, Mach 1 edge,
+    // plus aerodynamic buffet (AoA onset / transonic shock rumble).
     let rumble = 0;
     if (afterburner) rumble += 0.012 + Math.min(0.02, speed / 40000);
     if (onGround && speed > 30) rumble += 0.01 + Math.min(0.012, speed / 6000);
     if (this.machPulse > 0) rumble += this.machPulse * 0.006;
+    if (buffet > 0) rumble += buffet * 0.045;
 
     const hi = impulseAmp + rumble;
     const t = this.time;

@@ -590,6 +590,18 @@ export class CarrierGroup {
     g.add(box(1.6, 0.05, 10, numMat, 0, yMark, nz)); // 1 stem
     g.add(box(4, 0.05, 1.6, numMat, -1.2, yMark, nz + 4.2)); // 1 base
 
+    // Every sub-mesh above is placed exactly once. Compose the local matrices
+    // here instead of letting `scene.updateMatrixWorld()` recompose ~80 of them
+    // every frame. The root group still moves (`_syncGroup` / `update`), the
+    // radar dish spins and the FLOLS ball slides, so those keep
+    // `matrixAutoUpdate` on; a forced parent update carries the frozen children.
+    g.traverse((o) => {
+      if (!o.isMesh || o === this._flolsBall) return;
+      o.matrixAutoUpdate = false;
+      o.updateMatrix();
+    });
+    g.updateMatrixWorld(true);
+
     this.group = g;
     if (this.scene && typeof this.scene.add === 'function') this.scene.add(g);
   }

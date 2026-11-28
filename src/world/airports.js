@@ -129,15 +129,142 @@ function makeAsphaltTexture() {
   return tex;
 }
 
-function box(w, h, d, color, x, y, z) {
+/**
+ * Stable cache key for a material: the material type plus every flag that
+ * changes the compiled program or the draw state. Colours are normalised to
+ * sRGB hex so `0x123456` and a `THREE.Color` produce the same key.
+ */
+function hexOf(color, fallback = 0xffffff) {
+  if (color && color.isColor) return color.getHex();
+  const n = Number(color);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function materialKey(type, params = {}) {
+  return [
+    type,
+    hexOf(params.color),
+    hexOf(params.emissive, 0),
+    params.emissiveIntensity ?? 0,
+    params.roughness ?? '',
+    params.metalness ?? '',
+    params.transparent ? 1 : 0,
+    params.opacity ?? 1,
+    params.side ?? THREE.FrontSide,
+    params.depthWrite === false ? 0 : 1,
+    params.depthTest === false ? 0 : 1,
+    params.toneMapped === false ? 0 : 1,
+    params.blending ?? THREE.NormalBlending,
+    params.polygonOffset ? 1 : 0,
+  ].join('|');
+}
+
+/**
+ * Fallback atmosphere for a direct `buildAirport(ap)` call (tests, tools).
+ * `AirportSystem` installs its own table and copies the live sky into it, so
+ * never mutate this one when the system passed its own.
+ */
+const _defaultAirportAtmos = {
+  uAirSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.2) },
+  uAirSunColor: { value: new THREE.Color(0xfff2d0) },
+  uAirSkyColor: { value: new THREE.Color(0x8fb4c8) },
+};
+
+/**
+ * Identical Rayleigh + Mie aerial perspective to terrainview.js / roadnet.js /
+ * buildings.js (VI PER-ATMOS): a distant airfield dissolves into the same
+ * height-aware valley haze as the terrain rather than sitting on it as a dark
+ * high-contrast patch. The formula is injected into the stock Lambert program,
+ * so maps, lighting, shadows and fog stay exactly as Three.js computes them.
+ *
+ * Only `MeshLambertMaterial` is touched — runway lights, PAPIs and the approach
+ * rabbit are `MeshBasicMaterial` and must stay crisp and glowing.
+ */
+function attachAirportAerialHaze(mat, atmos = _defaultAirportAtmos) {
+  if (!mat || !mat.isMeshLambertMaterial) return mat;
+  mat.customProgramCacheKey = () => 'airport-aerial-v1';
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uAirSunDir = atmos.uAirSunDir;
+    shader.uniforms.uAirSunColor = atmos.uAirSunColor;
+    shader.uniforms.uAirSkyColor = atmos.uAirSkyColor;
+
+    shader.vertexShader = 'varying vec3 vAirWorld;\n' + shader.vertexShader.replace(
+      '#include <worldpos_vertex>',
+      /* glsl */`#include <worldpos_vertex>
+      vAirWorld = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz;`,
+    );
+
+    shader.fragmentShader = 'uniform vec3 uAirSunDir, uAirSunColor, uAirSkyColor;\n'
+      + 'varying vec3 vAirWorld;\n' + shader.fragmentShader.replace(
+        '#include <opaque_fragment>',
+        /* glsl */`
+      // Applied to the linear outgoingLight before tonemapping and colour-space
+      // encoding — exactly where terrainview.js runs it.
+      {
+        float airDist = length( cameraPosition - vAirWorld );
+        vec3 airViewDir = normalize( vAirWorld - cameraPosition );
+        float dayVis = smoothstep( -0.05, 0.25, uAirSunDir.y );
+        float lowAir = 1.0 - smoothstep( 100.0, 2600.0, 0.5 * ( cameraPosition.y + vAirWorld.y ) );
+        float aerialT = 1.0 - exp( -airDist * ( 0.000024 + lowAir * 0.000020 ) );
+        aerialT = clamp( aerialT * smoothstep( 2500.0, 9000.0, airDist ), 0.0, 0.72 );
+        vec3 rayleighBlue = mix( vec3( 0.42, 0.58, 0.80 ), vec3( 0.54, 0.68, 0.86 ),
+          smoothstep( 0.0, 0.5, uAirSunDir.y ) );
+        rayleighBlue = mix( rayleighBlue, uAirSkyColor, 0.16 * dayVis );
+        float sunAlign = max( dot( airViewDir, uAirSunDir ), 0.0 );
+        float miePhase = pow( sunAlign, 4.0 ) * 0.65 + pow( sunAlign, 18.0 ) * 0.35;
+        vec3 dustGlow = mix( vec3( 0.92, 0.76, 0.56 ), uAirSunColor, 0.55 );
+        vec3 atmosCol = mix( rayleighBlue, dustGlow,
+          clamp( miePhase * ( 0.45 + lowAir * 0.40 ), 0.0, 0.72 ) );
+        float distDesat = aerialT * 0.35 * dayVis;
+        float airLum = dot( outgoingLight, vec3( 0.2126, 0.7152, 0.0722 ) );
+        outgoingLight = mix( outgoingLight, vec3( airLum ), distDesat );
+        outgoingLight = mix( outgoingLight, atmosCol, aerialT * 0.62 * dayVis );
+        outgoingLight += dustGlow * miePhase * aerialT * 0.14 * dayVis * ( 0.5 + 0.5 * lowAir );
+      }
+      #include <opaque_fragment>`,
+      );
+  };
+  return mat;
+}
+
+/**
+ * One material per key for the lifetime of an `AirportSystem`. Every airport
+ * shares these, so a material whose opacity is animated must be animated with
+ * the same value for every airport — true for the runway edge/threshold lamps,
+ * which all follow `this.night`. Materials mutated per lamp (PAPI, rabbit) are
+ * deliberately NOT cached; see `buildAirport`.
+ */
+function cachedMaterial(cache, type, params = {}, atmos = _defaultAirportAtmos) {
+  if (!cache) {
+    const mat = type === 'basic'
+      ? new THREE.MeshBasicMaterial(params)
+      : new THREE.MeshLambertMaterial(params);
+    attachAirportAerialHaze(mat, atmos);
+    return mat;
+  }
+  const key = materialKey(type, params);
+  let material = cache.get(key);
+  if (material) return material;
+  material = type === 'basic'
+    ? new THREE.MeshBasicMaterial(params)
+    : new THREE.MeshLambertMaterial(params);
+  attachAirportAerialHaze(material, atmos);
+  // Marked so the per-mesh dispose traversal leaves it alone: `clear()` /
+  // `dispose()` free every cached material exactly once.
+  material.userData.cached = true;
+  cache.set(key, material);
+  return material;
+}
+
+function box(w, h, d, color, x, y, z, matCache = null, atmos = _defaultAirportAtmos) {
   const g = new THREE.BoxGeometry(w, h, d);
-  const m = new THREE.MeshLambertMaterial({ color });
+  const m = cachedMaterial(matCache, 'lambert', { color }, atmos);
   const mesh = new THREE.Mesh(g, m);
   mesh.position.set(x, y, z);
   return mesh;
 }
 
-export function buildAirport(ap, weatherRef) {
+export function buildAirport(ap, weatherRef, matCache = null, atmosUniforms = _defaultAirportAtmos) {
   const group = new THREE.Group();
   group.name = 'airport:' + ap.id;
   group.position.set(ap.x, ap.elevation, ap.z);
@@ -148,19 +275,19 @@ export function buildAirport(ap, weatherRef) {
   const runwayTex = makeRunwayTexture(L, Wd, ap.heading);
   const runway = new THREE.Mesh(
     new THREE.PlaneGeometry(L, Wd),
-    new THREE.MeshLambertMaterial({
+    attachAirportAerialHaze(new THREE.MeshLambertMaterial({
       map: runwayTex,
       polygonOffset: true,
       polygonOffsetFactor: -2,
       polygonOffsetUnits: -2,
-    }),
+    }), atmosUniforms),
   );
   runway.rotation.x = -Math.PI / 2;
   runway.position.y = 0.08;
   group.add(runway);
 
   // shoulders
-  const shoulderMat = new THREE.MeshLambertMaterial({ color: 0x50544f });
+  const shoulderMat = cachedMaterial(matCache, 'lambert', { color: 0x50544f }, atmosUniforms);
   const shoulder = new THREE.Mesh(new THREE.PlaneGeometry(L + 40, Wd + 24), shoulderMat);
   shoulder.rotation.x = -Math.PI / 2;
   shoulder.position.y = 0.04;
@@ -169,7 +296,7 @@ export function buildAirport(ap, weatherRef) {
 
   const asphaltTex = makeAsphaltTexture();
   asphaltTex.repeat.set(9, 2);
-  const asphaltMat = new THREE.MeshLambertMaterial({ map: asphaltTex });
+  const asphaltMat = attachAirportAerialHaze(new THREE.MeshLambertMaterial({ map: asphaltTex }), atmosUniforms);
 
   // taxiway parallel to the runway
   const taxiZ = Wd * 0.5 + 110;
@@ -194,7 +321,7 @@ export function buildAirport(ap, weatherRef) {
   group.add(apron);
 
   // taxi/apron markings
-  const markMat = new THREE.MeshBasicMaterial({ color: 0xd7d19a, transparent: true, opacity: 0.75 });
+  const markMat = cachedMaterial(matCache, 'basic', { color: 0xd7d19a, transparent: true, opacity: 0.75 });
   const line = new THREE.Mesh(new THREE.PlaneGeometry(L * 0.7, 0.9), markMat);
   line.rotation.x = -Math.PI / 2;
   line.position.set(0, 0.09, taxiZ);
@@ -213,11 +340,11 @@ export function buildAirport(ap, weatherRef) {
   for (let i = 0; i < nHangars; i++) {
     const hx = L * 0.02 + i * 78 - (nHangars - 1) * 34;
     const hz = taxiZ + 250;
-    const body = box(64, 16, 54, hangarColors[i % hangarColors.length], hx, 8, hz);
+    const body = box(64, 16, 54, hangarColors[i % hangarColors.length], hx, 8, hz, matCache, atmosUniforms);
     group.add(body);
     const roof = new THREE.Mesh(
       new THREE.CylinderGeometry(34, 34, 64, 18, 1, false, 0, Math.PI),
-      new THREE.MeshLambertMaterial({ color: 0x8f938f }),
+      cachedMaterial(matCache, 'lambert', { color: 0x8f938f }, atmosUniforms),
     );
     roof.rotation.z = Math.PI / 2;
     roof.rotation.y = Math.PI / 2;
@@ -227,7 +354,7 @@ export function buildAirport(ap, weatherRef) {
     // door
     const door = new THREE.Mesh(
       new THREE.PlaneGeometry(34, 13),
-      new THREE.MeshLambertMaterial({ color: 0x2b2f2e }),
+      cachedMaterial(matCache, 'lambert', { color: 0x2b2f2e }, atmosUniforms),
     );
     door.position.set(hx, 6.8, hz - 27.2);
     group.add(door);
@@ -236,41 +363,41 @@ export function buildAirport(ap, weatherRef) {
   // terminal
   if (ap.kind !== 'airfield') {
     const tw = isIntl ? 160 : 90;
-    const term = box(tw, 14, 42, 0xc9c6bc, L * 0.03, 7, taxiZ + 380);
+    const term = box(tw, 14, 42, 0xc9c6bc, L * 0.03, 7, taxiZ + 380, matCache, atmosUniforms);
     group.add(term);
     const glass = new THREE.Mesh(
       new THREE.PlaneGeometry(tw - 6, 7),
-      new THREE.MeshLambertMaterial({ color: 0x223a44, emissive: 0x102028, emissiveIntensity: 0.7 }),
+      cachedMaterial(matCache, 'lambert', { color: 0x223a44, emissive: 0x102028, emissiveIntensity: 0.7 }, atmosUniforms),
     );
     glass.position.set(L * 0.03, 8.4, taxiZ + 358.9);
     group.add(glass);
     // roof lip
-    group.add(box(tw + 10, 1.4, 48, 0x8d918c, L * 0.03, 14.6, taxiZ + 380));
+    group.add(box(tw + 10, 1.4, 48, 0x8d918c, L * 0.03, 14.6, taxiZ + 380, matCache, atmosUniforms));
   }
 
   // control tower
   const tz = taxiZ + 430;
   const shaft = new THREE.Mesh(
     new THREE.CylinderGeometry(4.2, 5.4, 30, 10),
-    new THREE.MeshLambertMaterial({ color: 0xbdbcb4 }),
+    cachedMaterial(matCache, 'lambert', { color: 0xbdbcb4 }, atmosUniforms),
   );
   shaft.position.set(-L * 0.28, 15, tz);
   group.add(shaft);
   const cab = new THREE.Mesh(
     new THREE.CylinderGeometry(8.4, 7.2, 6.5, 12),
-    new THREE.MeshLambertMaterial({ color: 0x27414a, emissive: 0x14303a, emissiveIntensity: 0.4 }),
+    cachedMaterial(matCache, 'lambert', { color: 0x27414a, emissive: 0x14303a, emissiveIntensity: 0.4 }, atmosUniforms),
   );
   cab.position.set(-L * 0.28, 33, tz);
   group.add(cab);
   const cap = new THREE.Mesh(
     new THREE.CylinderGeometry(9.2, 9.2, 1.0, 12),
-    new THREE.MeshLambertMaterial({ color: 0x777c78 }),
+    cachedMaterial(matCache, 'lambert', { color: 0x777c78 }, atmosUniforms),
   );
   cap.position.set(-L * 0.28, 37, tz);
   group.add(cap);
   const mast = new THREE.Mesh(
     new THREE.CylinderGeometry(0.18, 0.18, 12, 4),
-    new THREE.MeshLambertMaterial({ color: 0x9a9a92 }),
+    cachedMaterial(matCache, 'lambert', { color: 0x9a9a92 }, atmosUniforms),
   );
   mast.position.set(-L * 0.28, 43, tz);
   group.add(mast);
@@ -279,7 +406,7 @@ export function buildAirport(ap, weatherRef) {
   for (let i = 0; i < 2; i++) {
     const tank = new THREE.Mesh(
       new THREE.CylinderGeometry(9, 9, 18, 14),
-      new THREE.MeshLambertMaterial({ color: 0xd8d8ce }),
+      cachedMaterial(matCache, 'lambert', { color: 0xd8d8ce }, atmosUniforms),
     );
     tank.position.set(L * 0.3 + i * 24, 9, taxiZ + 300);
     group.add(tank);
@@ -288,7 +415,7 @@ export function buildAirport(ap, weatherRef) {
   // windsock
   const pole = new THREE.Mesh(
     new THREE.CylinderGeometry(0.2, 0.25, 9, 6),
-    new THREE.MeshLambertMaterial({ color: 0x8d928d }),
+    cachedMaterial(matCache, 'lambert', { color: 0x8d928d }, atmosUniforms),
   );
   pole.position.set(-L * 0.5 + 60, 4.5, taxiZ - 30);
   group.add(pole);
@@ -297,16 +424,18 @@ export function buildAirport(ap, weatherRef) {
   group.add(sockPivot);
   const sock = new THREE.Mesh(
     new THREE.ConeGeometry(1.4, 5.8, 8, 1, true),
-    new THREE.MeshLambertMaterial({ color: 0xff7a2a, side: THREE.DoubleSide }),
+    cachedMaterial(matCache, 'lambert', { color: 0xff7a2a, side: THREE.DoubleSide }, atmosUniforms),
   );
   // Cone points from base (-Y) toward tip (+Y); shift so wide opening sits at pivot.
   sock.position.set(0, 2.9, 0);
   sockPivot.add(sock);
 
-  // runway edge lights
-  const lightMat = new THREE.MeshBasicMaterial({ color: 0xffe2a8, toneMapped: false, transparent: true, opacity: 0.9 });
-  const redMat = new THREE.MeshBasicMaterial({ color: 0xff4b3a, toneMapped: false, transparent: true, opacity: 0.9 });
-  const greenMat = new THREE.MeshBasicMaterial({ color: 0x60ff9a, toneMapped: false, transparent: true, opacity: 0.9 });
+  // runway edge lights. `lightMat`/`redMat`/`greenMat` keep their opacity
+  // animation (`animate()` writes `this.night` into them) and every airport
+  // writes the same value, so they are safe to share through the cache.
+  const lightMat = cachedMaterial(matCache, 'basic', { color: 0xffe2a8, toneMapped: false, transparent: true, opacity: 0.9 });
+  const redMat = cachedMaterial(matCache, 'basic', { color: 0xff4b3a, toneMapped: false, transparent: true, opacity: 0.9 });
+  const greenMat = cachedMaterial(matCache, 'basic', { color: 0x60ff9a, toneMapped: false, transparent: true, opacity: 0.9 });
   const lightGeo = new THREE.BoxGeometry(1.1, 0.5, 1.1);
   const count = Math.floor(L / 55) * 2;
   const lights = new THREE.InstancedMesh(lightGeo, lightMat, count);
@@ -339,7 +468,9 @@ export function buildAirport(ap, weatherRef) {
 
   // PAPI: 4-lamp glideslope bar beside the touchdown zone on the approach end
   // (two white upper / two red lower lamps). Registered so the night animation
-  // can brighten them without touching the shared runway materials.
+  // can brighten them without touching the shared runway materials. Each lamp
+  // keeps its own material: `animate()` writes `p.material.opacity` per lamp, so
+  // these are deliberately NOT taken from the shared cache.
   const papiColors = [0xffffff, 0xffffff, 0xff3322, 0xff3322];
   const papi = [];
   for (let i = 0; i < 4; i++) {
@@ -352,11 +483,13 @@ export function buildAirport(ap, weatherRef) {
     papi.push({ mesh: m, material: mat });
   }
 
-  // approach light bars
+  // approach light bars (static, and their opacity is never animated, so the
+  // eight bars share one cached material)
+  const barMat = cachedMaterial(matCache, 'basic', { color: 0xffffff, toneMapped: false, transparent: true, opacity: 0.7 });
   for (let i = 0; i < 8; i++) {
     const bar = new THREE.Mesh(
       new THREE.BoxGeometry(18, 0.4, 1.2),
-      new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false, transparent: true, opacity: 0.7 }),
+      barMat,
     );
     bar.position.set(-L / 2 - 60 - i * 45, 0.5, 0);
     group.add(bar);
@@ -381,6 +514,8 @@ export function buildAirport(ap, weatherRef) {
     const wx = ap.x + cosR * lx + sinR * lz;
     const wz = ap.z - sinR * lx + cosR * lz;
     const groundY = (Number.isFinite(terrainHeight(wx, wz)) ? terrainHeight(wx, wz) : ap.elevation) + 1.5;
+    // Per-lamp material: each strobe flashes at its own phase, so the opacity
+    // is mutated per lamp in `animate()` and must not be shared.
     const mat = new THREE.MeshBasicMaterial({
       color: 0xfff6e0, toneMapped: false, transparent: true, opacity: 0.95,
     });
@@ -437,6 +572,20 @@ export function buildAirport(ap, weatherRef) {
   group.userData.airport = ap;
   group.userData.papi = papi;
   group.userData.rabbit = rabbit;
+
+  // Every mesh position/rotation/scale above is final, so compose each local
+  // matrix once here instead of letting `scene.updateMatrixWorld()` recompose
+  // ~60 static meshes per airport per frame. Animation only touches material
+  // opacity and lamp visibility, never a transform. `sockPivot` (a Group) and
+  // the group itself keep `matrixAutoUpdate` on — the pivot's quaternion is
+  // driven by the wind each frame, and a forced parent update carries the
+  // frozen children with it.
+  group.traverse((o) => {
+    if (!o.isMesh) return;
+    o.matrixAutoUpdate = false;
+    o.updateMatrix();
+  });
+  group.updateMatrixWorld(true);
   return group;
 }
 
@@ -447,10 +596,22 @@ export class AirportSystem {
     this.group = this.scene ? new THREE.Group() : null;
     if (this.group) this.scene.add(this.group);
     this.built = new Map();
+    // One material per (type, colour, flags) for every airport this system
+    // builds. Meshes reference them; the cache owns them and disposes them
+    // once, never the per-mesh traversal.
+    this._matCache = new Map();
     this.windX = 0;
     this.windZ = 0;
     this.windSpeed = 0;
     this.night = 0;
+    // Own copy of the module defaults: `update()` copies the live sky into it
+    // in place, and a shared table would leak one system's sun into another
+    // instance (or into a bare `buildAirport()` call in tests).
+    this._atmosUniforms = {
+      uAirSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.2) },
+      uAirSunColor: { value: new THREE.Color(0xfff2d0) },
+      uAirSkyColor: { value: new THREE.Color(0x8fb4c8) },
+    };
   }
 
   /**
@@ -478,6 +639,16 @@ export class AirportSystem {
     const skyNight = sky && Number.isFinite(sky.night) ? sky.night : null;
     this.night = skyNight !== null ? skyNight : (Number.isFinite(nightArg) ? Math.max(0, Math.min(1, nightArg)) : 0);
 
+    // Keep the airfield haze in the same atmosphere as the sky dome. Copied in
+    // place (no allocations) so every built Lambert material sees it through
+    // the uniform objects bound in `attachAirportAerialHaze`.
+    if (sky && typeof sky === 'object') {
+      const a = this._atmosUniforms;
+      if (sky.sunDir) a.uAirSunDir.value.copy(sky.sunDir);
+      if (sky.sunColor) a.uAirSunColor.value.copy(sky.sunColor);
+      if (sky.skyColor) a.uAirSkyColor.value.copy(sky.skyColor);
+    }
+
     // Headless-safe: no group (null scene) or no DOM means no meshes to drive.
     if (!this.group || typeof document === 'undefined') return;
 
@@ -502,13 +673,13 @@ export class AirportSystem {
     for (const [id, group] of this.built) {
       if (!wanted.has(id)) {
         this.group.remove(group);
-        disposeGroup(group);
+        disposeGroup(group, this._matCache);
         this.built.delete(id);
       }
     }
     for (const ap of near) {
       if (!this.built.has(ap.id)) {
-        const g = buildAirport(ap);
+        const g = buildAirport(ap, undefined, this._matCache, this._atmosUniforms);
         this.built.set(ap.id, g);
         this.group.add(g);
       }
@@ -530,9 +701,11 @@ export class AirportSystem {
   clear() {
     for (const [id, g] of this.built) {
       this.group?.remove(g);
-      disposeGroup(g);
+      disposeGroup(g, this._matCache);
     }
     this.built.clear();
+    // Nothing references the shared materials any more: free them once here.
+    this._disposeMaterialCache();
   }
 
   dispose() {
@@ -540,14 +713,23 @@ export class AirportSystem {
     this.group?.removeFromParent();
     this.group = null;
   }
+
+  /** Release every cached material exactly once (they outlive single airports). */
+  _disposeMaterialCache() {
+    for (const material of this._matCache.values()) material.dispose();
+    this._matCache.clear();
+  }
 }
 
-function disposeGroup(group) {
+function disposeGroup(group, matCache = null) {
   group.traverse((o) => {
     if (o.geometry) o.geometry.dispose();
     if (o.material) {
       const mats = Array.isArray(o.material) ? o.material : [o.material];
       for (const m of mats) {
+        // Shared materials belong to the system's cache and are disposed there
+        // once — disposing them per mesh would break the other airports.
+        if (matCache && m.userData && m.userData.cached) continue;
         if (m.map) m.map.dispose();
         m.dispose();
       }

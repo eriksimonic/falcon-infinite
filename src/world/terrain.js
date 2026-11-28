@@ -3,6 +3,13 @@
 import {
   fbm, fbm01, ridged01, noise2, smoothstep, clamp, hash2, hashU32, mulberry32,
 } from './noise.js';
+import {
+  sampleActiveHeightDelta, setActiveTerrainEdits, getActiveTerrainEdits,
+} from './terrain_edits.js';
+
+// Painted terrain edits are opt-in; with nothing installed the delta is 0 and
+// every height below is bit-identical to the unedited world.
+export { setActiveTerrainEdits, getActiveTerrainEdits };
 
 export const SEA_LEVEL = 0;
 export const AIRPORT_GRID = 16384; // one candidate airport per 16.4 km cell
@@ -318,9 +325,9 @@ export function airportNear(x, z, maxDist = 30000) {
   return best;
 }
 
-/** Terrain height including flattened airport pads. */
+/** Terrain height including painted edits and flattened airport pads. */
 export function terrainHeight(x, z) {
-  let h = baseHeight(x, z);
+  let h = baseHeight(x, z) + sampleActiveHeightDelta(x, z);
   if (_customAirports !== null) {
     for (const ap of _customAirports) {
       const d = Math.hypot(x - ap.x, z - ap.z);

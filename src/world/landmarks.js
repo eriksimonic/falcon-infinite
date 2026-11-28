@@ -335,14 +335,31 @@ export class LandmarkSystem {
     return material;
   }
 
+  /**
+   * Landmark parts never move after construction, so their local matrix is
+   * composed once here instead of being recomposed every frame by
+   * `scene.updateMatrixWorld()`. `updateMatrix()` also flags `matrixWorld` as
+   * dirty, and `_buildLandmark()` refreshes the whole subtree once the parent
+   * chain is final so `Box3.setFromObject` stays exact.
+   */
+  _freeze(mesh) {
+    mesh.matrixAutoUpdate = false;
+    mesh.updateMatrix();
+    return mesh;
+  }
+
   /** Box part: unit cube scaled to (w, h, d), centred on (x, y, z). */
   _box(parent, color, x, y, z, w, h, d, rx = 0, ry = 0, rz = 0, opts) {
     const mesh = new THREE.Mesh(this._resources().box, this._mat(color, opts));
     mesh.position.set(x, y, z);
     mesh.rotation.set(rx, ry, rz);
     mesh.scale.set(w, h, d);
-    mesh.castShadow = true;
+    // Under 2 m a part is smaller than a couple of shadow-map texels
+    // (1.37 m each at 2048² over the ±1.4 km sun box), so keeping it out of the
+    // shadow pass costs nothing visible and saves a draw call per part.
+    mesh.castShadow = Math.max(w, h, d) >= 2;
     mesh.receiveShadow = true;
+    this._freeze(mesh);
     parent.add(mesh);
     return mesh;
   }
@@ -354,8 +371,9 @@ export class LandmarkSystem {
     mesh.position.set(x, y, z);
     mesh.rotation.set(rx, ry, rz);
     mesh.scale.set(radius * 2, h, radius * 2);
-    mesh.castShadow = true;
+    mesh.castShadow = Math.max(radius * 2, h) >= 2;
     mesh.receiveShadow = true;
+    this._freeze(mesh);
     parent.add(mesh);
     return mesh;
   }
@@ -369,8 +387,9 @@ export class LandmarkSystem {
     mesh.position.set(x, y, z);
     mesh.rotation.set(rx, ry, rz);
     mesh.scale.set(radius * 2, h, radius * 2);
-    mesh.castShadow = true;
+    mesh.castShadow = Math.max(radius * 2, h) >= 2;
     mesh.receiveShadow = true;
+    this._freeze(mesh);
     parent.add(mesh);
     return mesh;
   }
@@ -380,6 +399,7 @@ export class LandmarkSystem {
     const mesh = new THREE.Mesh(this._resources().sphere, this._mat(color, opts));
     mesh.position.set(x, y, z);
     mesh.scale.setScalar(radius * 2);
+    this._freeze(mesh);
     parent.add(mesh);
     return mesh;
   }
@@ -425,6 +445,11 @@ export class LandmarkSystem {
     lm.object = obj;
     if (this.group) this._addNightGlow(obj, lm);
     this.group.add(obj);
+    // Every grounding, deck-pitch, position, rotation and scale write is done
+    // by now, so refresh the subtree once (forced) and leave `matrixWorld`
+    // exact for `Box3.setFromObject` and the grounding audit. Animated parts
+    // (beacons, lighthouse beam, night washes) keep `matrixAutoUpdate` on.
+    obj.updateMatrixWorld(true);
     return obj;
   }
 

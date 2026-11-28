@@ -382,6 +382,378 @@ function ilsFlight(x, z, y, heading = 90, onGround = false, agl) {
   ok(zero.grade === 'BUTTER' && zero.fpm === 0, 'non-finite / negative impact treated as zero');
 }
 
+// ------------------------------------- 8. smart auto-land (press-and-hold H)
+{
+  const landAp = {
+    x: 0, z: 0, elevation: 100, heading: 90, length: 3000, width: 45,
+    code: 'LJAJ', name: 'Ajdovščina',
+  };
+  const ground = () => 0;
+  const apClamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+  const apNorm = (d) => ((d % 360) + 360) % 360;
+
+  // Simple rate-command airframe, just enough to close the loops in Node.
+  function kinematicJet({ x, y, z, heading, speed = 170 }) {
+    return {
+      position: { x, y, z },
+      heading,
+      speed,
+      pitchDeg: 0,
+      rollDeg: 0,
+      rates: { x: 0, y: 0, z: 0 },
+      verticalSpeed: 0,
+      aoa: 0.05,
+      throttle: 0.5,
+      targetThrottle: 0.5,
+      onGround: false,
+      stall: false,
+      crashed: false,
+      gearDown: false,
+      flapsIndex: 0,
+      brake: false,
+      agl: y,
+      step(dt, cmd) {
+        const rad = Math.PI / 180;
+        const pitchRate = (cmd.pitch || 0) * 45;    // deg/s, + nose up
+        const rollRate = -(cmd.roll || 0) * 120;    // deg/s, + right bank
+        this.rates.x = pitchRate * rad;
+        this.rates.z = rollRate * rad;
+        this.pitchDeg = apClamp(this.pitchDeg + pitchRate * dt, -30, 30);
+        this.rollDeg = apClamp(this.rollDeg + rollRate * dt, -70, 70);
+        const turn = (9.81 / Math.max(60, this.speed)) * Math.tan(this.rollDeg * rad) * (180 / Math.PI);
+        this.heading = apNorm(this.heading + turn * dt);
+        this.verticalSpeed = this.speed * Math.sin((this.pitchDeg - this.aoa * (180 / Math.PI)) * rad);
+        this.position.y += this.verticalSpeed * dt;
+        this.position.x += Math.sin(this.heading * rad) * this.speed * dt;
+        this.position.z += -Math.cos(this.heading * rad) * this.speed * dt;
+        this.throttle += ((this.targetThrottle ?? this.throttle) - this.throttle) * Math.min(1, dt * 3);
+        this.speed = Math.max(0, this.speed + apClamp((this.throttle - 0.45) * 30, -12, 12) * dt);
+      },
+    };
+  }
+
+  // Engagement guards.
+  const guard = new AutopilotSystem();
+  ok(guard.engageAutoLand(null, landAp) === false, 'auto-land refuses a null jet');
+  ok(guard.engageAutoLand(makeJet({ crashed: true }), landAp) === false,
+    'auto-land refuses a crashed jet');
+  ok(guard.engageAutoLand(makeJet(), null) === false, 'auto-land refuses without an airport');
+  ok(guard.mode === 'OFF' && guard.phase === '', 'refused auto-land changes nothing');
+  ok(guard.consumeNotice() === null, 'no completion notice before a flight');
+
+  const air = makeJet({ x: -14000, y: 1200, z: 0, heading: 90, speed: 180 });
+  const apLand = new AutopilotSystem();
+  ok(apLand.engageAutoLand(air, landAp) === true, 'auto-land engages in the air');
+  ok(apLand.mode === 'AUTO_LAND', 'auto-land sets the AUTO_LAND mode');
+  ok(apLand.phase === 'INTERCEPT', 'auto-land starts in INTERCEPT');
+  ok(apLand.targetLabel === 'LJAJ', 'auto-land latches the airport code');
+
+  const desc = apLand.computeCommand(air, neutral(), { airport: landAp, terrainHeight: ground });
+  ok(desc !== undefined && desc.pitch < 0, 'INTERCEPT descends toward the approach gate',
+    desc && desc.pitch.toFixed(3));
+
+  // Terrain clearance: a 1500 m ridge must push the gate (and the jet) up.
+  const ridgeJet = makeJet({ x: -14000, y: 1600, z: 0, heading: 90, speed: 180 });
+  const ridgeAp = new AutopilotSystem();
+  ridgeAp.engageAutoLand(ridgeJet, landAp);
+  const ridge = ridgeAp.computeCommand(ridgeJet, neutral(), {
+    airport: landAp,
+    terrainHeight: () => 1500,
+  });
+  ok(ridge.pitch > 0, 'INTERCEPT climbs above a 1500 m terrain ridge', ridge.pitch.toFixed(3));
+
+  // Stable final: gear and flaps deploy, throttle targets 78 m/s on-speed.
+  const finalJet = makeJet({ x: -7500, y: 600, z: 0, heading: 90, speed: 130 });
+  finalJet.gearDown = false;
+  finalJet.flapsIndex = 0;
+  finalJet.targetThrottle = 0.5;
+  const apFinal = new AutopilotSystem();
+  apFinal.engageAutoLand(finalJet, landAp);
+  const fin = apFinal.computeCommand(finalJet, neutral(), { airport: landAp, terrainHeight: ground });
+  ok(apFinal.phase === 'FINAL', '6 km final is recognised', apFinal.phase);
+  ok(finalJet.gearDown === true, 'final deploys the gear inside 6.5 km');
+  ok(finalJet.flapsIndex === 2, 'final selects flaps 2 inside 6.5 km');
+  ok(fin.pitch < 0, 'final commands a descent on the 3.2° path', fin.pitch.toFixed(3));
+  ok(finalJet.targetThrottle >= 0.04 && finalJet.targetThrottle <= 0.92,
+    'final autothrottle stays in range', finalJet.targetThrottle.toFixed(2));
+
+  // Lateral intercept: right of centreline steers left (positive stick roll).
+  const latJet = makeJet({ x: -7500, y: 600, z: 800, heading: 90, speed: 130 });
+  const apLat = new AutopilotSystem();
+  apLat.engageAutoLand(latJet, landAp);
+  const lat = apLat.computeCommand(latJet, neutral(), { airport: landAp, terrainHeight: ground });
+  ok(apLat.phase === 'FINAL', 'lateral offset still inside the final gate', apLat.phase);
+  ok(lat.roll > 0, 'right of centreline commands a left bank', lat.roll.toFixed(3));
+
+  // Flare: below 18 m AGL inside 1.6 km, nose up and idle.
+  const flareJet = makeJet({ x: -1800, y: 115, z: 0, heading: 90, speed: 78, agl: 15 });
+  flareJet.gearDown = false;
+  flareJet.flapsIndex = 0;
+  flareJet.targetThrottle = 0.5;
+  const apFlare = new AutopilotSystem();
+  apFlare.engageAutoLand(flareJet, landAp);
+  const flare = apFlare.computeCommand(flareJet, neutral(), { airport: landAp, terrainHeight: ground });
+  ok(apFlare.phase === 'FLARE', 'low AGL on short final enters FLARE', apFlare.phase);
+  ok(flare.pitch > 0, 'flare raises the nose', flare.pitch.toFixed(3));
+  ok(flareJet.targetThrottle === 0.03, 'flare pulls the throttle to idle');
+  ok(flareJet.gearDown === true && flareJet.flapsIndex === 2,
+    'flare keeps gear down and flaps 2');
+
+  // Rollout: aerobrake above 72 m/s, wheel brakes below, rudder-align.
+  const rollJet = makeJet({ x: -1000, y: 100, z: 0, heading: 80, speed: 80, onGround: true });
+  rollJet.brake = false;
+  rollJet.targetThrottle = 0.8;
+  rollJet.gearDown = false;
+  const apRoll = new AutopilotSystem();
+  ok(apRoll.engageAutoLand(rollJet, landAp) === true, 'auto-land engages on the ground');
+  ok(apRoll.phase === 'ROLLOUT', 'ground engagement starts at ROLLOUT');
+  let rollOut;
+  for (let i = 0; i < 40; i++) {
+    rollOut = apRoll.computeCommand(rollJet, neutral(), { airport: landAp, terrainHeight: ground });
+  }
+  ok(apRoll.mode === 'AUTO_LAND', 'rollout does not disengage on ground contact');
+  ok(rollJet.targetThrottle === 0, 'rollout closes the throttle');
+  ok(rollJet.gearDown === true, 'rollout forces the gear down');
+  ok(rollJet.brake === false, 'aerobrake above 72 m/s (no wheel brakes)');
+  ok(rollOut.yaw < 0, 'rollout rudder aligns left toward runway heading', rollOut.yaw.toFixed(3));
+  ok(rollOut.pitch > 0, 'rollout holds a slight nose-up attitude', rollOut.pitch.toFixed(3));
+
+  rollJet.speed = 70;
+  apRoll.computeCommand(rollJet, neutral(), { airport: landAp, terrainHeight: ground });
+  ok(rollJet.brake === true, 'wheel brakes below 72 m/s');
+
+  rollJet.speed = 2.5;
+  const done = apRoll.computeCommand(rollJet, neutral(), { airport: landAp, terrainHeight: ground });
+  ok(apRoll.mode === 'OFF', 'rollout completes and disengages');
+  const notice = apRoll.consumeNotice();
+  ok(notice === 'AUTO-LAND COMPLETE · LJAJ', 'auto-land posts a clean completion notice',
+    String(notice));
+  ok(apRoll.consumeNotice() === null, 'completion notice is consumed once');
+  ok(done !== undefined, 'completion frame returns safely');
+
+  // Manual stick always wins, even in AUTO_LAND.
+  const ovJet = makeJet({ x: -14000, y: 1200, z: 0, heading: 90, speed: 180 });
+  const apOv = new AutopilotSystem();
+  apOv.engageAutoLand(ovJet, landAp);
+  const ovBase = neutral();
+  ovBase.pitch = 0.6;
+  ok(apOv.computeCommand(ovJet, ovBase, { airport: landAp }) === ovBase,
+    'stick override in AUTO_LAND returns baseCmd');
+  ok(apOv.mode === 'OFF', 'stick override disengages AUTO_LAND');
+
+  // Closed-loop approach: INTERCEPT -> FINAL -> FLARE -> rollout.
+  const sim = kinematicJet({ x: -14000, y: 1200, z: 0, heading: 90, speed: 180 });
+  const apSim = new AutopilotSystem();
+  apSim.engageAutoLand(sim, landAp);
+  const seen = new Set();
+  let gearSeen = false;
+  let flapsSeen = false;
+  const ctx = { airport: landAp, terrainHeight: ground };
+  for (let i = 0; i < 60 * 130; i++) {
+    sim.agl = sim.position.y - landAp.elevation;
+    const cmd = apSim.computeCommand(sim, neutral(), ctx);
+    seen.add(apSim.phase);
+    gearSeen = gearSeen || sim.gearDown;
+    flapsSeen = flapsSeen || sim.flapsIndex === 2;
+    sim.step(1 / 60, cmd);
+    if (Math.hypot(sim.position.x + 1500, sim.position.z) < 120) {
+      sim.onGround = true;
+      sim.position.y = landAp.elevation;
+      sim.speed = 75;
+      break;
+    }
+  }
+  ok(seen.has('INTERCEPT'), 'closed-loop approach starts in INTERCEPT');
+  ok(seen.has('FINAL'), 'closed-loop approach captures FINAL');
+  ok(seen.has('FLARE'), 'closed-loop approach flares before touchdown');
+  ok(gearSeen && flapsSeen, 'closed-loop approach auto-configures gear and flaps');
+  ok(Math.abs(sim.position.z) < 300, 'closed-loop approach tracks the centreline',
+    sim.position.z.toFixed(0) + ' m');
+
+  let landed = false;
+  for (let i = 0; i < 60 * 120; i++) {
+    apSim.computeCommand(sim, neutral(), ctx);
+    sim.speed = Math.max(0, sim.speed - 1.0);
+    if (apSim.mode === 'OFF') { landed = true; break; }
+  }
+  ok(landed, 'closed-loop rollout brings the jet to a stop and disengages');
+  ok(String(apSim.consumeNotice()).startsWith('AUTO-LAND COMPLETE'),
+    'closed-loop rollout posts a completion notice');
+}
+
+// ---------------------------------- 9. smart auto-refuel (press-and-hold H)
+{
+  const apClamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+  const apNorm = (d) => ((d % 360) + 360) % 360;
+
+  function kinematicJet({ x, y, z, heading, speed = 170 }) {
+    return {
+      position: { x, y, z },
+      heading,
+      speed,
+      pitchDeg: 0,
+      rollDeg: 0,
+      rates: { x: 0, y: 0, z: 0 },
+      verticalSpeed: 0,
+      aoa: 0.05,
+      throttle: 0.5,
+      targetThrottle: 0.5,
+      onGround: false,
+      stall: false,
+      crashed: false,
+      gearDown: false,
+      flapsIndex: 0,
+      brake: false,
+      agl: y,
+      step(dt, cmd) {
+        const rad = Math.PI / 180;
+        const pitchRate = (cmd.pitch || 0) * 45;
+        const rollRate = -(cmd.roll || 0) * 120;
+        this.rates.x = pitchRate * rad;
+        this.rates.z = rollRate * rad;
+        this.pitchDeg = apClamp(this.pitchDeg + pitchRate * dt, -30, 30);
+        this.rollDeg = apClamp(this.rollDeg + rollRate * dt, -70, 70);
+        const turn = (9.81 / Math.max(60, this.speed)) * Math.tan(this.rollDeg * rad) * (180 / Math.PI);
+        this.heading = apNorm(this.heading + turn * dt);
+        this.verticalSpeed = this.speed * Math.sin((this.pitchDeg - this.aoa * (180 / Math.PI)) * rad);
+        this.position.y += this.verticalSpeed * dt;
+        this.position.x += Math.sin(this.heading * rad) * this.speed * dt;
+        this.position.z += -Math.cos(this.heading * rad) * this.speed * dt;
+        this.throttle += ((this.targetThrottle ?? this.throttle) - this.throttle) * Math.min(1, dt * 3);
+        this.speed = Math.max(0, this.speed + apClamp((this.throttle - 0.45) * 30, -12, 12) * dt);
+      },
+    };
+  }
+
+  const tanker = () => ({
+    position: { x: 0, y: 3000, z: 0 },
+    velocity: { x: 0, y: 0, z: -165 },
+    heading: 0,
+    speed: 165,
+  });
+  const tankCtx = (t, fuel) => ({ tanker: t, fuel, terrainHeight: () => 0 });
+
+  // Engagement guards.
+  const guard = new AutopilotSystem();
+  ok(guard.engageAutoRefuel(null, tanker()) === false, 'auto-refuel refuses a null jet');
+  ok(guard.engageAutoRefuel(makeJet({ onGround: true }), tanker()) === false,
+    'auto-refuel refuses an aircraft on the ground');
+  ok(guard.engageAutoRefuel(makeJet({ crashed: true }), tanker()) === false,
+    'auto-refuel refuses a crashed jet');
+  ok(guard.engageAutoRefuel(makeJet(), null) === false, 'auto-refuel refuses without a tanker');
+  ok(guard.mode === 'OFF', 'refused auto-refuel leaves the autopilot OFF');
+
+  const joinJet = makeJet({ x: 0, y: 3000, z: 3000, heading: 0, speed: 220 });
+  const apJoin = new AutopilotSystem();
+  ok(apJoin.engageAutoRefuel(joinJet, tanker()) === true, 'auto-refuel engages in the air');
+  ok(apJoin.mode === 'AUTO_REFUEL' && apJoin.phase === 'RENDEZVOUS',
+    'auto-refuel starts in RENDEZVOUS');
+  ok(apJoin.targetLabel === 'KC-135', 'auto-refuel labels the tanker');
+
+  // Rendezvous: fast closure speed and gear/flaps clean.
+  const rv = apJoin.computeCommand(joinJet, neutral(), tankCtx(tanker(), { fraction: 0.5 }));
+  ok(apJoin.phase === 'RENDEZVOUS', '3 km behind the tanker is a rendezvous');
+  ok(joinJet.targetThrottle > 0.6, 'rendezvous commands a high closure throttle',
+    joinJet.targetThrottle.toFixed(2));
+  ok(joinJet.gearDown === false && joinJet.flapsIndex === 0, 'auto-refuel keeps the jet clean');
+
+  // Join: inside 750 m, closing gently on the boom.
+  const jJet = makeJet({ x: 0, y: 3000, z: 400, heading: 0, speed: 200 });
+  const apJo = new AutopilotSystem();
+  apJo.engageAutoRefuel(jJet, tanker());
+  apJo.computeCommand(jJet, neutral(), tankCtx(tanker(), { fraction: 0.5 }));
+  ok(apJo.phase === 'JOIN', '400 m behind the tanker is JOIN', apJo.phase);
+  ok(jJet.targetThrottle < 0.5, 'join eases the throttle toward tanker speed',
+    jJet.targetThrottle.toFixed(2));
+
+  // Contact: exactly on the boom target, lateral correction right -> stick left.
+  const cJet = makeJet({ x: 5, y: 2991, z: 22, heading: 0, speed: 165 });
+  const apC = new AutopilotSystem();
+  apC.engageAutoRefuel(cJet, tanker());
+  const contactCmd = apC.computeCommand(cJet, neutral(), tankCtx(tanker(), { fraction: 0.5 }));
+  ok(apC.phase === 'CONTACT', 'inside 90 m the autopilot holds CONTACT', apC.phase);
+  ok(Math.abs(cJet.targetThrottle - 0.45) < 0.02, 'contact matches tanker speed at zero error',
+    cJet.targetThrottle.toFixed(3));
+  ok(contactCmd.roll > 0, 'right of the boom commands a left bank', contactCmd.roll.toFixed(3));
+
+  // Full fuel: break away to ALT_HDG with a one-shot notice.
+  const fullJet = makeJet({ x: 0, y: 2991, z: 22, heading: 0, speed: 165 });
+  const apFull = new AutopilotSystem();
+  apFull.engageAutoRefuel(fullJet, tanker());
+  const baseFull = neutral();
+  const fullCmd = apFull.computeCommand(fullJet, baseFull, tankCtx(tanker(), { fraction: 1.0 }));
+  ok(fullCmd === baseFull, 'full fuel hands the frame back untouched');
+  ok(apFull.mode === 'ALT_HDG', 'full fuel transitions AUTO_REFUEL to ALT_HDG');
+  ok(apFull.phase === '', 'completion clears the sub-phase');
+  const fullNotice = apFull.consumeNotice();
+  ok(fullNotice === 'REFUEL COMPLETE · BREAKING AWAY', 'refuel posts a clean completion notice',
+    String(fullNotice));
+
+  // Manual stick always wins, even in AUTO_REFUEL.
+  const ovJet = makeJet({ x: 0, y: 3000, z: 3000, heading: 0, speed: 220 });
+  const apOv = new AutopilotSystem();
+  apOv.engageAutoRefuel(ovJet, tanker());
+  const ovBase = neutral();
+  ovBase.roll = -0.6;
+  ok(apOv.computeCommand(ovJet, ovBase, tankCtx(tanker(), { fraction: 0.5 })) === ovBase,
+    'stick override in AUTO_REFUEL returns baseCmd');
+  ok(apOv.mode === 'OFF', 'stick override disengages AUTO_REFUEL');
+
+  // Closed-loop: rendezvous -> join -> contact, settling inside the boom box.
+  const t = tanker();
+  const fuel = { fraction: 0.5 };
+  const sim = kinematicJet({ x: 0, y: 3000, z: 3000, heading: 0, speed: 220 });
+  const apSim = new AutopilotSystem();
+  apSim.engageAutoRefuel(sim, t);
+  const seen = new Set();
+  let inside = null;
+  let contactRun = 0;
+  for (let i = 0; i < 60 * 180; i++) {
+    const cmd = apSim.computeCommand(sim, neutral(), tankCtx(t, fuel));
+    seen.add(apSim.phase);
+    sim.step(1 / 60, cmd);
+    t.position.z -= 165 / 60;
+
+    const dx = sim.position.x - t.position.x;
+    const dy = sim.position.y - t.position.y;
+    const dz = sim.position.z - t.position.z;
+    const aft = -(dx * 0 + dz * -1);
+    const below = -dy;
+    const lateral = Math.abs(dx * 1 + dz * 0);
+    const relSpeed = Math.abs(sim.speed - t.speed);
+    if (apSim.phase === 'CONTACT') {
+      contactRun++;
+      if (aft >= 12 && aft <= 34 && below >= 2 && below <= 12 && lateral <= 10 && relSpeed < 22) {
+        inside = { aft, below, lateral, relSpeed };
+      }
+      if (inside && contactRun > 120) break;
+    }
+  }
+  ok(seen.has('RENDEZVOUS'), 'closed-loop refuel starts in RENDEZVOUS');
+  ok(seen.has('JOIN'), 'closed-loop refuel passes through JOIN');
+  ok(seen.has('CONTACT'), 'closed-loop refuel reaches CONTACT');
+  ok(!!inside, 'closed-loop refuel settles inside the KC-135 boom contact box',
+    inside ? `aft ${inside.aft.toFixed(1)}, below ${inside.below.toFixed(1)}, lat ${inside.lateral.toFixed(1)}` : 'never inside');
+  if (inside) {
+    ok(inside.aft >= 12 && inside.aft <= 34, 'contact box aft envelope', inside.aft.toFixed(1));
+    ok(inside.below >= 2 && inside.below <= 12, 'contact box vertical envelope', inside.below.toFixed(1));
+    ok(inside.lateral <= 10, 'contact box lateral envelope', inside.lateral.toFixed(1));
+    ok(inside.relSpeed < 22, 'contact closure is gentle', inside.relSpeed.toFixed(1));
+  }
+  ok(Math.abs(sim.position.y - (t.position.y - 9)) < 6,
+    'closed-loop refuel holds 9 m below the tanker',
+    (sim.position.y - t.position.y).toFixed(1));
+  ok(Math.abs(sim.heading - t.heading) < 8, 'closed-loop refuel holds the tanker heading',
+    (sim.heading - t.heading).toFixed(1));
+
+  // Reaching 100% posts the break-away notice and leaves ALT_HDG latched.
+  fuel.fraction = 1.0;
+  apSim.computeCommand(sim, neutral(), tankCtx(t, fuel));
+  ok(apSim.mode === 'ALT_HDG', 'closed-loop refuel ends in ALT_HDG');
+  ok(apSim.consumeNotice() === 'REFUEL COMPLETE · BREAKING AWAY',
+    'closed-loop refuel posts REFUEL COMPLETE');
+}
+
 // ---------------------------------------------------------------- summary
 console.log(`autopilot checks: ${checks}, failures: ${failures.length}`);
 for (const f of failures) console.log('  FAIL ' + f);

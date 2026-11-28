@@ -11,8 +11,18 @@ import { clamp, smoothstep, mulberry32 } from '../world/noise.js';
 import { terrainHeight } from '../world/terrain.js';
 
 const SPEED_OF_SOUND = 340;
-const RIBBON_SEGMENTS = 36;
+// Render mesh resolution of a vortex ribbon. The trail itself is captured at
+// RIBBON_HISTORY nodes (one per simulated frame) and resampled onto these 64
+// segments with a Catmull-Rom spline, so a 9G pull-up reads as a smooth curve
+// instead of a faceted polyline. Keep the two separate: the trail depth is part
+// of the acceptance contract in tests/vfx_test.mjs (r.filled === 36).
+const RIBBON_SEGMENTS = 64;
+const RIBBON_HISTORY = 36;
 const RIBBON_ALPHA = 0.55;
+// Condensation core half-width at the emitter (glassy, tight) and at the far
+// tail (a billowing turbulent plume), in metres.
+const RIBBON_W_TIP = 0.10;
+const RIBBON_W_TAIL = 0.70;
 const BOOM_COOLDOWN = 4;
 const MAX_EXPLOSIONS = 12;
 // Feature 21: explosions are a multi-stage effect, not a 0.45 s flash.
@@ -59,14 +69,31 @@ const LOBE_SIZE = [0.62, 0.48, 0.56, 0.72];
 const LOBE_SPIN = [0.85, -1.3, 1.65, -0.55];
 const DEBRIS_CAPACITY = 160;
 const DEBRIS_GRAVITY = -9.81;
+// Debris trail smoke. The fastest third of every burst is modelled as a burning
+// wing/fuselage shard: it drags a dark arcing smoke streamer behind it while it
+// is still fast and young, exactly like the shrapnel in a real aircraft kill.
+const DEBRIS_SMOKING_FRACTION = 0.35;
+const DEBRIS_SMOKE_PERIOD = 0.045;
+const DEBRIS_SMOKE_AGE = 1.5;
+const DEBRIS_SMOKE_SPEED = 12;
 const GUN_PORT = new THREE.Vector3(-0.75, 0.25, -2.5);
+// Condensation vortex emitters in airframe-local metres (x right, y up, z aft).
+// Wingtip pair: the tips of the F-16C Block 50 LAU-129 missile rails, where the
+// strongest tip vortex sheds. LERX pair: the strake shoulder ahead of the wing
+// root, which only condenses hard once the jet is genuinely loaded (>10 deg AoA
+// or >3.5G) and is otherwise dry.
 const WINGTIP_LOCAL = [
-  new THREE.Vector3(4.95, 0.02, 2.25),
-  new THREE.Vector3(-4.95, 0.02, 2.25),
+  new THREE.Vector3(4.96, 0.04, 2.95),
+  new THREE.Vector3(-4.96, 0.04, 2.95),
+];
+const LERX_LOCAL = [
+  new THREE.Vector3(1.08, 0.14, -0.75),
+  new THREE.Vector3(-1.08, 0.14, -0.75),
 ];
 
 const _head = new THREE.Vector3();
 const _right = new THREE.Vector3();
+const _up = new THREE.Vector3();
 const _tan = new THREE.Vector3();
 const _toCam = new THREE.Vector3();
 const _side = new THREE.Vector3();
@@ -78,6 +105,9 @@ const _dPos = new THREE.Vector3();
 const _dScale = new THREE.Vector3();
 const _dQuat = new THREE.Quaternion();
 const _dEuler = new THREE.Euler();
+// Scratch list of the pool slots launched by one burst, so _spawnDebris() can
+// pick out the fastest chunks without allocating (a burst is at most 44).
+const _debrisBatch = new Int16Array(DEBRIS_CAPACITY);
 
 function hasPose(flight) {
   return !!(
@@ -99,6 +129,9 @@ class ParticlePool {
     this.gravity = gravity;
     this.count = 0;
     this.cursor = 0;
+    // Highest slot that has been used at least once. update() only walks and
+    // uploads the prefix [0, _hi]; -1 means the pool has never spawned.
+    this._hi = -1;
 
     this.pos = new Float32Array(capacity * 3);
     this.col = new Float32Array(capacity * 3);
@@ -206,6 +239,7 @@ class ParticlePool {
     this.alpha[i] = opacity * 0.2;
 
     this.colAttr.needsUpdate = true;
+    if (i > this._hi) this._hi = i;
     this.cursor = (i + 1) % this.capacity;
     return i;
   }
@@ -215,8 +249,10 @@ class ParticlePool {
       this.points.visible = false;
       return 0;
     }
+    // Walk only the slots that have ever been touched, not the full capacity.
+    const hi = this._hi;
     const drag = Math.exp(-this.drag * dt);
-    for (let i = 0; i < this.capacity; i++) {
+    for (let i = 0; i <= hi; i++) {
       if (!this.active[i]) continue;
 
       const life = this.life[i] - dt;
@@ -245,8 +281,24 @@ class ParticlePool {
       this.alpha[i] = this.opacity[i] * fadeIn * Math.pow(1 - t, 1.35);
     }
 
+    // Compact the high-water mark down to the last slot still alive, so a
+    // short burst does not keep the loop and the uploads at full width.
+    let newHi = hi;
+    while (newHi >= 0 && !this.active[newHi]) newHi--;
+    this._hi = newHi;
+
+    // Upload only the live prefix. `hi` (this frame's highest slot) is used as
+    // the end marker, because slots that expired during this update must still
+    // push their zeroed alpha/size, or they would linger on the GPU.
+    const uploadCount = hi + 1;
+    this.posAttr.clearUpdateRanges();
+    this.posAttr.addUpdateRange(0, uploadCount * 3);
     this.posAttr.needsUpdate = true;
+    this.alphaAttr.clearUpdateRanges();
+    this.alphaAttr.addUpdateRange(0, uploadCount);
     this.alphaAttr.needsUpdate = true;
+    this.sizeAttr.clearUpdateRanges();
+    this.sizeAttr.addUpdateRange(0, uploadCount);
     this.sizeAttr.needsUpdate = true;
     this.points.visible = this.count > 0;
     return this.count;
@@ -258,7 +310,10 @@ class ParticlePool {
     this.size.fill(0);
     this.count = 0;
     this.cursor = 0;
+    this._hi = -1;
     this.points.visible = false;
+    this.alphaAttr.clearUpdateRanges();
+    this.sizeAttr.clearUpdateRanges();
     this.alphaAttr.needsUpdate = true;
     this.sizeAttr.needsUpdate = true;
   }
@@ -277,6 +332,12 @@ export class CombatVFX {
 
     // --- wingtip vapor ribbons -------------------------------------------
     this.vaporIntensity = 0;
+    // LERX/strake vortices are a separate, later-arriving effect: the strake
+    // only squeezes the air hard enough to condense at high AoA or high G.
+    this.lerxIntensity = 0;
+    // Shared shader clock, advanced once per update() so every ribbon material
+    // samples the same uTime and the turbulence churns instead of strobing.
+    this.vaporTime = 0;
     this.ribbons = [];
     this._buildRibbons();
 
@@ -288,11 +349,17 @@ export class CombatVFX {
     this.mach = this._buildMachCone();
 
     // --- explosion pool ---------------------------------------------------
-    this._coreGeo = new THREE.SphereGeometry(1, 16, 12);
+    // The fireball shader displaces this sphere along its own normal, so the
+    // shell needs enough vertices for the cauliflower billows to read as
+    // turbulence rather than as a lumpy low-poly blob.
+    this._coreGeo = new THREE.SphereGeometry(1, 48, 34);
     this._ringGeo = new THREE.RingGeometry(0.82, 1, 48, 1);
     this._ringGeo.rotateX(-Math.PI / 2);
     this.explosions = [];
     this._explosionCursor = 0;
+    // Shared shader clock for every fireball/lobe material, so the noise field
+    // churns continuously instead of restarting with each detonation.
+    this.explosionTime = 0;
     this._buildExplosions();
 
     // --- Feature 25: dynamic blast flash --------------------------------
@@ -301,6 +368,8 @@ export class CombatVFX {
     // and terrain catch the muzzle of the fireball.
     this._blastLight = new THREE.PointLight(0xff9b42, 0, 450, 1.5);
     this._blastLight.position.set(0, 0, 0);
+    // Starts dark, so keep it out of every lit program's light loop.
+    this._blastLight.visible = false;
     this.group.add(this._blastLight);
     this._blastPeak = 0;
     this._blastTimer = 0;
@@ -352,9 +421,30 @@ export class CombatVFX {
 
   // ------------------------------------------------------------- construction
   _buildRibbons() {
-    for (let w = 0; w < 2; w++) {
-      const positions = new Float32Array(RIBBON_SEGMENTS * 2 * 3);
-      const alphas = new Float32Array(RIBBON_SEGMENTS * 2);
+    // Four emitters: the wingtip pair always condenses at high G/AoA, the LERX
+    // pair only once the wing is really loaded (see update()).
+    const emitters = [
+      { local: WINGTIP_LOCAL[0], kind: 'tip', widthScale: 1.0, alphaScale: 1.0 },
+      { local: WINGTIP_LOCAL[1], kind: 'tip', widthScale: 1.0, alphaScale: 1.0 },
+      { local: LERX_LOCAL[0], kind: 'lerx', widthScale: 0.82, alphaScale: 0.72 },
+      { local: LERX_LOCAL[1], kind: 'lerx', widthScale: 0.82, alphaScale: 0.72 },
+    ];
+
+    for (let w = 0; w < emitters.length; w++) {
+      const em = emitters[w];
+      const vertCount = RIBBON_SEGMENTS * 2;
+      const positions = new Float32Array(vertCount * 3);
+      const alphas = new Float32Array(vertCount);
+      // u runs 0..1 along the trail, v is 0 or 1 across the width. The fragment
+      // shader turns that into a cylindrical vapour profile instead of a strip.
+      const uvs = new Float32Array(vertCount * 2);
+      for (let i = 0; i < RIBBON_SEGMENTS; i++) {
+        const u = RIBBON_SEGMENTS > 1 ? i / (RIBBON_SEGMENTS - 1) : 0;
+        uvs[i * 4] = u;
+        uvs[i * 4 + 1] = 0;
+        uvs[i * 4 + 2] = u;
+        uvs[i * 4 + 3] = 1;
+      }
       const indices = new Uint16Array((RIBBON_SEGMENTS - 1) * 6);
       for (let i = 0; i < RIBBON_SEGMENTS - 1; i++) {
         const a = i * 2;
@@ -375,35 +465,116 @@ export class CombatVFX {
       posAttr.setUsage(THREE.DynamicDrawUsage);
       const alphaAttr = new THREE.BufferAttribute(alphas, 1);
       alphaAttr.setUsage(THREE.DynamicDrawUsage);
+      const uvAttr = new THREE.BufferAttribute(uvs, 2);
+      uvAttr.setUsage(THREE.DynamicDrawUsage);
+      uvAttr.needsUpdate = true;
       geo.setAttribute('position', posAttr);
       geo.setAttribute('aAlpha', alphaAttr);
+      geo.setAttribute('uv', uvAttr);
       geo.setIndex(new THREE.BufferAttribute(indices, 1));
       geo.setDrawRange(0, 0);
 
+      const seed = 1.7 + w * 2.31;
       const mat = new THREE.ShaderMaterial({
         transparent: true,
         depthWrite: false,
         side: THREE.DoubleSide,
+        // fog: true + the merged fog uniforms make <fog_fragment> legal; without
+        // both, USE_FOG is undefined and the chunk compiles to nothing.
+        fog: true,
+        uniforms: THREE.UniformsUtils.merge([
+          THREE.UniformsLib.fog,
+          {
+            uColor: { value: new THREE.Color(0xf5faff) },
+            uTime: { value: 0 },
+            uSeed: { value: seed },
+            uTurb: { value: 0 },
+            uNight: { value: 0 },
+          },
+        ]),
         vertexShader: /* glsl */`
           attribute float aAlpha;
           varying float vA;
+          varying vec2 vUv;
+          #include <fog_pars_vertex>
           void main() {
             vA = aAlpha;
-            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            vUv = uv;
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            gl_Position = projectionMatrix * mvPosition;
+            #include <fog_vertex>
           }
         `,
         fragmentShader: /* glsl */`
-          precision mediump float;
+          precision highp float;
           uniform vec3 uColor;
+          uniform float uTime;
+          uniform float uSeed;
+          uniform float uTurb;
+          uniform float uNight;
           varying float vA;
+          varying vec2 vUv;
+          #include <fog_pars_fragment>
+
+          float hash21(vec2 p) {
+            p = fract(p * vec2(123.34, 456.21));
+            p += dot(p, p + 45.32);
+            return fract(p.x * p.y);
+          }
+
+          // Value noise: smooth, cheap, and enough for a 2-octave vapour fBM.
+          float vnoise(vec2 p) {
+            vec2 i = floor(p);
+            vec2 f = fract(p);
+            f = f * f * (3.0 - 2.0 * f);
+            float a = hash21(i);
+            float b = hash21(i + vec2(1.0, 0.0));
+            float c = hash21(i + vec2(0.0, 1.0));
+            float d = hash21(i + vec2(1.0, 1.0));
+            return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+          }
+
           void main() {
-            if (vA < 0.003) discard;
-            gl_FragColor = vec4(uColor, vA);
+            float u = clamp(vUv.x, 0.0, 1.0);
+            float v = clamp(vUv.y, 0.0, 1.0);
+
+            // Helical twist: the vortex spins faster and wider toward the tail.
+            float grow = smoothstep(0.02, 0.45, u);
+            float twist = sin(u * 30.0 - uTime * 16.0 + uSeed) * 0.22 * grow;
+            float vw = v + twist;
+
+            // Soft cylindrical profile: a dense core plus a wispy outer mist.
+            float dv = (vw - 0.5) * 3.8;
+            float core = exp(-dv * dv);
+            float mist = smoothstep(0.0, 0.35, 1.0 - abs(vw * 2.0 - 1.0));
+
+            // Two octaves of scrolling turbulence carve the vapour apart.
+            float nFar = vnoise(vec2(u * 14.0 - uTime * 5.5, vw * 3.2 + uSeed));
+            float nNear = vnoise(vec2(u * 34.0 - uTime * 11.0, vw * 7.5 + uSeed * 2.1));
+            float turb = nFar * 0.64 + nNear * 0.36;
+
+            // u < 0.08: tight, continuous and silky. From 0.15 -> 1.0 the noise
+            // eats growing lace gaps into the plume.
+            float breakup = smoothstep(0.15, 1.0, u) * clamp(uTurb, 0.0, 1.0);
+            float lacy = smoothstep(0.30, 0.82, turb);
+            float carve = mix(1.0, lacy, breakup);
+
+            float density = (core * 0.92 + mist * 0.30) * carve;
+            density = mix(core, density, smoothstep(0.05, 0.20, u));
+
+            float a = vA * density * (1.0 - 0.55 * uNight);
+            if (a < 0.004) discard;
+
+            // Bright sunlit white-blue core -> cooler misty grey-blue rim.
+            vec3 col = mix(vec3(0.76, 0.83, 0.90), uColor, smoothstep(0.12, 0.85, core));
+            col *= (0.90 + 0.18 * nFar) * (1.0 - 0.30 * uNight);
+
+            gl_FragColor = vec4(col, a);
+            #include <fog_fragment>
+            #include <tonemapping_fragment>
+            #include <colorspace_fragment>
           }
         `,
-        uniforms: {
-          uColor: { value: new THREE.Color(0xf3f8ff) },
-        },
       });
 
       const mesh = new THREE.Mesh(geo, mat);
@@ -415,13 +586,29 @@ export class CombatVFX {
       this.ribbons.push({
         mesh,
         geo,
+        mat,
         posAttr,
         alphaAttr,
+        uvAttr,
         positions,
         alphas,
-        hist: new Float32Array(RIBBON_SEGMENTS * 3),
+        uvs,
+        // Captured trail, one node per simulated frame, oldest last.
+        hist: new Float32Array(RIBBON_HISTORY * 3),
+        // Age (s) of each captured node. Allocated at the render resolution so
+        // no allocation is ever needed at runtime; only RIBBON_HISTORY entries
+        // are live.
+        ages: new Float32Array(RIBBON_SEGMENTS),
+        // Half-width of each render segment, refreshed every frame.
+        widths: new Float32Array(RIBBON_SEGMENTS),
         filled: 0,
-        local: WINGTIP_LOCAL[w],
+        local: em.local,
+        kind: em.kind,
+        // Left tip (x < 0) spins the opposite way to the right tip.
+        side: em.local.x < 0 ? -1 : 1,
+        seed: seed * 3.17,
+        widthScale: em.widthScale,
+        alphaScale: em.alphaScale,
       });
     }
   }
@@ -479,6 +666,266 @@ export class CombatVFX {
     return { mesh, mat, geo };
   }
 
+  /**
+   * Turbulent procedural fireball. A flat MeshBasicMaterial sphere reads as a
+   * plastic orange balloon, so the fireball shell and its four lobes share this
+   * ShaderMaterial instead:
+   *
+   *  - the vertex stage displaces the sphere along its own normal with a
+   *    multi-octave billow field, breaking the perfect silhouette into a
+   *    churning, asymmetrical cauliflower mass and rebuilding the shading
+   *    normal from the displaced surface (finite differences);
+   *  - the fragment stage lays a temperature ramp over two octaves of noise
+   *    scrolled upward through the fireball: incandescent white-yellow core ->
+   *    roaring orange flames -> crimson embers -> charcoal soot crust, with the
+   *    crevices between billows staying hot long after the shells crust over;
+   *  - the silhouette is eroded by that same turbulence, so the shell never
+   *    shows a hard plastic sphere outline.
+   *
+   * `opacity` and `color` are re-exposed as accessors over uOpacity/uColor, so
+   * every existing caller — and tests/vfx_test.mjs — keeps reading and writing
+   * them exactly as it did on the MeshBasicMaterial this replaces.
+   */
+  _fireballMaterial(color, seed, soot = 0) {
+    const uniforms = {
+      uTime: { value: 0 },
+      uAge: { value: 0 },
+      uSeed: { value: seed },
+      uSoot: { value: soot },
+      uOpacity: { value: 0 },
+      uColor: { value: new THREE.Color(color) },
+    };
+
+    const mat = new THREE.ShaderMaterial({
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.NormalBlending,
+      uniforms,
+      vertexShader: /* glsl */`
+        uniform float uTime;
+        uniform float uAge;
+        uniform float uSeed;
+        varying vec3 vNormal;
+        varying vec3 vViewDir;
+        varying vec3 vLocalPos;
+        varying float vNoise;
+
+        float hash31(vec3 p) {
+          p = fract(p * 0.1031);
+          p += dot(p, p.yzx + 33.33);
+          return fract((p.x + p.y) * p.z);
+        }
+
+        // Trilinear value noise: cheap, smooth, and enough for two octaves of
+        // gas turbulence.
+        float noise3(vec3 p) {
+          vec3 i = floor(p);
+          vec3 f = fract(p);
+          f = f * f * (3.0 - 2.0 * f);
+          float n000 = hash31(i);
+          float n100 = hash31(i + vec3(1.0, 0.0, 0.0));
+          float n010 = hash31(i + vec3(0.0, 1.0, 0.0));
+          float n110 = hash31(i + vec3(1.0, 1.0, 0.0));
+          float n001 = hash31(i + vec3(0.0, 0.0, 1.0));
+          float n101 = hash31(i + vec3(1.0, 0.0, 1.0));
+          float n011 = hash31(i + vec3(0.0, 1.0, 1.0));
+          float n111 = hash31(i + vec3(1.0, 1.0, 1.0));
+          float nx00 = mix(n000, n100, f.x);
+          float nx10 = mix(n010, n110, f.x);
+          float nx01 = mix(n001, n101, f.x);
+          float nx11 = mix(n011, n111, f.x);
+          return mix(mix(nx00, nx10, f.y), mix(nx01, nx11, f.y), f.z);
+        }
+
+        // Radial billow: how far the shell bulges in a given direction. Deliberately
+        // low frequency and smooth — the mesh only has ~36 segments, so the fine
+        // cauliflower detail is carried by the per-pixel erosion in the fragment
+        // stage instead. High-frequency displacement here would alias into
+        // per-vertex normal noise and make the shell look like cut glass.
+        float billow(vec3 dir) {
+          float n1 = noise3(dir * 2.2 + vec3(uSeed, -uTime * 0.45, uSeed * 0.7));
+          float n2 = noise3(dir * 4.2 + vec3(uTime * 0.28, -uTime * 0.62, uSeed * 1.7));
+          float n = n1 * 0.72 + n2 * 0.28;
+          // The shell churns harder as it cools and drags soot, but stays
+          // anchored to its radius so the pooled mesh scale still means
+          // "fireball radius".
+          float amp = 0.28 + 0.30 * clamp(uAge, 0.0, 1.0);
+          return (n - 0.5) * amp * 2.0;
+        }
+
+        void main() {
+          vec3 dir = normalize(position);
+          // Tangent frame for a finite-difference normal of the displaced shell.
+          // mix/step instead of a ternary keeps this branchless on WebGL1.
+          vec3 up = mix(vec3(0.0, 1.0, 0.0), vec3(0.0, 0.0, 1.0), step(0.985, abs(dir.y)));
+          vec3 t1 = normalize(cross(up, dir));
+          vec3 t2 = cross(dir, t1);
+
+          float eps = 0.09;
+          vec3 d1 = normalize(dir + t1 * eps);
+          vec3 d2 = normalize(dir + t2 * eps);
+          float b0 = billow(dir);
+          float b1 = billow(d1);
+          float b2 = billow(d2);
+
+          vec3 p0 = dir * (1.0 + b0);
+          vec3 p1 = d1 * (1.0 + b1);
+          vec3 p2 = d2 * (1.0 + b2);
+          vec3 nrm = normalize(cross(p1 - p0, p2 - p0));
+
+          vec4 mv = modelViewMatrix * vec4(p0, 1.0);
+          vNormal = normalize(normalMatrix * nrm);
+          vViewDir = normalize(-mv.xyz);
+          vLocalPos = p0;
+          vNoise = b0;
+          gl_Position = projectionMatrix * mv;
+        }
+      `,
+      fragmentShader: /* glsl */`
+        precision highp float;
+        uniform float uTime;
+        uniform float uAge;
+        uniform float uSeed;
+        uniform float uSoot;
+        uniform float uOpacity;
+        uniform vec3 uColor;
+        varying vec3 vNormal;
+        varying vec3 vViewDir;
+        varying vec3 vLocalPos;
+        varying float vNoise;
+
+        float hash31(vec3 p) {
+          p = fract(p * 0.1031);
+          p += dot(p, p.yzx + 33.33);
+          return fract((p.x + p.y) * p.z);
+        }
+
+        float noise3(vec3 p) {
+          vec3 i = floor(p);
+          vec3 f = fract(p);
+          f = f * f * (3.0 - 2.0 * f);
+          float n000 = hash31(i);
+          float n100 = hash31(i + vec3(1.0, 0.0, 0.0));
+          float n010 = hash31(i + vec3(0.0, 1.0, 0.0));
+          float n110 = hash31(i + vec3(1.0, 1.0, 0.0));
+          float n001 = hash31(i + vec3(0.0, 0.0, 1.0));
+          float n101 = hash31(i + vec3(1.0, 0.0, 1.0));
+          float n011 = hash31(i + vec3(0.0, 1.0, 1.0));
+          float n111 = hash31(i + vec3(1.0, 1.0, 1.0));
+          float nx00 = mix(n000, n100, f.x);
+          float nx10 = mix(n010, n110, f.x);
+          float nx01 = mix(n001, n101, f.x);
+          float nx11 = mix(n011, n111, f.x);
+          return mix(mix(nx00, nx10, f.y), mix(nx01, nx11, f.y), f.z);
+        }
+
+        void main() {
+          vec3 N = normalize(vNormal);
+          vec3 V = normalize(vViewDir);
+          float rim = pow(1.0 - abs(dot(N, V)), 1.6);
+
+          // Two octaves of turbulence scrolled upward through the fireball: the
+          // noise field rises with the gas, so the pattern churns rather than
+          // sliding past.
+          vec3 q = vLocalPos * (4.2 + 2.6 * uAge);
+          q.y -= uTime * (1.1 + 1.3 * uAge);
+          float f1 = noise3(q + vec3(uSeed * 1.3));
+          float f2 = noise3(q * 2.3 + vec3(-uTime * 1.7, uSeed * 2.1, uTime * 1.0));
+          // Value noise clusters around 0.5, so stretch it back to a full 0..1
+          // range and give it contrast: that is what turns a gentle cloud into
+          // distinct billows with deep crevices between them.
+          float f = smoothstep(0.30, 0.72, f1 * 0.70 + f2 * 0.30);
+
+          // Temperature. "hot" is the global cooling curve (white-hot at birth,
+          // cold soot at the end of the fireball's life); "crev" is the sharpened
+          // crevice network between the billows, which stays incandescent long
+          // after the exposed shells crust over. The base term is deliberately
+          // high so a young fireball is roaring orange everywhere, with white
+          // heat only in the cracks; the top of the mass runs cooler than the
+          // ground-hugging base, where the fuel is densest.
+          float heat = clamp(1.0 - f, 0.0, 1.0);
+          float crev = smoothstep(0.40, 0.86, heat);
+          float age = clamp(uAge + uSoot * 0.35, 0.0, 1.0);
+          float hot = 1.0 - smoothstep(0.10, 1.05, age);
+          float temp = hot * (0.55 + 0.45 * crev)
+            + vLocalPos.y * 0.16
+            - rim * 0.22
+            - vNoise * 1.2;
+          // Detonation flash: the first ~0.25 of the life is white-heat.
+          temp += (1.0 - smoothstep(0.0, 0.25, age)) * 0.30 * (0.5 + 0.5 * crev);
+          temp = clamp(temp, 0.0, 1.0);
+
+          vec3 sootCol = vec3(0.06, 0.055, 0.05);
+          vec3 crimson = vec3(0.42, 0.08, 0.02);
+          vec3 orange = vec3(1.25, 0.42, 0.06);
+          vec3 whiteHot = vec3(1.85, 1.35, 0.55);
+
+          vec3 col = sootCol;
+          col = mix(col, crimson, smoothstep(0.05, 0.26, temp));
+          col = mix(col, orange, smoothstep(0.24, 0.52, temp));
+          col = mix(col, whiteHot, smoothstep(0.66, 0.92, temp));
+
+          // Hot crevices glow brighter than the billow faces; the fresnel rim
+          // glows while the shell is young, then thickens into a soot crust.
+          col *= 1.0 + crev * 0.25;
+          col += orange * rim * 0.40 * hot;
+          float crust = smoothstep(0.30, 1.0, age) * (0.40 + 0.60 * rim);
+          col = mix(col, sootCol * (0.85 + 0.5 * f), crust * 0.8);
+
+          // Per-lobe palette: the fiery lobes warm their flames, the dark lobe
+          // pulls its cooling crust toward soot so it ties into the rising plume.
+          col = mix(col, col * (0.5 + 1.25 * uColor), 0.30 * (1.0 - temp));
+
+          // Eroded, turbulent edge: no hard sphere outline anywhere. The base
+          // erosion term is cut further by the turbulence at the silhouette, so
+          // the boundary is a torn, noisy skin instead of a polygonal arc.
+          float edge = smoothstep(0.15, 0.72, (1.0 - rim * 0.55) * (0.55 + 0.65 * f));
+          edge *= smoothstep(0.30, 0.62, f + (1.0 - rim) * 0.30);
+          // Burning gas is densely opaque. A soft rim gradient would leave a
+          // pale annulus around a dense middle — i.e. a glass bubble with a
+          // shell — so the body is thresholded into a solid mass whose boundary
+          // is the noise contour, then it thins into a wispy veil as it cools.
+          float density = mix(1.95, 0.75, smoothstep(0.15, 1.0, age));
+          float solid = smoothstep(0.26, 0.50, edge * density);
+          // Where the gas thins, darken it toward soot instead of opening a
+          // window onto the sky: real holes in a fireball are smoke, and a
+          // see-through gap is what makes a shell read as glass.
+          float thin = 1.0 - smoothstep(0.26, 0.50, edge * density);
+          col = mix(col, vec3(0.16, 0.10, 0.07) * (0.7 + 0.5 * f), thin * 0.55);
+          float a = solid * uOpacity;
+          if (a < 0.004) discard;
+
+          gl_FragColor = vec4(col, a);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+    });
+
+    // Backwards compatibility: the pools (and the tests) treat this material
+    // exactly like the MeshBasicMaterial it replaced.
+    Object.defineProperty(mat, 'opacity', {
+      configurable: true,
+      enumerable: true,
+      get() { return uniforms.uOpacity.value; },
+      set(v) { uniforms.uOpacity.value = v; },
+    });
+    Object.defineProperty(mat, 'color', {
+      configurable: true,
+      enumerable: true,
+      get() { return uniforms.uColor.value; },
+      set(v) {
+        if (v && typeof v === 'object' && typeof v.r === 'number') {
+          uniforms.uColor.value.copy(v);
+        } else {
+          uniforms.uColor.value.set(v);
+        }
+      },
+    });
+
+    return mat;
+  }
+
   _buildExplosions() {
     for (let i = 0; i < MAX_EXPLOSIONS; i++) {
       const coreMat = new THREE.MeshBasicMaterial({
@@ -509,14 +956,9 @@ export class CombatVFX {
       this.group.add(ring);
 
       // Opaque-ish orange-red shell. Additive fire vanishes against a bright
-      // sky; this one is normal-blended so the blast reads in daylight too.
-      const fireballMat = new THREE.MeshBasicMaterial({
-        color: 0xff5a18,
-        transparent: true,
-        opacity: 0,
-        depthWrite: false,
-        blending: THREE.NormalBlending,
-      });
+      // sky; this one is normal-blended so the blast reads in daylight too, and
+      // it shades as turbulent incandescent gas rather than a flat orange ball.
+      const fireballMat = this._fireballMaterial(0xff5a18, 1.7 + i * 1.13, 0);
       const fireball = new THREE.Mesh(this._coreGeo, fireballMat);
       fireball.frustumCulled = false;
       fireball.visible = false;
@@ -529,13 +971,13 @@ export class CombatVFX {
       // column; the rest are fiery orange shades.
       const lobes = [];
       for (let L = 0; L < LOBE_COUNT; L++) {
-        const lobeMat = new THREE.MeshBasicMaterial({
-          color: LOBE_COLORS[L],
-          transparent: true,
-          opacity: 0,
-          depthWrite: false,
-          blending: THREE.NormalBlending,
-        });
+        // Index LOBE_COUNT - 1 is the soot lobe: uSoot fast-forwards its cooling
+        // curve so it crusts over into charcoal while the others still roar.
+        const lobeMat = this._fireballMaterial(
+          LOBE_COLORS[L],
+          4.3 + i * 2.07 + L * 1.71,
+          L === LOBE_COUNT - 1 ? 1 : 0,
+        );
         const lobe = new THREE.Mesh(this._coreGeo, lobeMat);
         lobe.frustumCulled = false;
         lobe.visible = false;
@@ -609,6 +1051,10 @@ export class CombatVFX {
       floorY: new Float32Array(DEBRIS_CAPACITY),
       active: new Uint8Array(DEBRIS_CAPACITY),
       bounced: new Uint8Array(DEBRIS_CAPACITY),
+      // Ember trail state: `smoking` flags the fastest chunks of a burst as
+      // burning shards, `trailTimer` counts down to their next smoke puff.
+      smoking: new Uint8Array(DEBRIS_CAPACITY),
+      trailTimer: new Float32Array(DEBRIS_CAPACITY),
     };
   }
 
@@ -679,11 +1125,18 @@ export class CombatVFX {
     // Feature 25: give the lobe cluster its own churn phase and start every
     // lobe at the blast centre (update() then throws them outward).
     slot.lobeSeed = this.rng() * TAU;
+    // Fresh noise seed (and restart the cooling clock) per detonation, so no
+    // two fireballs churn identically out of the shared material pool.
+    slot.fireballMat.uniforms.uSeed.value = slot.lobeSeed * 2.3;
+    slot.fireballMat.uniforms.uAge.value = 0;
+    slot.fireballMat.opacity = 0;
     for (let L = 0; L < slot.lobes.length; L++) {
       const lobe = slot.lobes[L];
       lobe.visible = true;
       lobe.position.copy(slot.pos);
       lobe.scale.setScalar(0.001);
+      lobe.material.uniforms.uSeed.value = slot.lobeSeed * 3.7 + L * 1.9;
+      lobe.material.uniforms.uAge.value = 0;
       lobe.material.opacity = 0;
     }
 
@@ -724,6 +1177,9 @@ export class CombatVFX {
         this._emitExplosionSmoke(slot, true, i >= INITIAL_SMOKE_PUFFS - HOT_SMOKE_PUFFS);
       }
     }
+
+    // White-hot multi-core ground fireball plus a thick charcoal soot collar.
+    this._emitBlastCorePuffs(slot);
 
     // Feature 25: pulse the shared blast light and throw the debris field.
     this._fireBlastFlash(slot.pos, s);
@@ -775,6 +1231,53 @@ export class CombatVFX {
     );
 
     return 2;
+  }
+
+  // Incandescent multi-core ground fireball: three to five white-hot blobs at
+  // the blast centre (bright enough for the tonemapper to bloom them) buried in
+  // a wide, slowly expanding charcoal-brown soot cloud, so the detonation has a
+  // molten heart wrapped in rolling black smoke instead of one flat orange dome.
+  _emitBlastCorePuffs(e) {
+    const s = clamp(e.scale, 0.4, 6);
+    const cores = e.mega ? 5 : 4;
+    for (let i = 0; i < cores; i++) {
+      const ang = (i / cores) * TAU + e.lobeSeed;
+      const rad = (0.22 + this.rng() * 0.42) * s;
+      const k = 0.9 + this.rng() * 0.1; // warm yellow-white, HDR-bright
+      this.puffs.spawn(
+        e.pos.x + Math.cos(ang) * rad,
+        e.pos.y + (0.3 + this.rng() * 0.45) * s,
+        e.pos.z + Math.sin(ang) * rad,
+        Math.cos(ang) * (1.0 + this.rng() * 2.4) * s,
+        (7 + this.rng() * 6) * s,
+        Math.sin(ang) * (1.0 + this.rng() * 2.4) * s,
+        0.55 + this.rng() * 0.5,
+        (1.8 + this.rng() * 1.6) * s,
+        1.0 * k, 0.86 * k, 0.42 * k,
+        0.92, 3.8, 0.55, 2.4,
+      );
+    }
+
+    // Thick soot collar: dark, brown-black, wide and slow, expanding as it
+    // climbs so the fire sits inside a turbulent charcoal cloud.
+    const soot = e.mega ? 9 : 6;
+    for (let i = 0; i < soot; i++) {
+      const ang = this.rng() * TAU;
+      const rad = (0.5 + this.rng() * 1.6) * s;
+      const shade = 0.085 + this.rng() * 0.05;
+      this.puffs.spawn(
+        e.pos.x + Math.cos(ang) * rad,
+        e.pos.y + (0.4 + this.rng() * 1.4) * s,
+        e.pos.z + Math.sin(ang) * rad,
+        Math.cos(ang) * (1.6 + this.rng() * 3.2) * s,
+        (3.2 + this.rng() * 4.0) * s,
+        Math.sin(ang) * (1.6 + this.rng() * 3.2) * s,
+        2.6 + this.rng() * 2.4,
+        (2.6 + this.rng() * 2.6) * s,
+        shade, shade * 0.93, shade * 0.82,
+        0.66, 2.6, 0.7, 2.3,
+      );
+    }
   }
 
   spawnSmokePlume(pos, duration = 60) {
@@ -914,6 +1417,7 @@ export class CombatVFX {
 
     // --- high-G wingtip vapor ribbons ------------------------------------
     let vaporTarget = 0;
+    let lerxTarget = 0;
     if (flight) {
       const g = Number.isFinite(flight.gForce) ? Math.abs(flight.gForce) : 1;
       const aoa = Number.isFinite(flight.aoa) ? Math.abs(flight.aoa) : 0;
@@ -923,14 +1427,22 @@ export class CombatVFX {
           0, 1,
         )
         : 0.15;
-      const condition = !flight.onGround
-        && speed > 90
-        && (Math.abs(g) > 3.4 || Math.abs(aoa) > 0.17);
+      const airborne = !flight.onGround && speed > 90;
+      const condition = airborne && (g > 3.4 || aoa > 0.17);
       if (condition) {
-        const gPull = smoothstep(3.4, 6.0, Math.abs(g));
-        const aoaPull = smoothstep(0.17, 0.30, Math.abs(aoa));
+        const gPull = smoothstep(3.4, 6.0, g);
+        const aoaPull = smoothstep(0.17, 0.30, aoa);
         const severity = Math.max(gPull, aoaPull);
         vaporTarget = clamp((0.55 + 0.45 * severity) * (0.82 + humid * 0.35), 0, 1);
+      }
+      // LERX/strake vortices: the strake pair only condenses hard once the jet
+      // is genuinely loaded — above 10 deg AoA or 3.5G.
+      if (airborne && (aoa > 0.1745 || g > 3.5)) {
+        const aoaPull = smoothstep(0.1745, 0.32, aoa);
+        const gPull = smoothstep(3.5, 7.0, g);
+        lerxTarget = clamp(
+          (0.5 + 0.5 * Math.max(aoaPull, gPull)) * (0.86 + humid * 0.28), 0, 1,
+        );
       }
     }
     const vaporRate = vaporTarget > this.vaporIntensity ? 6.0 : 2.4;
@@ -938,8 +1450,21 @@ export class CombatVFX {
       * (1 - Math.exp(-vaporRate * dt));
     if (this.vaporIntensity < 0.002 && vaporTarget === 0) this.vaporIntensity = 0;
 
+    const lerxRate = lerxTarget > this.lerxIntensity ? 5.0 : 2.2;
+    this.lerxIntensity += (lerxTarget - this.lerxIntensity)
+      * (1 - Math.exp(-lerxRate * dt));
+    if (this.lerxIntensity < 0.002 && lerxTarget === 0) this.lerxIntensity = 0;
+
+    // One shared clock for every ribbon shader, so the turbulence churns.
+    this.vaporTime += dt;
+    const night = weather && Number.isFinite(weather.night) ? clamp(weather.night, 0, 1) : 0;
     for (let w = 0; w < this.ribbons.length; w++) {
-      this._updateRibbon(this.ribbons[w], this.vaporIntensity, flight, camera);
+      const ribbon = this.ribbons[w];
+      const level = ribbon.kind === 'lerx' ? this.lerxIntensity : this.vaporIntensity;
+      ribbon.mat.uniforms.uTime.value = this.vaporTime;
+      ribbon.mat.uniforms.uTurb.value = level;
+      ribbon.mat.uniforms.uNight.value = night;
+      this._updateRibbon(ribbon, level, flight, camera, dt, windX, windZ);
     }
 
     // --- muzzle flash -----------------------------------------------------
@@ -958,6 +1483,10 @@ export class CombatVFX {
       this.muzzle.mat.opacity = 0;
     }
 
+    // Shared clock for every fireball/lobe shader, advanced once per frame so the
+    // gas churns continuously instead of restarting with each detonation.
+    this.explosionTime += dt;
+
     // --- explosions -------------------------------------------------------
     let activeExplosions = 0;
     for (let i = 0; i < this.explosions.length; i++) {
@@ -967,24 +1496,32 @@ export class CombatVFX {
       e.t += dt;
       const t = e.t;
 
-      // Incandescent core: additive white-yellow, expands to ~11x scale.
-      // Mega-blasts keep it burning for 2.8 s instead of 1.8 s.
+      // Incandescent core: additive white-yellow flash. It grows to ~9x scale and
+      // is deliberately kept *inside* the fireball shell (which blooms to 11x),
+      // so the white heat reads as the heart of the fire rather than a milky
+      // dome swallowing it. Mega-blasts keep it burning for 2.8 s instead of 1.8 s.
       const coreT = t / (e.coreTime || CORE_TIME);
       if (coreT < 1) {
         const ease = 1 - (1 - coreT) * (1 - coreT);
         e.core.visible = true;
         e.core.position.copy(e.pos);
-        const cs = e.scale * (0.9 + 10.1 * ease);
+        const cs = e.scale * (0.9 + 8.0 * ease);
         e.core.scale.set(cs, cs, cs);
-        e.coreMat.opacity = 0.95 * Math.pow(1 - coreT, 1.55);
+        // The core is a *flash*, not a second fireball: it burns white-hot for
+        // the first few tenths of a second and then drops to a whisper, so it
+        // cannot show through the fireball's eroded gaps as a pale sphere.
+        e.coreMat.opacity = 0.85 * Math.pow(1 - coreT, 4.2);
       } else {
         e.core.visible = false;
         e.coreMat.opacity = 0;
       }
 
       // Normal-blended orange-red fireball shell, slightly slower to bloom and
-      // the part that stays readable against a bright daytime sky.
+      // the part that stays readable against a bright daytime sky. The shader's
+      // uAge drives the temperature ramp (white-hot -> orange -> crimson soot).
       const fbT = t / (e.fireballTime || FIREBALL_TIME);
+      e.fireballMat.uniforms.uTime.value = this.explosionTime;
+      e.fireballMat.uniforms.uAge.value = clamp(fbT, 0, 1);
       if (fbT < 1) {
         const ease = 1 - Math.pow(1 - fbT, 1.7);
         const rise = fbT < 0.12 ? fbT / 0.12 : 1;
@@ -992,7 +1529,12 @@ export class CombatVFX {
         e.fireball.position.set(e.pos.x, e.pos.y + (e.mega ? 0.32 : 0.08) * e.scale * ease, e.pos.z);
         const fs = e.scale * (0.7 + 10.3 * ease);
         e.fireball.scale.set(fs, fs, fs);
-        e.fireballMat.opacity = 0.92 * rise * Math.pow(1 - fbT, 1.25);
+        // The shader runs its own cooling fade (temperature ramp + thinning
+        // density), so the pool only has to keep the burning mass fully solid —
+        // any alpha below 1 here reads as a see-through bubble — and then let it
+        // collapse into smoke over the last 40% of the fireball's life.
+        const burnT = fbT < 0.6 ? 1 : (1 - fbT) / 0.4;
+        e.fireballMat.opacity = rise * Math.pow(burnT, 1.3);
       } else {
         e.fireball.visible = false;
         e.fireballMat.opacity = 0;
@@ -1005,6 +1547,8 @@ export class CombatVFX {
       for (let L = 0; L < e.lobes.length; L++) {
         const lobe = e.lobes[L];
         const lt = t / (lobeSpan * (0.9 + 0.06 * L));
+        lobe.material.uniforms.uTime.value = this.explosionTime;
+        lobe.material.uniforms.uAge.value = clamp(lt, 0, 1);
         if (lt < 1) {
           const ease = 1 - Math.pow(1 - lt, 1.6);
           const ang = LOBE_ANGLE[L] + e.lobeSeed + lt * LOBE_SPIN[L];
@@ -1022,7 +1566,7 @@ export class CombatVFX {
           );
           lobe.rotation.set(ang * 0.6, ang, ang * 0.35);
           lobe.scale.set(ls, ls * (0.84 + 0.16 * Math.sin(ang * 1.7)), ls);
-          lobe.material.opacity = 0.6 * fadeIn * Math.pow(1 - lt, 1.15);
+          lobe.material.opacity = 0.78 * fadeIn * Math.pow(1 - lt, 0.85);
         } else {
           lobe.visible = false;
           lobe.material.opacity = 0;
@@ -1088,6 +1632,9 @@ export class CombatVFX {
     } else if (this._blastLight.intensity !== 0) {
       this._blastLight.intensity = 0;
     }
+    // A dark light still costs a full light evaluation in every lit shader:
+    // hide it instead of leaving it in the loop at intensity 0.
+    this._blastLight.visible = this._blastLight.intensity > 0;
 
     // --- Feature 25: tumbling 3D debris -----------------------------------
     const d = this.debris;
@@ -1134,6 +1681,26 @@ export class CombatVFX {
         }
       }
 
+      // Burning shards drag a dark, arcing smoke streamer behind them: while the
+      // chunk is young and still fast, it peels off a compact soot puff (ember
+      // tinted for the first 0.4 s) every ~45 ms at its exact position, so the
+      // trail curves with the ballistic arc instead of following the chunk.
+      if (d.smoking[i] && life > d.maxLife[i] - DEBRIS_SMOKE_AGE) {
+        const fast = Math.abs(d.vy[i]) > DEBRIS_SMOKE_SPEED
+          || d.vx[i] * d.vx[i] + d.vz[i] * d.vz[i]
+            > DEBRIS_SMOKE_SPEED * DEBRIS_SMOKE_SPEED;
+        if (fast) {
+          d.trailTimer[i] -= dt;
+          let guard = 0;
+          while (d.trailTimer[i] <= 0 && guard < 3) {
+            this._emitDebrisSmoke(d, i, d.maxLife[i] - life);
+            d.trailTimer[i] += DEBRIS_SMOKE_PERIOD;
+            guard++;
+          }
+          if (d.trailTimer[i] <= 0) d.trailTimer[i] = DEBRIS_SMOKE_PERIOD;
+        }
+      }
+
       // Fade the chunk out by shrinking it over its last ~35% of life.
       const fade = clamp(life / (d.maxLife[i] * 0.35), 0, 1);
       _dPos.set(d.px[i], d.py[i], d.pz[i]);
@@ -1145,7 +1712,12 @@ export class CombatVFX {
       activeDebris++;
     }
     d.mesh.count = instances;
-    if (instances > 0 || d.rendered > 0) d.mesh.instanceMatrix.needsUpdate = true;
+    if (instances > 0) {
+      // Upload only the live instances (16 floats per matrix), not the pool.
+      d.mesh.instanceMatrix.clearUpdateRanges();
+      d.mesh.instanceMatrix.addUpdateRange(0, instances * 16);
+      d.mesh.instanceMatrix.needsUpdate = true;
+    }
     d.rendered = instances;
     d.activeDebris = activeDebris;
     this.activeDebris = activeDebris;
@@ -1195,11 +1767,20 @@ export class CombatVFX {
 
   reset() {
     this.vaporIntensity = 0;
+    this.lerxIntensity = 0;
+    this.vaporTime = 0;
     for (let i = 0; i < this.ribbons.length; i++) {
       const r = this.ribbons[i];
       r.filled = 0;
       r.hist.fill(0);
+      r.ages.fill(0);
+      r.widths.fill(0);
+      r.mat.uniforms.uTime.value = 0;
+      r.mat.uniforms.uTurb.value = 0;
+      r.mat.uniforms.uNight.value = 0;
       r.geo.setDrawRange(0, 0);
+      r.posAttr.clearUpdateRanges();
+      r.alphaAttr.clearUpdateRanges();
       r.mesh.visible = false;
     }
 
@@ -1227,13 +1808,16 @@ export class CombatVFX {
       e.coreMat.opacity = 0;
       e.ringMat.opacity = 0;
       e.fireballMat.opacity = 0;
+      e.fireballMat.uniforms.uAge.value = 0;
       e.lobeSeed = 0;
       for (let L = 0; L < e.lobes.length; L++) {
         e.lobes[L].visible = false;
         e.lobes[L].material.opacity = 0;
+        e.lobes[L].material.uniforms.uAge.value = 0;
       }
     }
     this._explosionCursor = 0;
+    this.explosionTime = 0;
 
     for (let i = 0; i < this.plumes.length; i++) {
       this.plumes[i].active = false;
@@ -1253,15 +1837,19 @@ export class CombatVFX {
     this._blastPeak = 0;
     this._blastPhase = 0;
     this._blastLight.intensity = 0;
+    this._blastLight.visible = false;
     const d = this.debris;
     d.active.fill(0);
     d.bounced.fill(0);
+    d.smoking.fill(0);
+    d.trailTimer.fill(0);
     d.life.fill(0);
     d.maxLife.fill(0);
     d.cursor = 0;
     d.rendered = 0;
     d.activeDebris = 0;
     d.mesh.count = 0;
+    d.mesh.instanceMatrix.clearUpdateRanges();
     d.mesh.instanceMatrix.needsUpdate = true;
     this.activeDebris = 0;
 
@@ -1286,7 +1874,10 @@ export class CombatVFX {
     return 0;
   }
 
-  _updateRibbon(ribbon, level, flight, camera) {
+  // One condensation vortex trail: advect the captured nodes, resample them onto
+  // the dense render mesh with a Catmull-Rom spline, then billboard every
+  // segment against the camera so the ribbon never turns edge-on.
+  _updateRibbon(ribbon, level, flight, camera, dt, windX, windZ) {
     if (level <= 0.004 || !hasPose(flight)) {
       ribbon.mesh.visible = false;
       ribbon.filled = 0;
@@ -1294,30 +1885,132 @@ export class CombatVFX {
     }
 
     _head.copy(ribbon.local).applyQuaternion(flight.quaternion).add(flight.position);
+    _right.set(1, 0, 0).applyQuaternion(flight.quaternion);
+    _up.set(0, 1, 0).applyQuaternion(flight.quaternion);
+
     const hist = ribbon.hist;
-    if (ribbon.filled < RIBBON_SEGMENTS) {
+    const ages = ribbon.ages;
+
+    // 1. Advect the trail that already exists: ambient wind, the wingtip's own
+    //    downwash and a counter-rotating helical swirl plus multi-frequency curl
+    //    turbulence, all growing with node age (age^1.3).
+    if (dt > 0) {
+      const spin = ribbon.side;
+      const seed = ribbon.seed;
+      const load = 0.35 + 0.65 * level;
+      const filledNow = ribbon.filled;
+      for (let i = 0; i < filledNow; i++) {
+        const age = ages[i] + dt;
+        ages[i] = age;
+        const grown = Math.pow(age, 1.3);
+        const p = i * 3;
+
+        let dx = windX * dt;
+        let dy = -0.65 * dt * level; // gentle wingtip downwash
+        let dz = windZ * dt;
+
+        // Helical vortex: tangential velocity in the local X/Y plane. The left
+        // tip (side -1) turns the opposite way to the right tip (side +1). The
+        // angular rate is deliberately low (a little over a quarter turn over
+        // the trail's life) so the helix reads as a corkscrew rather than a
+        // high-frequency writhing wobble.
+        const sw = age * 4.2 * spin + seed;
+        const swirl = 8.5 * grown * load;
+        const cs = Math.cos(sw);
+        const sn = Math.sin(sw);
+        dx += (_right.x * cs + _up.x * sn) * swirl * dt;
+        dy += (_right.y * cs + _up.y * sn) * swirl * dt;
+        dz += (_right.z * cs + _up.z * sn) * swirl * dt;
+
+        // Two octaves of smooth curl: strongest at the tail, where the vortex
+        // has had time to break down into wandering turbulent air.
+        const curl = (0.35 + 1.80 * (grown < 1 ? grown : 1)) * load;
+        const t1 = age * 3.1 + seed;
+        const t2 = age * 7.4 + seed * 2.1;
+        dx += (Math.sin(t1) + 0.5 * Math.sin(t2 * 1.7)) * curl * dt;
+        dy += (Math.cos(t1 * 1.3) + 0.5 * Math.cos(t2)) * curl * dt;
+        dz += (Math.sin(t2) + 0.5 * Math.cos(t1 * 0.8)) * curl * dt;
+
+        hist[p] += dx;
+        hist[p + 1] += dy;
+        hist[p + 2] += dz;
+      }
+    }
+
+    // 2. Shift one node aft and pin node 0 exactly on the emitter: the vapour is
+    //    born at the wingtip, so the head must never jitter.
+    if (ribbon.filled < RIBBON_HISTORY) {
       hist.copyWithin(3, 0, ribbon.filled * 3);
+      ages.copyWithin(1, 0, ribbon.filled);
       ribbon.filled++;
     } else {
-      hist.copyWithin(3, 0, (RIBBON_SEGMENTS - 1) * 3);
+      hist.copyWithin(3, 0, (RIBBON_HISTORY - 1) * 3);
+      ages.copyWithin(1, 0, RIBBON_HISTORY - 1);
     }
     hist[0] = _head.x;
     hist[1] = _head.y;
     hist[2] = _head.z;
+    ages[0] = 0;
 
     const filled = ribbon.filled;
-    _right.set(1, 0, 0).applyQuaternion(flight.quaternion);
-    const cam = camera && camera.position ? camera.position : null;
+    if (filled < 2) {
+      ribbon.geo.setDrawRange(0, 0);
+      ribbon.mesh.visible = false;
+      return;
+    }
 
+    // 3. Resample the captured nodes onto RIBBON_SEGMENTS render segments. The
+    //    drawn span grows with the trail so a young trail stays short instead of
+    //    being stretched across the whole mesh.
     const positions = ribbon.positions;
     const alphas = ribbon.alphas;
-    for (let i = 0; i < filled; i++) {
-      const i0 = Math.max(0, i - 1) * 3;
-      const i1 = Math.min(filled - 1, i + 1) * 3;
-      _tan.set(hist[i0] - hist[i1], hist[i0 + 1] - hist[i1 + 1], hist[i0 + 2] - hist[i1 + 2]);
+    const widths = ribbon.widths;
+    const cam = camera && camera.position ? camera.position : null;
+    const last = filled - 1;
+    const drawSegs = Math.max(
+      1,
+      Math.round((RIBBON_SEGMENTS - 1) * (last / (RIBBON_HISTORY - 1))),
+    );
 
+    for (let s = 0; s <= drawSegs; s++) {
+      const t = (s / drawSegs) * last;
+      const i0 = Math.min(last, Math.floor(t));
+      const i1 = Math.min(last, i0 + 1);
+      const f = t - i0;
+      const iA = i0 > 0 ? i0 - 1 : i0;
+      const iB = i1 < last ? i1 + 1 : i1;
+      const a0 = iA * 3;
+      const a1 = i0 * 3;
+      const a2 = i1 * 3;
+      const a3 = iB * 3;
+
+      const f2 = f * f;
+      const f3 = f2 * f;
+      // Uniform Catmull-Rom: the captured nodes are one simulated frame apart.
+      const k0 = -0.5 * f3 + f2 - 0.5 * f;
+      const k1 = 1.5 * f3 - 2.5 * f2 + 1;
+      const k2 = -1.5 * f3 + 2 * f2 + 0.5 * f;
+      const k3 = 0.5 * f3 - 0.5 * f2;
+
+      const px = hist[a0] * k0 + hist[a1] * k1 + hist[a2] * k2 + hist[a3] * k3;
+      const py = hist[a0 + 1] * k0 + hist[a1 + 1] * k1 + hist[a2 + 1] * k2 + hist[a3 + 1] * k3;
+      const pz = hist[a0 + 2] * k0 + hist[a1 + 2] * k1 + hist[a2 + 2] * k2 + hist[a3 + 2] * k3;
+
+      // Analytic spline tangent, so the billboard frame follows the curve.
+      const d0 = -0.5 + 2 * f - 1.5 * f2;
+      const d1 = -5 * f + 4.5 * f2;
+      const d2 = 0.5 + 4 * f - 4.5 * f2;
+      const d3 = -f + 1.5 * f2;
+      _tan.set(
+        hist[a0] * d0 + hist[a1] * d1 + hist[a2] * d2 + hist[a3] * d3,
+        hist[a0 + 1] * d0 + hist[a1 + 1] * d1 + hist[a2 + 1] * d2 + hist[a3 + 1] * d3,
+        hist[a0 + 2] * d0 + hist[a1 + 2] * d1 + hist[a2 + 2] * d2 + hist[a3 + 2] * d3,
+      );
+
+      // Segment axis: perpendicular to both the view ray and the trail, so the
+      // ribbon presents its face from chase, cockpit, wing, orbit and flyby.
       if (cam) {
-        _toCam.set(cam.x - hist[i * 3], cam.y - hist[i * 3 + 1], cam.z - hist[i * 3 + 2]);
+        _toCam.set(cam.x - px, cam.y - py, cam.z - pz);
         _side.crossVectors(_tan, _toCam);
       } else {
         _side.copy(_right);
@@ -1325,25 +2018,39 @@ export class CombatVFX {
       if (_side.lengthSq() < 1e-9) _side.copy(_right);
       _side.normalize();
 
-      const u = filled > 1 ? i / (RIBBON_SEGMENTS - 1) : 0;
-      const width = 0.30 * (1 - u * 0.65) * (0.55 + 0.45 * level);
-      const p = i * 6;
-      positions[p] = hist[i * 3] + _side.x * width;
-      positions[p + 1] = hist[i * 3 + 1] + _side.y * width;
-      positions[p + 2] = hist[i * 3 + 2] + _side.z * width;
-      positions[p + 3] = hist[i * 3] - _side.x * width;
-      positions[p + 4] = hist[i * 3 + 1] - _side.y * width;
-      positions[p + 5] = hist[i * 3 + 2] - _side.z * width;
+      // Tight glassy core at the emitter, billowing plume at the tail.
+      const wNorm = s / drawSegs;
+      const spread = Math.pow(wNorm, 1.25);
+      const half = (RIBBON_W_TIP + (RIBBON_W_TAIL - RIBBON_W_TIP) * spread)
+        * (0.78 + 0.22 * level)
+        * ribbon.widthScale;
+      widths[s] = half;
 
-      const a = level * RIBBON_ALPHA * Math.pow(1 - u, 1.7);
-      alphas[i * 2] = a;
-      alphas[i * 2 + 1] = a;
+      const p = s * 6;
+      positions[p] = px + _side.x * half;
+      positions[p + 1] = py + _side.y * half;
+      positions[p + 2] = pz + _side.z * half;
+      positions[p + 3] = px - _side.x * half;
+      positions[p + 4] = py - _side.y * half;
+      positions[p + 5] = pz - _side.z * half;
+
+      // Alpha thins toward the tail but never snaps to zero exactly where the
+      // plume is widest: the shader's lacy noise finishes the dissipation.
+      const a = level * RIBBON_ALPHA * ribbon.alphaScale
+        * (0.10 + 0.90 * Math.pow(1 - wNorm, 1.15));
+      alphas[s * 2] = a;
+      alphas[s * 2 + 1] = a;
     }
 
-    ribbon.geo.setDrawRange(0, Math.max(0, (filled - 1) * 6));
+    const drawVerts = (drawSegs + 1) * 2;
+    ribbon.geo.setDrawRange(0, drawSegs * 6);
+    ribbon.posAttr.clearUpdateRanges();
+    ribbon.posAttr.addUpdateRange(0, drawVerts * 3);
     ribbon.posAttr.needsUpdate = true;
+    ribbon.alphaAttr.clearUpdateRanges();
+    ribbon.alphaAttr.addUpdateRange(0, drawVerts);
     ribbon.alphaAttr.needsUpdate = true;
-    ribbon.mesh.visible = filled > 1;
+    ribbon.mesh.visible = true;
   }
 
   _placeMuzzle(flight) {
@@ -1364,6 +2071,7 @@ export class CombatVFX {
     this._blastTimer = this._blastDuration;
     this._blastPhase = 0;
     light.intensity = this._blastPeak;
+    light.visible = light.intensity > 0;
   }
 
   // Ground plane for a chunk: real terrain when it lies below the blast,
@@ -1414,6 +2122,9 @@ export class CombatVFX {
 
       d.active[i] = 1;
       d.bounced[i] = 0;
+      // A recycled slot must never inherit the previous chunk's ember trail.
+      d.smoking[i] = 0;
+      d.trailTimer[i] = 0;
       d.px[i] = pos.x + Math.cos(ang) * 0.8 * scale;
       d.py[i] = pos.y + 0.4 * scale + this.rng() * scale;
       d.pz[i] = pos.z + Math.sin(ang) * 0.8 * scale;
@@ -1433,9 +2144,59 @@ export class CombatVFX {
       d.life[i] = life;
       d.maxLife[i] = life;
       d.floorY[i] = floorY;
+      _debrisBatch[launched] = i;
       launched++;
     }
+
+    // The fastest third of the burst is a burning wing/fuselage shard dragging
+    // an arcing soot streamer behind it (see the debris update loop).
+    this._markSmokingDebris(launched);
     return launched;
+  }
+
+  // Pick the fastest ~35% of a fresh burst and flag them as burning shards.
+  // A plain O(n^2) sweep over the preallocated scratch list: n is at most 44
+  // and it allocates nothing, which keeps the spawn path garbage-free.
+  _markSmokingDebris(count) {
+    const d = this.debris;
+    const want = Math.max(1, Math.round(count * DEBRIS_SMOKING_FRACTION));
+    for (let m = 0; m < want; m++) {
+      let best = -1;
+      let bestSpd = -1;
+      for (let k = 0; k < count; k++) {
+        const i = _debrisBatch[k];
+        if (d.smoking[i]) continue;
+        const spd = d.vx[i] * d.vx[i] + d.vy[i] * d.vy[i] + d.vz[i] * d.vz[i];
+        if (spd > bestSpd) {
+          bestSpd = spd;
+          best = i;
+        }
+      }
+      if (best < 0) break;
+      d.smoking[best] = 1;
+      // Stagger the first puff so the streamers do not pulse in lockstep.
+      d.trailTimer[best] = this.rng() * DEBRIS_SMOKE_PERIOD;
+    }
+  }
+
+  // One compact charcoal-brown puff peeling off a burning shard. Almost zero
+  // inherited velocity, so the trail hangs where the chunk has been instead of
+  // riding along with it; the first 0.4 s carry an ember tint.
+  _emitDebrisSmoke(d, i, age) {
+    const ember = age < 0.4 ? 1 - age / 0.4 : 0;
+    const shade = 0.075 + this.rng() * 0.045;
+    this.puffs.spawn(
+      d.px[i], d.py[i], d.pz[i],
+      d.vx[i] * 0.05 + (this.rng() - 0.5) * 0.6,
+      d.vy[i] * 0.04 + 0.4 + this.rng() * 0.6,
+      d.vz[i] * 0.05 + (this.rng() - 0.5) * 0.6,
+      0.55 + this.rng() * 0.55,
+      0.8 + this.rng() * 0.8 + ember * 0.5,
+      shade + 0.62 * ember,
+      shade * 0.95 + 0.24 * ember,
+      shade * 0.86 + 0.04 * ember,
+      0.78, 0.9 + 0.6 * ember, 0.85, 2.6,
+    );
   }
 
   // Feature 24: the BFFG detonation burst is a three-way mix — fiery
