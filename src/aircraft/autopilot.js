@@ -89,6 +89,16 @@ function orbitBankDeg(omega, tSpeed, speed) {
   return omega > 0 ? bank : -bank;
 }
 
+// Approach speed schedule: 78 m/s on-speed 2.5 km from the threshold, rising
+// linearly with distance to go (175 m/s at 10 km). A continuous schedule is
+// what lets the autothrottle fly the deceleration instead of the speedbrake;
+// a stepped target made the aircraft arrive over-speed at every step.
+const APPROACH_VREF_MS = 78;
+const APPROACH_SPEED_SLOPE = 0.0105; // m/s per metre of distance-to-go
+function approachSpeedSchedule(dist) {
+  return clamp(APPROACH_VREF_MS + (dist - 2500) * APPROACH_SPEED_SLOPE, APPROACH_VREF_MS, 175);
+}
+
 function runwayNumber(headingDeg) {
   let n = Math.round((((headingDeg % 360) + 360) % 360) / 10);
   if (n === 0) n = 36;
@@ -128,6 +138,12 @@ export class AutopilotSystem {
     this._side = 1;
     this._finalCaptured = false;
     this._patternComplete = false;
+    // Latched speedbrake state: the airbrake only ever opens on a genuine
+    // overspeed and stays stowed until the speed has truly decayed.
+    this._airbrake = false;
+    // Slow autothrottle integrator that learns the power needed to hold the
+    // approach speed schedule (the proportional law alone settles fast).
+    this._spdTrim = 0;
     // Slow autothrottle integrator for the live tanker (learns the drag trim).
     this._throttleTrim = 0;
   }
@@ -186,6 +202,8 @@ export class AutopilotSystem {
     this._airport = airport;
     this._airportCode = airport.code || airport.name || '';
     this._completeMsg = null;
+    this._airbrake = false;
+    this._spdTrim = 0;
     this._resetCommand();
     this._buildPlan(LAND_LEGS);
 
@@ -256,6 +274,7 @@ export class AutopilotSystem {
     this._runwayHeading = null;
     this._runwayLabel = '';
     this._throttleTrim = 0;
+    this._airbrake = false;
     this._completeMsg = null;
     this._resetCommand();
     this._buildPlan(REFUEL_LEGS);
@@ -288,6 +307,8 @@ export class AutopilotSystem {
   disengage() {
     this.mode = 'OFF';
     this.phase = '';
+    this._airbrake = false;
+    this._spdTrim = 0;
     this._resetCommand();
   }
 
@@ -295,6 +316,33 @@ export class AutopilotSystem {
     this._pitchCmd = 0;
     this._rollCmd = 0;
     this._yawCmd = 0;
+  }
+
+  /**
+   * Latched speedbrake: engage only on a genuine overspeed, release once the
+   * speed has decayed well back inside the schedule. The wide gap between
+   * `engageOver` and `releaseOver` is the hysteresis that stops the HUD BRK
+   * light and the tail paddles chattering on approach.
+   */
+  _updateAirbrake(speed, spdTarget, engageOver = 30, releaseOver = 10) {
+    if (this._airbrake) {
+      if (speed <= spdTarget + releaseOver) this._airbrake = false;
+    } else if (speed > spdTarget + engageOver) {
+      this._airbrake = true;
+    }
+    return this._airbrake;
+  }
+
+  /**
+   * Descent-aware approach autothrottle: proportional speed law on a low
+   * descent baseline plus a slow trim integrator. Without the trim the
+   * proportional law settles several m/s fast on a glideslope, and that
+   * permanent overspeed is what used to keep the speedbrake fighting the
+   * throttle through the whole approach.
+   */
+  _approachThrottle(spdTarget, speed, base, gain, lo = 0.02, hi = 0.92) {
+    this._spdTrim = clamp(this._spdTrim + (spdTarget - speed) * 0.00008, -0.30, 0.30);
+    return clamp(base + (spdTarget - speed) * gain + this._spdTrim, lo, hi);
   }
 
   /** Snapshot the aircraft state the autopilot is asked to hold. */
@@ -504,14 +552,14 @@ export class AutopilotSystem {
         this._setPhase('INTERCEPT');
       } else {
         const altTarget = Math.max(elev + 520, floorAlt + 260);
-        const spdTarget = toBase < 3000 ? 120 : 140;
+        const spdTarget = toBase < 3000 ? 130 : 155;
         const hdgTarget = norm360(Math.atan2(baseX - pos.x, -(baseZ - pos.z)) * DEG);
         const toGo = Math.max(900, toBase);
         const pathDeg = Math.atan2(altTarget - pos.y, toGo) * DEG;
         const pitchTarget = clamp(pathDeg + (flight.aoa || 0) * DEG, -14, 10);
         const bankTarget = clamp(headingError(hdgTarget, acHeading) * 2.0, -45, 45);
-        flight.targetThrottle = clamp(0.45 + (spdTarget - speed) * 0.025, 0.02, 0.92);
-        const brake = speed > spdTarget + 8;
+        flight.targetThrottle = this._approachThrottle(spdTarget, speed, 0.36, 0.025, 0.02, 0.92);
+        const brake = this._updateAirbrake(speed, spdTarget, 32, 10);
         flight.brake = brake;
         const out = this._flyAttitude(flight, cmd, pitchTarget, bankTarget,
           { pitchGain: 0.07, pitchDamp: 0.9, rollLimit: 0.85 });
@@ -542,15 +590,15 @@ export class AutopilotSystem {
       const aimX = thX + fx * carrotAlong;
       const aimZ = thZ + fz * carrotAlong;
       const altTarget = Math.max(elev + Math.max(310, Math.min(600, (-along) * AP_GS_TAN)), floorAlt);
-      const spdTarget = dist > 10000 ? 175 : 115;
+      const spdTarget = approachSpeedSchedule(dist);
       const latVel = this._lateralSpeed(flight, rx, rz, hdgErr);
       const hdgTarget = norm360(rwy + clamp(-lateral * 0.030 - latVel * 0.25, -40, 40));
       const toGo = Math.max(900, Math.hypot(aimX - pos.x, aimZ - pos.z));
       const pathDeg = clamp(Math.atan2(altTarget - pos.y, toGo) * DEG, -8, 8);
       const pitchTarget = clamp(pathDeg + (flight.aoa || 0) * DEG, -16, 11);
       const bankTarget = clamp(headingError(hdgTarget, acHeading) * 2.2, -40, 40);
-      flight.targetThrottle = clamp(0.45 + (spdTarget - speed) * 0.025, 0.02, 0.92);
-      const brake = speed > spdTarget + 14;
+      flight.targetThrottle = this._approachThrottle(spdTarget, speed, 0.36, 0.025, 0.02, 0.92);
+      const brake = this._updateAirbrake(speed, spdTarget, 28, 8);
       flight.brake = brake;
       const out = this._flyAttitude(flight, cmd, pitchTarget, bankTarget,
         { pitchGain: 0.07, pitchDamp: 0.9, rollLimit: 0.85 });
@@ -567,6 +615,7 @@ export class AutopilotSystem {
       flight.gearTarget = 1;
       flight.flapsIndex = 2;
       flight.targetThrottle = 0.03;
+      this._airbrake = false;
       flight.brake = false;
       const vs = flight.verticalSpeed || 0;
       // Flare attitude with sink-rate feedback so touchdown stays < 2.5 m/s.
@@ -597,16 +646,18 @@ export class AutopilotSystem {
 
     // Damped localizer: lateral position + lateral velocity (kills S-turns).
     const latVel = this._lateralSpeed(flight, rx, rz, hdgErr);
-    const hdgTarget = rwy + clamp(-lateral * 0.05 - latVel * 0.35, -26, 26);
+    const hdgTarget = rwy + clamp(-lateral * 0.07 - latVel * 0.25, -26, 26);
     const bankLimit = agl < 120 ? 10 : 25;
     const bankTarget = clamp(headingError(hdgTarget, acHeading) * 2.2, -bankLimit, bankLimit);
 
-    const spdTarget = dist > 10000 ? 175 : dist > 5200 ? 115 : 78;
+    const spdTarget = approachSpeedSchedule(dist);
     const pathDeg = Math.asin(clamp(vsTarget / Math.max(speed, 50), -1, 1)) * DEG;
     const pitchTarget = clamp(pathDeg + (flight.aoa || 0) * DEG, -16, 12);
 
-    flight.targetThrottle = clamp(0.45 + (spdTarget - speed) * 0.025, 0.02, 0.92);
-    const brake = speed > spdTarget + 12;
+    // Gear and flaps are already hanging out here, so the throttle owns the
+    // speed on the path; the speedbrake only wakes up on a real overspeed.
+    flight.targetThrottle = this._approachThrottle(spdTarget, speed, 0.30, 0.028, 0.04, 0.92);
+    const brake = this._updateAirbrake(speed, spdTarget, 26, 8);
     flight.brake = brake;
     const out = this._flyAttitude(flight, cmd, pitchTarget, bankTarget,
       { pitchGain: 0.075, pitchDamp: 0.9 });
@@ -723,7 +774,8 @@ export class AutopilotSystem {
     let vsTarget;
     let spdTarget;
     let throttleGain = 0.025;
-    let brakeMargin = 12;
+    let brakeEngageOver = 28;
+    let brakeReleaseOver = 8;
     let aimDist = hDist;
 
     // ------------------------------------------------ polar orbit join law
@@ -791,7 +843,7 @@ export class AutopilotSystem {
       const fpDeg = Math.asin(clamp(vsTarget / Math.max(speed, 50), -1, 1)) * DEG;
       const pitch = clamp(fpDeg + aoaDeg, -14, 12);
       flight.targetThrottle = this._refuelThrottle(hasOrbit, spdTarget, speed, throttleGain);
-      const brake = speed > spdTarget + 10;
+      const brake = this._updateAirbrake(speed, spdTarget, 28, 8);
       flight.brake = brake;
       const out = this._flyAttitude(flight, cmd, pitch, bankTarget,
         { pitchGain: 0.07, pitchDamp: 0.9, rollLimit: 0.9 });
@@ -833,7 +885,7 @@ export class AutopilotSystem {
       spdTarget = clamp(tSpeed + hDist * 0.035, tSpeed + 18, 265);
       const pitch = clamp(pathDeg + aoaDeg, -14, 11);
       flight.targetThrottle = this._refuelThrottle(hasOrbit, spdTarget, speed, throttleGain);
-      const brake = speed > spdTarget + brakeMargin;
+      const brake = this._updateAirbrake(speed, spdTarget, brakeEngageOver, brakeReleaseOver);
       flight.brake = brake;
       const out = this._flyAttitude(flight, cmd, pitch, bankTarget,
         { pitchGain: 0.07, pitchDamp: 0.9 });
@@ -868,7 +920,10 @@ export class AutopilotSystem {
       vsTarget = clamp((boomY - pos.y) * 0.45 - vs * 0.55, -8, 8);
       spdTarget = tSpeed + clamp(alongErr * 0.16, -14, 14);
       throttleGain = 0.028;
-      brakeMargin = 8;
+      // On the boom the throttle alone trims speed: the speedbrake stays shut
+      // unless the jet is genuinely 18 m/s fast (and then releases at +5).
+      brakeEngageOver = 18;
+      brakeReleaseOver = 5;
     }
 
     bankTarget = clamp(bankTarget, -36, 36);
@@ -881,7 +936,7 @@ export class AutopilotSystem {
     }
 
     flight.targetThrottle = this._refuelThrottle(hasOrbit, spdTarget, speed, throttleGain);
-    const brake = speed > spdTarget + brakeMargin;
+    const brake = this._updateAirbrake(speed, spdTarget, brakeEngageOver, brakeReleaseOver);
     flight.brake = brake;
     const out = this._flyAttitude(flight, cmd, pitch, bankTarget,
       { pitchGain: 0.07, pitchDamp: 0.9 });
