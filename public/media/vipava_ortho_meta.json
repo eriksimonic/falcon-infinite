@@ -1,0 +1,26 @@
+{
+  "hd": {
+    "url": "./media/vipava_ortho_hd.jpg",
+    "xMin": -25000,
+    "xMax": 15000,
+    "zMin": -15000,
+    "zMax": 15000,
+    "blendM": 1500
+  },
+  "regional": {
+    "url": "./media/vipava_ortho.jpg",
+    "xMin": -50000,
+    "xMax": 50000,
+    "zMin": -50000,
+    "zMax": 50000,
+    "blendM": 6000
+  },
+  "macro": {
+    "url": "./media/vipava_ortho_macro.jpg",
+    "xMin": -250000,
+    "xMax": 250000,
+    "zMin": -250000,
+    "zMax": 250000,
+    "blendM": 20000
+  }
+}

@@ -155,8 +155,9 @@ export class RoadTrafficSystem {
       const major = /motorway|trunk|primary|highway|express|arterial/i.test(kind)
         ? 2
         : width >= 13 ? 2 : width >= 9 ? 1 : 0;
+      const bridge = raw.b === 1 || raw.bridge === true;
 
-      prepared.push({ points, cum, total, width, kind, major });
+      prepared.push({ points, cum, total, width, kind, major, bridge });
     }
 
     prepared.sort((a, b) => (b.major - a.major) || (b.total - a.total));
@@ -168,9 +169,25 @@ export class RoadTrafficSystem {
     };
 
     this.roads = prepared.map((r) => {
-      const ys = new Float32Array(r.points.length);
-      for (let i = 0; i < r.points.length; i++) {
-        ys[i] = sampleHeight(r.points[i].x, r.points[i].z) + LIGHT_LIFT;
+      const n = r.points.length;
+      const ys = new Float32Array(n);
+      if (r.bridge) {
+        const hStart = sampleHeight(r.points[0].x, r.points[0].z);
+        const hEnd = sampleHeight(r.points[n - 1].x, r.points[n - 1].z);
+        const total = r.total || 1;
+        for (let i = 0; i < n; i++) {
+          const t = r.cum[i] / total;
+          const localH = sampleHeight(r.points[i].x, r.points[i].z);
+          const interpY = hStart * (1 - t) + hEnd * t;
+          const deckY = (i === 0 || i === n - 1)
+            ? Math.max(interpY, localH)
+            : Math.max(interpY, localH + 1.2);
+          ys[i] = deckY + LIGHT_LIFT;
+        }
+      } else {
+        for (let i = 0; i < n; i++) {
+          ys[i] = sampleHeight(r.points[i].x, r.points[i].z) + LIGHT_LIFT;
+        }
       }
       return { ...r, ys };
     });

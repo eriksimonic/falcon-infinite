@@ -471,3 +471,131 @@ export class PhotoModeController {
 }
 
 export { PRIORITY as ORDNANCE_PRIORITY, LABELS as ORDNANCE_LABELS, LINGER_TIME };
+
+// ---------------------------------------------------------------------------
+// FreeCamController — detached 6-DOF drone/spectator camera for fast terrain,
+// town, runway and landmark inspection without flying the aircraft.
+// ---------------------------------------------------------------------------
+const FREECAM_MIN_SPEED = 15;     // m/s (walk/inspect close up)
+const FREECAM_MAX_SPEED = 5000;   // m/s (cross 100 km Vipava Valley fast)
+const FREECAM_DEFAULT_SPEED = 240;
+const FREECAM_PITCH_LIMIT = 1.52; // ~87 deg up/down
+const FREECAM_LOOK_SENS = 0.0024;
+
+export class FreeCamController {
+  constructor() {
+    this.active = false;
+    this.position = new THREE.Vector3(0, 300, 0);
+    this.yaw = 0;       // radians, 0 looks toward -Z
+    this.pitch = -0.25; // radians, negative looks downward
+    this.speed = FREECAM_DEFAULT_SPEED;
+    this.fov = 60;
+    this._fwd = new THREE.Vector3();
+    this._right = new THREE.Vector3();
+    this._euler = new THREE.Euler(0, 0, 0, 'YXZ');
+  }
+
+  /** Activate free camera at `(pos, yaw, pitch)`. */
+  enter(pos, yaw = 0, pitch = -0.22) {
+    if (readPosition(pos, this.position)) {
+      // keep provided position
+    }
+    this.yaw = Number.isFinite(yaw) ? yaw : 0;
+    this.pitch = clamp(Number.isFinite(pitch) ? pitch : -0.22, -FREECAM_PITCH_LIMIT, FREECAM_PITCH_LIMIT);
+    this.active = true;
+    return this;
+  }
+
+  exit() {
+    this.active = false;
+    return this;
+  }
+
+  /** Instantly move to `(x, y, z)` looking along `(yaw, pitch)`. */
+  teleport(x, y, z, yaw = this.yaw, pitch = -0.35) {
+    if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+      this.position.set(x, y, z);
+    }
+    if (Number.isFinite(yaw)) this.yaw = yaw;
+    if (Number.isFinite(pitch)) this.pitch = clamp(pitch, -FREECAM_PITCH_LIMIT, FREECAM_PITCH_LIMIT);
+    return this;
+  }
+
+  /** Mouse-look delta in pixels. */
+  look(dx, dy) {
+    if (!this.active) return this;
+    const x = Number.isFinite(dx) ? dx : 0;
+    const y = Number.isFinite(dy) ? dy : 0;
+    this.yaw -= x * FREECAM_LOOK_SENS;
+    this.pitch = clamp(this.pitch - y * FREECAM_LOOK_SENS, -FREECAM_PITCH_LIMIT, FREECAM_PITCH_LIMIT);
+    return this;
+  }
+
+  /** Wheel / +/- speed adjustment (positive speeds up, negative slows down). */
+  adjustSpeed(steps) {
+    const s = Number.isFinite(steps) ? steps : 0;
+    this.speed = clamp(this.speed * Math.exp(s * 0.24), FREECAM_MIN_SPEED, FREECAM_MAX_SPEED);
+    return this.speed;
+  }
+
+  /**
+   * Step free-camera motion and write position/rotation onto `camera`.
+   *
+   * @param {number} dt seconds
+   * @param {object} camera THREE.PerspectiveCamera (or plain stub)
+   * @param {object} move `{ forward, right, up, boost, slow, lookX, lookY }`
+   * @param {(x:number, z:number) => number|null} [heightAt] ground clamp
+   */
+  update(dt, camera, move = {}, heightAt = null) {
+    if (!this.active) return false;
+    const h = Number.isFinite(dt) && dt > 0 ? clamp(dt, 0, 0.1) : 1 / 60;
+
+    if (move.lookX || move.lookY) {
+      this.yaw -= (move.lookX || 0) * 1.9 * h;
+      this.pitch = clamp(this.pitch + (move.lookY || 0) * 1.5 * h, -FREECAM_PITCH_LIMIT, FREECAM_PITCH_LIMIT);
+    }
+
+    const mult = move.boost ? 4.0 : move.slow ? 0.2 : 1.0;
+    const step = this.speed * mult * h;
+
+    const cp = Math.cos(this.pitch);
+    const sp = Math.sin(this.pitch);
+    const sy = Math.sin(this.yaw);
+    const cy = Math.cos(this.yaw);
+    // Standard Three.js YXZ forward (-Z rotated by yaw/pitch) and right (+X).
+    this._fwd.set(-sy * cp, sp, -cy * cp);
+    this._right.set(cy, 0, -sy);
+
+    const fwd = move.forward || 0;
+    const rgt = move.right || 0;
+    const up = move.up || 0;
+    if (fwd) this.position.addScaledVector(this._fwd, fwd * step);
+    if (rgt) this.position.addScaledVector(this._right, rgt * step);
+    if (up) this.position.y += up * step;
+
+    if (typeof heightAt === 'function') {
+      const ground = heightAt(this.position.x, this.position.z);
+      if (Number.isFinite(ground) && this.position.y < ground + 2.0) {
+        this.position.y = ground + 2.0;
+      }
+    }
+
+    if (camera && camera.position) {
+      camera.position.copy(this.position);
+      camera.up?.set(0, 1, 0);
+      this._euler.set(this.pitch, this.yaw, 0, 'YXZ');
+      camera.quaternion?.setFromEuler(this._euler);
+      let projDirty = false;
+      if (typeof camera.fov === 'number' && camera.fov !== this.fov) {
+        camera.fov = this.fov;
+        projDirty = true;
+      }
+      if (typeof camera.near === 'number' && camera.near !== 2.0) {
+        camera.near = 2.0;
+        projDirty = true;
+      }
+      if (projDirty) camera.updateProjectionMatrix?.();
+    }
+    return true;
+  }
+}

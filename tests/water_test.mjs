@@ -119,16 +119,34 @@ check(riverGeo.riverSegments === rVerts / 2 - 1,
   `riverSegments matches vertex pairs (${riverGeo.riverSegments})`);
 check(riverGeo.lakeCount === 0, 'no lakes counted for river-only data');
 
-for (let i = 0; i < rVerts; i++) {
-  const x = riverGeo.positions[i * 3];
-  const y = riverGeo.positions[i * 3 + 1];
-  const z = riverGeo.positions[i * 3 + 2];
-  const dy = Math.abs(y - (sloped(x, z) + 0.35));
-  if (dy > 0.05) {
-    check(false, `river vertex ${i} lift off by ${dy.toFixed(3)} m`);
-    break;
+// Every bank pair must be horizontal across the ribbon, strictly downhill
+// along it, and sit one lift above the centreline terrain. Banks are no longer
+// sampled independently (that tilted rivers sideways up canyon cliffs).
+{
+  const pairCount = rVerts / 2;
+  let horizontalBad = 0;
+  let uphillPairs = 0;
+  let liftBad = 0;
+  let prevPairY = Infinity;
+  for (let k = 0; k < pairCount; k++) {
+    const i = k * 2;
+    const lx = riverGeo.positions[i * 3];
+    const ly = riverGeo.positions[i * 3 + 1];
+    const lz = riverGeo.positions[i * 3 + 2];
+    const rx = riverGeo.positions[i * 3 + 3];
+    const ry = riverGeo.positions[i * 3 + 4];
+    const rz = riverGeo.positions[i * 3 + 5];
+
+    if (Math.abs(ly - ry) > 1e-6) horizontalBad++;
+    if (k > 0 && ly > prevPairY + 1e-4) uphillPairs++;
+    const cx = (lx + rx) * 0.5;
+    const cz = (lz + rz) * 0.5;
+    if (Math.abs(ly - (sloped(cx, cz) + 0.35)) > 0.05) liftBad++;
+    prevPairY = ly;
   }
-  if (i === rVerts - 1) check(true, 'river vertices sit heightAt + 0.35 ±0.05 m');
+  check(horizontalBad === 0, `river banks are level across the ribbon (${horizontalBad} tilted)`);
+  check(uphillPairs === 0, `river flows strictly downhill (${uphillPairs} uphill pairs)`);
+  check(liftBad === 0, `river pairs sit at centreline height + 0.35 ±0.05 m (${liftBad} off)`);
 }
 
 for (let i = 0; i < rVerts; i++) {
@@ -154,14 +172,28 @@ for (let i = 0; i < riverGeo.indices.length; i += 3) {
 check(riverMaxIndex < rVerts, 'river indices stay within the vertex range');
 check(riverDownFaces === 0, `all ${riverUpFaces} river triangles face +Y`);
 
-// Resampling interval: vertices come in pairs every ~25 m of centreline.
+// Resampling interval: consecutive pairs are ~25 m apart along the centreline.
+// (OSM ways are reversed to flow downstream, which can leave the final short
+// tail sample first, so allow exactly one off-spec gap.)
 {
   const p = riverGeo.positions;
   const stride = Math.hypot(p[3] - p[0], p[5] - p[2]); // bank width, not spacing
   check(stride > 10 && stride < 20, `river bank ribbon follows width 15 m (${stride.toFixed(1)})`);
-  const c0x = (p[0] + p[3]) / 2, c0z = (p[2] + p[5]) / 2;
-  const c1x = (p[6] + p[9]) / 2, c1z = (p[8] + p[11]) / 2;
-  near(Math.hypot(c1x - c0x, c1z - c0z), 25, 1.5, 'river sample spacing');
+
+  const pairs = riverGeo.positions.length / 6;
+  let near25 = 0;
+  let spacings = 0;
+  for (let k = 1; k < pairs; k++) {
+    const ax = (p[k * 6] + p[k * 6 + 3]) / 2;
+    const az = (p[k * 6 + 2] + p[k * 6 + 5]) / 2;
+    const bx = (p[(k - 1) * 6] + p[(k - 1) * 6 + 3]) / 2;
+    const bz = (p[(k - 1) * 6 + 2] + p[(k - 1) * 6 + 5]) / 2;
+    const d = Math.hypot(ax - bx, az - bz);
+    spacings++;
+    if (d > 23.5 && d < 26.5) near25++;
+  }
+  check(near25 >= spacings - 1,
+    `river sample spacing ~25 m (${near25}/${spacings} pairs)`);
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +498,10 @@ function pointInPoly(x, z, pts) {
   finiteArray(real.normals, 'real dataset normals finite');
   finiteArray(real.indices, 'real dataset indices finite');
   check(real.riverSegments > 1000, `real river segments (${real.riverSegments})`);
-  check(real.lakeCount > 300, `real lakes triangulated (${real.lakeCount}/${raw.lakes.length})`);
+  check(real.lakeCount >= 50 && real.lakeCount < raw.lakes.length,
+    `real lakes triangulated (${real.lakeCount}/${raw.lakes.length})`);
+  check(real.filteredSlopedBanks > 0,
+    `sloping riverbank polygons filtered out (${real.filteredSlopedBanks})`);
   check(real.positions.length / 3 > 50000, 'real mesh is substantial');
 }
 
@@ -514,6 +549,67 @@ function pointInPoly(x, z, pts) {
   check(emptySys.mesh === null, 'empty water data attaches nothing');
   emptySys.update(0.016, null);
   emptySys.dispose();
+}
+
+// ---------------------------------------------------------------------------
+// 7. Bumpy terrain & sloping riverbank polygons
+// ---------------------------------------------------------------------------
+// A DEM bump mid-reach must not make the ribbon climb. Strictly monotonic
+// downstream elevation flattens the hump instead of following it uphill.
+{
+  const bump = (x) => 100 - 0.005 * x + 5 * Math.exp(-((x / 250) ** 2));
+  const pts = [];
+  for (let i = 0; i <= 100; i++) pts.push([-1000 + 20 * i, 0]);
+
+  let rawUphill = 0;
+  let prevH = Infinity;
+  for (let x = -1000; x <= 1000; x += 20) {
+    const h = bump(x);
+    if (h > prevH) rawUphill++;
+    prevH = h;
+  }
+  check(rawUphill > 0, `bumpy fixture really climbs (${rawUphill} uphill spots)`);
+
+  const geo = buildInlandWaterGeometry({ rivers: [{ w: 15, pts }], lakes: [] }, bump);
+  check(geo.riverSegments > 50, `bumpy river emits segments (${geo.riverSegments})`);
+  let uphillPairs = 0;
+  let prevY = Infinity;
+  for (let k = 0; k < geo.positions.length / 6; k++) {
+    const y = geo.positions[k * 6 + 1];
+    if (k > 0 && y > prevY) uphillPairs++;
+    prevY = y;
+  }
+  check(uphillPairs === 0, `bumpy river still flows strictly downhill (${uphillPairs} uphill)`);
+}
+
+// A long, narrow OSM riverbank polygon that drops 25 m along its length must
+// not become one flat floating sheet: the continuous river ribbon draws it.
+{
+  const slopingBank = [[-1000, -22.5], [1000, -22.5], [1000, 22.5], [-1000, 22.5]];
+  const bankTerrain = (x) => 200 - (25 * (x + 1000)) / 2000;
+
+  const only = buildInlandWaterGeometry({ rivers: [], lakes: [slopingBank] }, bankTerrain);
+  check(only.lakeCount === 0,
+    'elongated sloping riverbank polygon is not triangulated as a flat lake');
+  check(only.positions.length === 0, 'filtered riverbank emits no vertices');
+  check(only.filteredSlopedBanks === 1,
+    `sloping riverbank counted as filtered (${only.filteredSlopedBanks})`);
+
+  // A compact flat pond and a dammed reservoir must survive the same filter.
+  const flatLake = [[4000, 4000], [4400, 4000], [4400, 4300], [4000, 4300]];
+  const reservoir = [[5000, 5000], [5600, 5000], [5600, 5400], [5000, 5400]];
+  const mixed = (x) => {
+    if (x >= 5000 && x <= 5060) return 90; // dam foot, 10 m below the basin
+    if (x > 5060 && x <= 5600) return 100; // basin
+    return bankTerrain(x);
+  };
+  const geo = buildInlandWaterGeometry({
+    rivers: [],
+    lakes: [slopingBank, flatLake, reservoir],
+  }, mixed);
+  check(geo.lakeCount === 2, `flat lake & dammed reservoir survive filtering (${geo.lakeCount})`);
+  check(geo.filteredSlopedBanks === 1,
+    `exactly one sloping riverbank filtered (${geo.filteredSlopedBanks})`);
 }
 
 // ---------------------------------------------------------------------------

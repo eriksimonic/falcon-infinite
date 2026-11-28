@@ -95,6 +95,11 @@ const SALT = {
   hamlet: 0xc2b2ae35,
 };
 
+// Site centres must sit this far above sea level (metres). evalSite and the
+// cached-site revalidation in settlementAtCell both use it, so a site cached
+// before a real DEM loaded can never be built on top of water.
+const MIN_SITE_HEIGHT = 3.5;
+
 // ---------------------------------------------------------------------------
 // Names
 // ---------------------------------------------------------------------------
@@ -183,7 +188,7 @@ function evalSite(x, z, R, level) {
   if (nearAirport(x, z, R)) return null;
   // Airport pads are excluded above, so plain baseHeight is the ground height.
   const h = baseHeight(x, z);
-  if (h < 3.5 || h > cfg.elevMax) return null;
+  if (h < MIN_SITE_HEIGHT || h > cfg.elevMax) return null;
   const slope = meanSlope(x, z, R, cfg.slopePoints);
   if (slope > cfg.slopeMax) return null;
   // Prefer flat ground, then lower ground; a hilltop town is allowed but rare.
@@ -1033,6 +1038,12 @@ export function settlementAtCell(level, cx, cz) {
   const site = ensureSite(level, cx, cz);
   if (!site) return store(cache, key, null);
 
+  // Sites are cached by cell and may predate a real DEM load, when open sea
+  // was still procedural dry land. Re-validate the centre against the current
+  // ground before generating a layout, so a stale site can never build a
+  // floating city on water.
+  if (baseHeight(site.x, site.z) < MIN_SITE_HEIGHT) return store(cache, key, null);
+
   // Layout randomness is independent of the site-phase draws, so building
   // arrays can be generated later without replaying the site RNG.
   const rng = mulberry32((site.seed ^ LAYOUT_MIX) >>> 0);
@@ -1138,4 +1149,21 @@ export function nearestSettlement(x, z) {
   if (NEAREST_CACHE.size > 256) NEAREST_CACHE.clear();
   NEAREST_CACHE.set(key, best);
   return best;
+}
+
+/**
+ * Drop every cached procedural site, layout and proximity result.
+ *
+ * Site selection reads the active terrain, so a cache filled before a real DEM
+ * (or live Terrarium tile) loaded can describe land that is now sea. Callers
+ * that swap theaters should clear it; generation itself is deterministic, so
+ * the next query simply rebuilds the same sites against the new terrain.
+ */
+export function clearSettlementCaches() {
+  for (const level of SETTLEMENT_LAYERS) {
+    settlementCaches[level.level].clear();
+    siteCaches[level.level].clear();
+  }
+  NEAR_CACHE.clear();
+  NEAREST_CACHE.clear();
 }

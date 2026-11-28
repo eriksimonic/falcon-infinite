@@ -12,7 +12,8 @@
 import { performance } from 'node:perf_hooks';
 import { BuildingSystem, buildStreetRibbonData } from '../src/world/buildings.js';
 import { settlementsNear } from '../src/world/settlements.js';
-import { terrainHeight } from '../src/world/terrain.js';
+import { terrainHeight, setActiveDEM } from '../src/world/terrain.js';
+import { HeightmapDEM } from '../src/world/dem.js';
 import { QUALITY } from '../src/config.js';
 
 const failures = [];
@@ -589,6 +590,13 @@ const insideCustom = customSys._settlementsNear(0, 0, 6000);
 check(insideCustom.length === 1 && insideCustom[0].id === 'vipava-osm',
   'procedural cities were not hidden while the baked OSM city is active');
 
+// The real-world theater streams live Terrarium terrain far past the old
+// +-50 km box; the Adriatic past Piran was procedural dry land before the DEM
+// loaded, so no invented city may survive there while the baked city is active.
+const adriatic = customSys._settlementsNear(-51614, 55952, 16000);
+check(adriatic.length === 0,
+  `${adriatic.length} procedural settlements floated on the Adriatic Sea near Piran`);
+
 const reverted = customSys.setCustomBuildings(null);
 check(reverted === null, 'setCustomBuildings(null) did not return null');
 check(customSys.customSettlement === null, 'customSettlement was not cleared');
@@ -614,6 +622,132 @@ const strip = customSys.setCustomBuildings([
 check(!!strip && strip.buildings.length === 1,
   `runway-strip filter kept ${strip ? strip.buildings.length : -1} buildings on LJAJ`);
 customSys.setCustomBuildings(null);
+
+// ---------------------------------------------------------------------------
+// 12. Feature 39 — +rot grounding, hillside plinths, 4-tier LOD & 20k grid
+// ---------------------------------------------------------------------------
+{
+  // Tilted planar DEM: h(x, z) = 200 + 0.12 * x + 0.25 * z (steep hillside!).
+  // Use a 4x4 linear grid so Catmull-Rom bicubic reproduces the plane exactly.
+  const W = 4, H = 4, SIZE = 40000;
+  const planePx = new Float32Array(W * H);
+  for (let r = 0; r < H; r++) {
+    const z = -SIZE * 0.5 + (r / (H - 1)) * SIZE;
+    for (let c = 0; c < W; c++) {
+      const x = -SIZE * 0.5 + (c / (W - 1)) * SIZE;
+      planePx[r * W + c] = 200 + 0.12 * x + 0.25 * z;
+    }
+  }
+  const slopeDem = new HeightmapDEM({ width: W, height: H, sizeM: SIZE, pixels: planePx });
+  try {
+    setActiveDEM(slopeDem);
+    const slopeSys = new BuildingSystem(null, QUALITY.medium);
+    // Elongated rotated building (rot = 0.7 rad) far from origin airport pad.
+    const rot = 0.7;
+    const b = { x: 5200, z: 4800, w: 40, d: 10, h: 8, rot, kind: 'house' };
+    const g = slopeSys._ground(b);
+
+    // Compute exact Three.js Euler(0, rot, 0) rotated footprint corners.
+    const c = Math.cos(rot);
+    const s = Math.sin(rot);
+    const hw = b.w * 0.5;
+    const hd = b.d * 0.5;
+    let exactLo = Infinity;
+    let exactHi = -Infinity;
+    for (const [su, sv] of [[-hw, -hd], [hw, -hd], [-hw, hd], [hw, hd]]) {
+      const wx = b.x + su * c + sv * s;
+      const wz = b.z - su * s + sv * c;
+      const h = terrainHeight(wx, wz);
+      if (h < exactLo) exactLo = h;
+      if (h > exactHi) exactHi = h;
+    }
+    const relief = exactHi - exactLo;
+    check(relief > 4, `tilted plane relief too small (${fmt(relief)} m)`);
+    check(Math.abs(g.ground - exactLo) < 0.05,
+      `_ground(b) corner sign mismatch (got lo=${fmt(g.ground)}, exact +rot lo=${fmt(exactLo)})`);
+    check(Math.abs(g.hi - exactHi) < 0.05,
+      `_ground(b) uphill corner mismatch (got hi=${fmt(g.hi)}, exact +rot hi=${fmt(exactHi)})`);
+    check(g.base < exactLo - 3.0,
+      `hillside plinth base (${fmt(g.base)}) does not extend > 3 m below lo (${fmt(exactLo)})`);
+    check(g.floorY >= exactLo - 1e-6,
+      `terrace floorY (${fmt(g.floorY)}) fell below lo (${fmt(exactLo)})`);
+    check(g.top >= exactHi + b.h * 0.5,
+      `hillside roof top (${fmt(g.top)}) buried near uphill corner (${fmt(exactHi)})`);
+
+    // Steep hillside test: 12 m relief across a larger footprint.
+    const steepB = { x: 5400, z: 5000, w: 50, d: 35, h: 9, rot: 0.4, kind: 'house' };
+    const sg = slopeSys._ground(steepB);
+    check(sg.relief >= 10, `steep building relief expected >= 10 m, got ${fmt(sg.relief)} m`);
+    check(sg.base < sg.ground - 3.0, `steep plinth base too shallow (${fmt(sg.ground - sg.base)} m)`);
+    check(sg.top >= sg.hi + steepB.h * 0.5, `steep roof buried (top=${fmt(sg.top)}, hi=${fmt(sg.hi)})`);
+    check(sg.floorY >= sg.ground - 1e-6, 'steep floorY below lowest corner');
+
+    // Verify hitBuilding agrees with the exact +rot corners on the rotated building.
+    const rotSet = slopeSys.setCustomBuildings([[b.x, b.z, b.w, b.d, b.h, b.rot, 0, 0, 1, 42]]);
+    const rb = rotSet.buildings[0];
+    const rg = slopeSys._ground(rb);
+    const midY = (rg.floorY + rg.top) * 0.5;
+    const hitFrom = { x: rb.x - c * (hw + 6), y: midY, z: rb.z + s * (hw + 6) };
+    const hitTo = { x: rb.x, y: midY, z: rb.z };
+    const hit = slopeSys.hitBuilding(hitFrom, hitTo);
+    check(!!hit, 'hitBuilding missed rotated +rot building on slope');
+  } finally {
+    setActiveDEM(null);
+  }
+
+  // 4-tier procedural LOD test (close, mid, far) + 3D roofs + plinths + churches.
+  const lodScene = { add() {}, remove() {} };
+  const lodSys = new BuildingSystem(lodScene, QUALITY.medium);
+  check(!!lodSys.plinthMesh && !!lodSys.gableRoofMesh && !!lodSys.hipRoofMesh,
+    'BuildingSystem did not create plinth/roof InstancedMesh pools');
+
+  // Place 3 clusters:
+  //   - Close (1200 m): 1 shed (tier 0), 1 house (tier 1), 1 church (tier 2)
+  //   - Mid (6500 m):   1 shed (tier 0 -> hidden!), 1 house (tier 1 -> shown), 1 church (tier 2 -> shown)
+  //   - Far (15000 m):  1 shed (tier 0 -> hidden!), 1 house (tier 1 -> hidden!), 1 tower (tier 2 -> shown)
+  const lodRecords = [
+    [1200, 1200, 6, 5, 4, 0, 5, 0, 0, 10],   // close shed (tier 0)
+    [1240, 1200, 12, 9, 7, 0.2, 0, 0, 1, 20], // close house (tier 1)
+    [1280, 1200, 16, 24, 15, 0.3, 4, 4, 2, 30], // close church (tier 2)
+    [6500, 1200, 6, 5, 4, 0, 5, 0, 0, 40],   // mid shed (tier 0 -> hidden)
+    [6540, 1200, 12, 9, 7, 0.2, 0, 1, 1, 50], // mid house (tier 1 -> shown)
+    [6580, 1200, 16, 24, 15, 0.3, 4, 4, 2, 60], // mid church (tier 2 -> shown)
+    [15000, 1200, 6, 5, 4, 0, 5, 0, 0, 70],   // far shed (tier 0 -> hidden)
+    [15040, 1200, 12, 9, 7, 0.2, 0, 0, 1, 80], // far house (tier 1 -> hidden)
+    [15080, 1200, 20, 20, 32, 0, 3, 2, 2, 90], // far tower (tier 2 -> shown)
+  ];
+  lodSys.setCustomBuildings(lodRecords, [[1240, 1200, 260, 2.0]]);
+  lodSys.rebuild({ position: { x: 0, y: 120, z: 1200 } });
+
+  check(lodSys.stats.lod.close === 3, `expected 3 close buildings, got ${lodSys.stats.lod.close}`);
+  check(lodSys.stats.lod.mid === 2, `expected 2 mid buildings (shed hidden), got ${lodSys.stats.lod.mid}`);
+  check(lodSys.stats.lod.far === 1, `expected 1 far building (shed & house hidden), got ${lodSys.stats.lod.far}`);
+  check(lodSys.stats.lod.roofs >= 5, `expected >= 5 3D roofs/spires, got ${lodSys.stats.lod.roofs}`);
+  check(lodSys.stats.lod.plinths >= 6, `expected >= 6 stone plinths, got ${lodSys.stats.lod.plinths}`);
+  check(lodSys.grounds.size === 1, `expected 1 urban ground patch, got ${lodSys.grounds.size}`);
+  lodSys.dispose();
+
+  // Spatial grid performance: 20,000 synthetic custom buildings must rebuild < 25 ms.
+  const perfScene = { add() {}, remove() {} };
+  const perfSys = new BuildingSystem(perfScene, QUALITY.medium);
+  const synth = [];
+  for (let i = 0; i < 20000; i++) {
+    const gx = ((i * 73) % 40000) - 20000;
+    const gz = ((Math.floor(i / 200) * 197 + (i % 19) * 31) % 40000) - 20000;
+    const tier = (i % 10 === 0) ? 2 : (i % 4 === 0 ? 0 : 1);
+    const kind = tier === 2 ? (i % 20 === 0 ? 4 : 1) : (tier === 0 ? 5 : 0);
+    synth.push([gx, gz, 12, 9, 8, (i % 6) * 0.5, kind, kind === 4 ? 4 : 0, tier, i & 255]);
+  }
+  perfSys.setCustomBuildings(synth);
+  // Warm up JIT + ground cache once, then measure spatial-grid rebuild time.
+  perfSys.rebuild({ position: { x: 4000, y: 300, z: 4000 } });
+  const tRebuild0 = performance.now();
+  perfSys.rebuild({ position: { x: 4300, y: 300, z: 4200 } });
+  const rebuildMs = performance.now() - tRebuild0;
+  check(rebuildMs < 25, `20k spatial-grid rebuild too slow (${fmt(rebuildMs)} ms, want < 25 ms)`);
+  check(perfSys.stats.buildings > 0, '20k spatial-grid rebuild produced 0 buildings');
+  perfSys.dispose();
+}
 
 // ---------------------------------------------------------------------------
 // Summary

@@ -139,6 +139,7 @@ export function buildRoadRibbonData(polylines, heightAt) {
   const normals = [];
   const uvs = [];
   const indices = [];
+  const piers = [];
   let vbase = 0;
   let segmentCount = 0;
   let bridgeCount = 0;
@@ -148,6 +149,7 @@ export function buildRoadRibbonData(polylines, heightAt) {
     if (!line) continue;
     const width = Number.isFinite(line.width) ? Math.max(0.5, line.width) : 9;
     const halfW = width * 0.5;
+    const isBridge = line.bridge === true;
     const src = sanitizePoints(line.points);
     if (src.length < 2) continue;
     const pts = resamplePolyline(src, SAMPLE_STEP);
@@ -155,12 +157,13 @@ export function buildRoadRibbonData(polylines, heightAt) {
     if (n < 2) continue;
 
     const dist = new Float64Array(n);
+    const localH = new Float64Array(n);
     const deckY = new Float64Array(n);
     const rightX = new Float64Array(n);
     const rightZ = new Float64Array(n);
     for (let i = 0; i < n; i++) {
       if (i > 0) dist[i] = dist[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].z - pts[i - 1].z);
-      deckY[i] = deckHeightFor(safeHeight(hFn, pts[i].x, pts[i].z));
+      localH[i] = safeHeight(hFn, pts[i].x, pts[i].z);
     }
 
     // Horizontal tangents (central difference) -> right vector = (-tz, tx).
@@ -175,12 +178,97 @@ export function buildRoadRibbonData(polylines, heightAt) {
       rightZ[i] = tx;
     }
 
-    // Contiguous bridge spans (runs of samples below WATER_LEVEL).
-    let inBridge = false;
-    for (let i = 0; i < n; i++) {
-      const wet = safeHeight(hFn, pts[i].x, pts[i].z) < WATER_LEVEL;
-      if (wet && !inBridge) { bridgeCount++; inBridge = true; }
-      else if (!wet) inBridge = false;
+    if (isBridge) {
+      const hStart = localH[0];
+      const hEnd = localH[n - 1];
+      const totalD = dist[n - 1] || 1;
+      for (let i = 0; i < n; i++) {
+        const p = pts[i];
+        const rx = rightX[i];
+        const rz = rightZ[i];
+        const hL = safeHeight(hFn, p.x - rx * halfW, p.z - rz * halfW);
+        const hR = safeHeight(hFn, p.x + rx * halfW, p.z + rz * halfW);
+        // Clear centerline AND both left/right deck edges so a bridge deck on
+        // a steep cross-slope never dips under the uphill bank.
+        const maxEdgeH = Math.max(localH[i], hL, hR);
+        const t = dist[i] / totalD;
+        const interp = hStart * (1 - t) + hEnd * t + DECK_LIFT;
+        const minDeck = maxEdgeH < WATER_LEVEL
+          ? Math.max(BRIDGE_DECK, maxEdgeH + 1.2)
+          : (i === 0 || i === n - 1 ? maxEdgeH + DECK_LIFT : maxEdgeH + 1.2);
+        deckY[i] = Math.max(interp, minDeck);
+      }
+      bridgeCount++;
+    } else {
+      for (let i = 0; i < n; i++) {
+        deckY[i] = deckHeightFor(localH[i]);
+      }
+    }
+
+    // Contiguous water-crossing bridge spans + grounded piers for viaducts & coastal bridges.
+    if (isBridge) {
+      let lastPierDist = -1e9;
+      let emittedForBridge = false;
+      let deepestIdx = -1;
+      let deepestClear = 0;
+      for (let i = 1; i < n - 1; i++) {
+        const clear = deckY[i] - localH[i];
+        if (clear > deepestClear) {
+          deepestClear = clear;
+          deepestIdx = i;
+        }
+        if (clear > 1.8 && dist[i] - lastPierDist >= 45) {
+          const tx = rightZ[i];
+          const tz = -rightX[i];
+          piers.push({
+            x: pts[i].x,
+            z: pts[i].z,
+            topY: deckY[i] - 0.4,
+            bottomY: localH[i] < WATER_LEVEL ? Math.min(localH[i] - 5.0, -3.5) : localH[i] - 5.0,
+            width: Math.max(2.2, width * 0.72),
+            rot: Math.atan2(tx, tz),
+          });
+          lastPierDist = dist[i];
+          emittedForBridge = true;
+        }
+      }
+      if (!emittedForBridge && deepestIdx >= 0 && deepestClear > 1.8) {
+        const i = deepestIdx;
+        const tx = rightZ[i];
+        const tz = -rightX[i];
+        piers.push({
+          x: pts[i].x,
+          z: pts[i].z,
+          topY: deckY[i] - 0.4,
+          bottomY: localH[i] < WATER_LEVEL ? Math.min(localH[i] - 5.0, -3.5) : localH[i] - 5.0,
+          width: Math.max(2.2, width * 0.72),
+          rot: Math.atan2(tx, tz),
+        });
+      }
+    } else {
+      let inBridge = false;
+      let lastWetPierDist = -1e9;
+      for (let i = 0; i < n; i++) {
+        const wet = localH[i] < WATER_LEVEL;
+        if (wet) {
+          if (!inBridge) { bridgeCount++; inBridge = true; }
+          if (dist[i] - lastWetPierDist >= 40) {
+            const tx = rightZ[i];
+            const tz = -rightX[i];
+            piers.push({
+              x: pts[i].x,
+              z: pts[i].z,
+              topY: deckY[i] - 0.4,
+              bottomY: Math.min(localH[i], -3.5),
+              width: Math.max(2.2, width * 0.72),
+              rot: Math.atan2(tx, tz),
+            });
+            lastWetPierDist = dist[i];
+          }
+        } else {
+          inBridge = false;
+        }
+      }
     }
 
     for (let i = 0; i < n; i++) {
@@ -191,10 +279,10 @@ export function buildRoadRibbonData(polylines, heightAt) {
       const zl = p.z - rz * halfW;
       const xr = p.x + rx * halfW;
       const zr = p.z + rz * halfW;
-      // Each deck edge is sampled against the terrain directly beneath it, so
-      // cross-slopes never lift or bury the road edge.
-      const yl = deckHeightFor(safeHeight(hFn, xl, zl));
-      const yr = deckHeightFor(safeHeight(hFn, xr, zr));
+      // Bridged spans stay level across the carriageway; ground-hugging roads
+      // sample each edge directly beneath it so cross-slopes never lift/bury.
+      const yl = isBridge ? deckY[i] : deckHeightFor(safeHeight(hFn, xl, zl));
+      const yr = isBridge ? deckY[i] : deckHeightFor(safeHeight(hFn, xr, zr));
       const v = dist[i] / UV_METRES;
 
       // Surface normal from (edge across) x (longitudinal tangent), upforced.
@@ -240,7 +328,79 @@ export function buildRoadRibbonData(polylines, heightAt) {
     indices: Uint32Array.from(indices),
     segmentCount,
     bridgeCount,
+    piers,
   };
+}
+
+/** Merge bridge pier descriptors into a single BufferGeometry of concrete columns. */
+function buildPierGeometry(piers) {
+  const geo = new THREE.BufferGeometry();
+  if (!Array.isArray(piers) || piers.length === 0) return geo;
+
+  const count = piers.length;
+  // 24 vertices (4 per face * 6 faces) and 36 indices per box.
+  const pos = new Float32Array(count * 24 * 3);
+  const norm = new Float32Array(count * 24 * 3);
+  const idx = new Uint32Array(count * 36);
+  let vp = 0;
+  let ip = 0;
+
+  const faces = [
+    // +X
+    { n: [1, 0, 0], c: [[0.5, 0, -0.5], [0.5, 1, -0.5], [0.5, 1, 0.5], [0.5, 0, 0.5]] },
+    // -X
+    { n: [-1, 0, 0], c: [[-0.5, 0, 0.5], [-0.5, 1, 0.5], [-0.5, 1, -0.5], [-0.5, 0, -0.5]] },
+    // +Z
+    { n: [0, 0, 1], c: [[-0.5, 0, 0.5], [0.5, 0, 0.5], [0.5, 1, 0.5], [-0.5, 1, 0.5]] },
+    // -Z
+    { n: [0, 0, -1], c: [[0.5, 0, -0.5], [-0.5, 0, -0.5], [-0.5, 1, -0.5], [0.5, 1, -0.5]] },
+    // +Y
+    { n: [0, 1, 0], c: [[-0.5, 1, -0.5], [-0.5, 1, 0.5], [0.5, 1, 0.5], [0.5, 1, -0.5]] },
+    // -Y
+    { n: [0, -1, 0], c: [[-0.5, 0, 0.5], [-0.5, 0, -0.5], [0.5, 0, -0.5], [0.5, 0, 0.5]] },
+  ];
+
+  for (let i = 0; i < count; i++) {
+    const pr = piers[i];
+    const h = Math.max(1.0, pr.topY - pr.bottomY);
+    const w = Math.max(1.5, pr.width || 6.0);
+    const t = Math.min(2.6, Math.max(1.4, w * 0.28)); // thickness along road
+    const c = Math.cos(pr.rot || 0);
+    const s = Math.sin(pr.rot || 0);
+
+    for (let f = 0; f < 6; f++) {
+      const face = faces[f];
+      const base = vp;
+      const fnx = face.n[0] * c + face.n[2] * s;
+      const fny = face.n[1];
+      const fnz = -face.n[0] * s + face.n[2] * c;
+      for (let k = 0; k < 4; k++) {
+        const corner = face.c[k];
+        const lx = corner[0] * w;
+        const ly = pr.bottomY + corner[1] * h;
+        const lz = corner[2] * t;
+        pos[vp * 3] = pr.x + lx * c + lz * s;
+        pos[vp * 3 + 1] = ly;
+        pos[vp * 3 + 2] = pr.z - lx * s + lz * c;
+        norm[vp * 3] = fnx;
+        norm[vp * 3 + 1] = fny;
+        norm[vp * 3 + 2] = fnz;
+        vp++;
+      }
+      idx[ip++] = base;
+      idx[ip++] = base + 1;
+      idx[ip++] = base + 2;
+      idx[ip++] = base;
+      idx[ip++] = base + 2;
+      idx[ip++] = base + 3;
+    }
+  }
+
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(norm, 3));
+  geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  geo.computeBoundingSphere();
+  return geo;
 }
 
 function splitAroundAirports(points, airports, margin) {
@@ -285,13 +445,23 @@ export class RoadNetwork {
     this.mesh.renderOrder = 1;
     this.mesh.frustumCulled = false;
     this.mesh.visible = false;
+
+    // Concrete piers supporting elevated OSM viaducts and coastal bridges,
+    // attached as a child of `this.mesh` so `scene.add` stays a single call.
+    this.pierMaterial = new THREE.MeshLambertMaterial({ color: 0x8f8e88 });
+    this.pierMesh = new THREE.Mesh(new THREE.BufferGeometry(), this.pierMaterial);
+    this.pierMesh.name = 'highway-piers';
+    this.pierMesh.frustumCulled = false;
+    this.pierMesh.visible = false;
+    this.mesh.add(this.pierMesh);
+
     if (scene && typeof scene.add === 'function') scene.add(this.mesh);
     this._lastX = Infinity;
     this._lastZ = Infinity;
     this._built = false;
-    // Baked real-world roads ({ width, points }) or null for procedural links.
+    // Baked real-world roads ({ width, points, bridge }) or null for procedural links.
     this.customRoads = null;
-    this.stats = { roads: 0, segments: 0, bridges: 0 };
+    this.stats = { roads: 0, segments: 0, bridges: 0, piers: 0 };
   }
 
   /**
@@ -331,7 +501,8 @@ export class RoadNetwork {
         points.push({ x, z });
       }
       if (points.length < 2) continue;
-      roads.push({ width, points });
+      const bridge = r.b === 1 || r.bridge === true;
+      roads.push({ width, points, bridge });
     }
 
     this.customRoads = roads.length > 0 ? roads : null;
@@ -447,6 +618,12 @@ export class RoadNetwork {
     if (data.positions.length > 0) geo.computeBoundingSphere();
     this.mesh.geometry = geo;
     if (old && old !== geo) old.dispose();
+
+    const oldPiers = this.pierMesh.geometry;
+    const pierGeo = buildPierGeometry(data.piers);
+    this.pierMesh.geometry = pierGeo;
+    this.pierMesh.visible = Array.isArray(data.piers) && data.piers.length > 0;
+    if (oldPiers && oldPiers !== pierGeo) oldPiers.dispose();
   }
 
   _clear() {
@@ -457,6 +634,7 @@ export class RoadNetwork {
       indices: new Uint32Array(0),
       segmentCount: 0,
       bridgeCount: 0,
+      piers: [],
     });
     this.mesh.visible = false;
     this._built = false;
@@ -465,6 +643,7 @@ export class RoadNetwork {
     this.stats.roads = 0;
     this.stats.segments = 0;
     this.stats.bridges = 0;
+    this.stats.piers = 0;
   }
 
   _rebuild(camera) {
@@ -506,6 +685,7 @@ export class RoadNetwork {
     this.stats.roads = links.length;
     this.stats.segments = data.segmentCount;
     this.stats.bridges = data.bridgeCount;
+    this.stats.piers = data.piers.length;
   }
 
   update(camera) {
@@ -561,7 +741,7 @@ export class RoadNetwork {
         const est = Math.max(1, Math.ceil(length / SAMPLE_STEP));
         if (est > segmentBudget) continue;
         segmentBudget -= est;
-        polylines.push({ width, points: run });
+        polylines.push({ width, points: run, bridge: Boolean(road.bridge) });
       }
       if (segmentBudget <= 0) break;
     }
@@ -575,12 +755,15 @@ export class RoadNetwork {
     this.stats.roads = polylines.length;
     this.stats.segments = data.segmentCount;
     this.stats.bridges = data.bridgeCount;
+    this.stats.piers = data.piers.length;
   }
 
   dispose() {
     this.mesh.geometry.dispose();
     this.material.map?.dispose();
     this.material.dispose();
+    this.pierMesh?.geometry.dispose();
+    this.pierMaterial?.dispose();
     this.mesh.removeFromParent();
     if (this.scene && typeof this.scene.remove === 'function') this.scene.remove(this.mesh);
   }

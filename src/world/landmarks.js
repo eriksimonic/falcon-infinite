@@ -59,6 +59,35 @@ function num(value, fallback) {
 }
 
 /**
+ * Sample ground elevation at landmark-local `(lx, lz)` relative to `lm.y`,
+ * using Three.js's exact `rotation.y = lm.rot` world transform.
+ */
+function localGroundY(lm, heightAt, lx, lz) {
+  const c = Math.cos(lm.rot || 0);
+  const s = Math.sin(lm.rot || 0);
+  const wx = lm.x + lx * c + lz * s;
+  const wz = lm.z - lx * s + lz * c;
+  const h = heightAt(wx, wz);
+  return Number.isFinite(h) ? h - lm.y : 0;
+}
+
+/** Sample 4 corners + centre of a local footprint `(cx ± w/2, cz ± d/2)`. */
+function footprintRange(lm, heightAt, cx, cz, w, d) {
+  const hw = w * 0.5;
+  const hd = d * 0.5;
+  const h0 = localGroundY(lm, heightAt, cx - hw, cz - hd);
+  const h1 = localGroundY(lm, heightAt, cx + hw, cz - hd);
+  const h2 = localGroundY(lm, heightAt, cx - hw, cz + hd);
+  const h3 = localGroundY(lm, heightAt, cx + hw, cz + hd);
+  const centerY = localGroundY(lm, heightAt, cx, cz);
+  return {
+    minY: Math.min(h0, h1, h2, h3, centerY),
+    maxY: Math.max(h0, h1, h2, h3, centerY),
+    centerY,
+  };
+}
+
+/**
  * Normalize one baked landmark record. Returns null when it cannot be placed.
  * `y` is always sampled from the active terrain, never trusted from the file.
  */
@@ -138,7 +167,7 @@ export class LandmarkSystem {
       const lm = normalizeLandmark(list[i], i, sample);
       if (!lm) continue;
       this.landmarks.push(lm);
-      if (this.group) this._buildLandmark(lm);
+      if (this.group) this._buildLandmark(lm, sample);
     }
 
     this.stats.landmarks = this.landmarks.length;
@@ -349,10 +378,10 @@ export class LandmarkSystem {
     return mesh;
   }
 
-  /** Foundation skirt: 4 m into the ground plus a shallow visible plinth. */
-  _foundation(parent, w, d, color = COL.stone) {
-    const h = FOUNDATION_DEPTH + FOUNDATION_TOP;
-    return this._box(parent, color, 0, FOUNDATION_TOP - h / 2, 0, w, h, d);
+  /** Foundation skirt anchored at local `(x, z)` from `bottomY` to `topY`. */
+  _foundation(parent, w, d, color = COL.stone, x = 0, z = 0, topY = FOUNDATION_TOP, bottomY = -FOUNDATION_DEPTH) {
+    const h = Math.max(1.0, topY - bottomY);
+    return this._box(parent, color, x, bottomY + h * 0.5, z, w, h, d);
   }
 
   /** Gable roof made from two slanted slabs; ridge runs along local Z. */
@@ -369,7 +398,8 @@ export class LandmarkSystem {
   // -------------------------------------------------------------------------
   // Landmark builder
   // -------------------------------------------------------------------------
-  _buildLandmark(lm) {
+  _buildLandmark(lm, heightAt = terrainHeight) {
+    const sample = typeof heightAt === 'function' ? heightAt : terrainHeight;
     const obj = new THREE.Group();
     obj.name = `landmark:${lm.id}`;
     obj.position.set(lm.x, lm.y, lm.z);
@@ -377,13 +407,13 @@ export class LandmarkSystem {
     obj.userData.landmark = lm;
 
     switch (lm.kind) {
-      case 'bridge': this._buildBridge(obj, lm); break;
-      case 'dam': this._buildDam(obj, lm); break;
-      case 'tower': this._buildTower(obj, lm); break;
-      case 'castle': this._buildCastle(obj, lm); break;
-      case 'lighthouse': this._buildLighthouse(obj, lm); break;
+      case 'bridge': this._buildBridge(obj, lm, sample); break;
+      case 'dam': this._buildDam(obj, lm, sample); break;
+      case 'tower': this._buildTower(obj, lm, sample); break;
+      case 'castle': this._buildCastle(obj, lm, sample); break;
+      case 'lighthouse': this._buildLighthouse(obj, lm, sample); break;
       case 'church':
-      default: this._buildChurch(obj, lm); break;
+      default: this._buildChurch(obj, lm, sample); break;
     }
 
     lm.object = obj;
@@ -402,6 +432,8 @@ export class LandmarkSystem {
   _addNightGlow(parent, lm) {
     // Shared unit cube, scaled per part; no per-landmark geometry to free.
     const boxGeo = this._resources().box;
+    const meta = lm._groundMeta || {};
+    const baseY = Number.isFinite(meta.baseY) ? meta.baseY : 0;
 
     const addWash = (x, y, z, w, h, d, strength) => {
       const material = new THREE.MeshBasicMaterial({
@@ -448,8 +480,8 @@ export class LandmarkSystem {
         const towerW = 7 * s;
         const towerH = 30 * s;
         const tz = -naveD * 0.5 - towerW * 0.5 - 1;
-        addWash(0, naveH * 0.42 + 1, 0, naveW + 1.6, naveH * 0.72, naveD + 1.6, 1.0);
-        addWash(0, towerH * 0.45, tz, towerW + 1.4, towerH * 0.8, towerW + 1.4, 0.75);
+        addWash(0, baseY + naveH * 0.42 + 1, 0, naveW + 1.6, naveH * 0.72, naveD + 1.6, 1.0);
+        addWash(0, baseY + towerH * 0.45, tz, towerW + 1.4, towerH * 0.8, towerW + 1.4, 0.75);
         break;
       }
       case 'castle': {
@@ -459,31 +491,34 @@ export class LandmarkSystem {
         const wallH = 9 * s;
         const keepW = 14 * s;
         const keepH = 20 * s;
-        addWash(0, (wallH + 2.2) * 0.5, 0, yard + 7, wallH + 2, yard + 7, 0.6);
-        addWash(0, keepH * 0.5 + 2, 0, keepW + 2, keepH * 0.8, keepW + 2, 1.0);
+        addWash(0, baseY + (wallH + 2.2) * 0.5, 0, yard + 7, wallH + 2, yard + 7, 0.6);
+        addWash(0, baseY + keepH * 0.5 + 2, 0, keepW + 2, keepH * 0.8, keepW + 2, 1.0);
         break;
       }
       case 'bridge': {
-        // Solkan arch span: a low glow under the deck so the arches read at night.
+        // Solkan arch span: a small highlight tucked under the central arch so
+        // the voussoirs read at night without washing the gorge in orange.
         const length = lm.length || 220;
         const height = lm.height || 34;
         const deckW = 9.5 * Math.min(1.4, lm.scale);
-        addWash(0, height * 0.34, 0, length * 0.98, height * 0.62, deckW * 0.7, 0.9);
+        const deckMidY = Number.isFinite(meta.deckMidY) ? meta.deckMidY : height;
+        const washH = Math.max(4, Math.min(height * 0.24, 8));
+        addWash(0, deckMidY - washH * 0.6, 0, length * 0.38, washH, deckW * 0.42, 0.25);
         break;
       }
       case 'tower': {
         // Nanos / Pleša: red obstruction beacons at two thirds and the top.
         const height = lm.height || 90;
         const phase = lm.phase ?? lm.x * 0.013 + lm.z * 0.007;
-        addObstruction(height * 0.66, 1.15, phase);
-        addObstruction(height * 0.99, 0.95, phase + 1.7);
+        addObstruction(baseY + height * 0.66, 1.15, phase);
+        addObstruction(baseY + height * 0.99, 0.95, phase + 1.7);
         break;
       }
       case 'lighthouse': {
         // Faro della Vittoria: a long rotating white beam at lantern height.
         const height = lm.height || 60;
         const shaftH = height * 0.78;
-        const galleryY = shaftH + 3.4;
+        const galleryY = baseY + shaftH + 3.4;
         const material = new THREE.MeshBasicMaterial({
           color: COL.beaconWhite,
           transparent: true,
@@ -506,161 +541,265 @@ export class LandmarkSystem {
   }
 
   // White Karst limestone nave, terracotta gable roof, tall campanile with a
-  // tapered spire and a golden finial cross. Covers Sveta Gora, Kostanjevica
-  // and the Piran bell tower alike (the scale field differentiates them).
-  _buildChurch(parent, lm) {
+  // tapered spire and a golden finial cross. Both nave and campanile are
+  // individually corner-grounded so hilltop basilicas never float or bury.
+  _buildChurch(parent, lm, heightAt = terrainHeight) {
     const s = lm.scale;
     const naveW = 15 * s;
     const naveH = 11 * s;
     const naveD = 28 * s;
     const roofRise = naveW * 0.34;
-
-    this._foundation(parent, naveW + 5, naveD + 5, COL.limestoneDark);
-    this._box(parent, COL.limestoneDark, 0, 0.45, 0, naveW + 2.4, 1.5, naveD + 2.4);
-    this._box(parent, COL.limestone, 0, naveH * 0.5 + 1, 0, naveW, naveH, naveD);
-    this._gableRoof(parent, COL.terracotta, naveW + 0.8, naveD + 1.2, roofRise, naveH + 1);
-
-    // Apse at the liturgical east end.
-    this._cyl(parent, COL.limestone, 0, naveH * 0.42 + 1, naveD * 0.5 + 1.5, naveW * 0.32, naveH * 0.8, 8);
-    this._cone(parent, COL.terracotta, 0, naveH * 0.86 + 1, naveD * 0.5 + 1.5, naveW * 0.36, roofRise * 0.8, 8);
-
-    // Front portal + a row of dark arched windows along both long walls.
-    this._box(parent, COL.window, 0, 3.1 * s + 1, naveD * 0.5 + 0.12, 3.2 * s, 4.6 * s, 0.3);
-    for (let i = -1; i <= 1; i++) {
-      this._box(parent, COL.window, naveW * 0.5 + 0.1, naveH * 0.62 + 1, i * 8 * s, 0.25, 3.4 * s, 1.5 * s);
-      this._box(parent, COL.window, -naveW * 0.5 - 0.1, naveH * 0.62 + 1, i * 8 * s, 0.25, 3.4 * s, 1.5 * s);
-    }
-
-    // Campanile: square shaft, belfry with open arches, cornice, spire, cross.
     const towerW = 7 * s;
     const towerH = 30 * s;
     const tz = -naveD * 0.5 - towerW * 0.5 - 1;
-    this._foundation(parent, towerW + 3, towerW + 3, COL.limestoneDark);
-    this._box(parent, COL.limestone, 0, towerH * 0.5, tz, towerW, towerH, towerW);
-    this._box(parent, COL.limestoneDark, 0, towerH * 0.86, tz, towerW * 1.06, 1.2 * s, towerW * 1.06);
+
+    const naveRange = footprintRange(lm, heightAt, 0, 0, naveW + 4, naveD + 4);
+    const towerRange = footprintRange(lm, heightAt, 0, tz, towerW + 3, towerW + 3);
+    const baseY = Math.max(0, naveRange.maxY - 1.5);
+
+    this._foundation(parent, naveW + 5, naveD + 5, COL.limestoneDark, 0, 0, baseY + 0.8, naveRange.minY - 6.0);
+    this._box(parent, COL.limestoneDark, 0, baseY + 0.45, 0, naveW + 2.4, 1.5, naveD + 2.4);
+    this._box(parent, COL.limestone, 0, baseY + naveH * 0.5 + 1, 0, naveW, naveH, naveD);
+    this._gableRoof(parent, COL.terracotta, naveW + 0.8, naveD + 1.2, roofRise, baseY + naveH + 1);
+
+    // Apse at the liturgical east end.
+    this._cyl(parent, COL.limestone, 0, baseY + naveH * 0.42 + 1, naveD * 0.5 + 1.5, naveW * 0.32, naveH * 0.8, 8);
+    this._cone(parent, COL.terracotta, 0, baseY + naveH * 0.86 + 1, naveD * 0.5 + 1.5, naveW * 0.36, roofRise * 0.8, 8);
+
+    // Front portal + a row of dark arched windows along both long walls.
+    this._box(parent, COL.window, 0, baseY + 3.1 * s + 1, naveD * 0.5 + 0.12, 3.2 * s, 4.6 * s, 0.3);
+    for (let i = -1; i <= 1; i++) {
+      this._box(parent, COL.window, naveW * 0.5 + 0.1, baseY + naveH * 0.62 + 1, i * 8 * s, 0.25, 3.4 * s, 1.5 * s);
+      this._box(parent, COL.window, -naveW * 0.5 - 0.1, baseY + naveH * 0.62 + 1, i * 8 * s, 0.25, 3.4 * s, 1.5 * s);
+    }
+
+    // Campanile: independently anchored at (0, tz) down to its own corners.
+    this._foundation(parent, towerW + 3, towerW + 3, COL.limestoneDark, 0, tz, baseY + 0.8, towerRange.minY - 6.0);
+    this._box(parent, COL.limestone, 0, baseY + towerH * 0.5, tz, towerW, towerH, towerW);
+    this._box(parent, COL.limestoneDark, 0, baseY + towerH * 0.86, tz, towerW * 1.06, 1.2 * s, towerW * 1.06);
     // Belfry openings on all four faces.
     for (let f = 0; f < 4; f++) {
       const a = (f * Math.PI) / 2;
       this._box(
         parent, COL.window,
-        Math.sin(a) * towerW * 0.5, towerH * 0.74, tz + Math.cos(a) * towerW * 0.5,
+        Math.sin(a) * towerW * 0.5, baseY + towerH * 0.74, tz + Math.cos(a) * towerW * 0.5,
         Math.abs(Math.sin(a)) > 0.5 ? 0.3 : towerW * 0.42,
         6 * s,
         Math.abs(Math.cos(a)) > 0.5 ? 0.3 : towerW * 0.42,
       );
     }
     const spireH = 12 * s;
-    this._cone(parent, COL.terracotta, 0, towerH + spireH * 0.5 - 0.4, tz, towerW * 0.62, spireH, 4, 0, Math.PI / 4);
+    this._cone(parent, COL.terracotta, 0, baseY + towerH + spireH * 0.5 - 0.4, tz, towerW * 0.62, spireH, 4, 0, Math.PI / 4);
     // Golden finial ball + cross.
-    const finialY = towerH + spireH - 0.4;
+    const finialY = baseY + towerH + spireH - 0.4;
     this._sphere(parent, COL.gold, 0, finialY + 0.7 * s, tz, 0.75 * s, { metalness: 0.7, roughness: 0.35 });
     this._box(parent, COL.gold, 0, finialY + 2.9 * s, tz, 0.28 * s, 3.4 * s, 0.28 * s, 0, 0, 0, { metalness: 0.7, roughness: 0.35 });
     this._box(parent, COL.gold, 0, finialY + 3.6 * s, tz, 1.7 * s, 0.28 * s, 0.28 * s, 0, 0, 0, { metalness: 0.7, roughness: 0.35 });
+
+    lm._groundMeta = { baseY, naveRange, towerRange };
   }
 
-  // Multi-span arch viaduct / stone bridge: piers down to the valley floor, a
-  // grand semicircular central arch of voussoirs, roadway deck and parapets.
-  // Solkan (220 m, 36 m) and the Vipava H4 viaduct (340 m, 28 m).
-  _buildBridge(parent, lm) {
+  // Terrain-conforming multi-span arch viaduct / stone bridge: samples both
+  // banks and the valley floor, caps deck grade at 8%, never buries the road,
+  // and independently roots every pier deep into its own local ground.
+  _buildBridge(parent, lm, heightAt = terrainHeight) {
     const length = lm.length || 220;
     const height = lm.height || 34;
     const deckW = 9.5 * Math.min(1.4, lm.scale);
-    const deckY = height;
     const pierW = 4.6;
     const pierD = deckW * 0.72;
     const span = Math.min(length * 0.42, Math.max(28, height * 1.7));
     const archR = span * 0.5;
 
-    // Deck + parapets + a pale roadway centre strip.
-    this._box(parent, COL.concrete, 0, deckY, 0, length, 1.7, deckW);
-    this._box(parent, COL.stone, 0, deckY + 1.45, 0, length, 0.25, deckW * 0.62);
-    this._box(parent, COL.stone, 0, deckY + 1.4, deckW * 0.5 - 0.4, length, 1.3, 0.7);
-    this._box(parent, COL.stone, 0, deckY + 1.4, -deckW * 0.5 + 0.4, length, 1.3, 0.7);
+    // Sample terrain profile across the entire bridge span.
+    const sampleTs = [-0.5, -0.35, -0.2, 0, 0.2, 0.35, 0.5];
+    const samples = sampleTs.map((t) => {
+      const lx = t * length;
+      return { t, lx, g: localGroundY(lm, heightAt, lx, 0) };
+    });
+    const yStart = samples[0].g;
+    const yEnd = samples[samples.length - 1].g;
+    let yMinSpan = Infinity;
+    let yMaxSpan = -Infinity;
+    for (let i = 0; i < samples.length; i++) {
+      const g = samples[i].g;
+      if (g > yMaxSpan) yMaxSpan = g;
+      if (i > 0 && i < samples.length - 1 && g < yMinSpan) yMinSpan = g;
+    }
+    if (!Number.isFinite(yMinSpan)) yMinSpan = Math.min(yStart, yEnd);
+
+    // Bank-to-bank deck elevation with max 8% bridge grade and guaranteed
+    // clearance over both the gorge floor and any intermediate terrain crest.
+    let deckA = Math.max(yStart + 1.2, yMinSpan + Math.min(height, 18));
+    let deckB = Math.max(yEnd + 1.2, yMinSpan + Math.min(height, 18));
+    const maxGradeDelta = length * 0.08;
+    if (deckA < deckB - maxGradeDelta) deckA = deckB - maxGradeDelta;
+    else if (deckB < deckA - maxGradeDelta) deckB = deckA - maxGradeDelta;
+
+    const minInteriorDeck = Math.max(yMaxSpan + 0.8, yMinSpan + Math.min(height, 26));
+    const deckYRaw = (lx) => deckA + (deckB - deckA) * ((lx + length * 0.5) / length);
+    let lift = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      const need = (i === 0 || i === samples.length - 1)
+        ? Math.max(s.g + 1.2, minInteriorDeck - maxGradeDelta)
+        : Math.max(s.g + 1.2, minInteriorDeck);
+      const cur = deckYRaw(s.lx);
+      if (need > cur) lift = Math.max(lift, need - cur);
+    }
+    deckA += lift;
+    deckB += lift;
+
+    const deckYAt = (lx) => deckA + (deckB - deckA) * ((lx + length * 0.5) / length);
+    const deckMidY = (deckA + deckB) * 0.5;
+    const deckPitch = Math.atan2(deckB - deckA, length);
+    const deckLen = Math.hypot(length, deckB - deckA);
+
+    // Sloped deck assembly (deck slab, pale roadway strip, side parapets).
+    const deckGroup = new THREE.Group();
+    deckGroup.position.set(0, deckMidY, 0);
+    deckGroup.rotation.z = deckPitch;
+    parent.add(deckGroup);
+    this._box(deckGroup, COL.concrete, 0, 0, 0, deckLen, 1.7, deckW);
+    this._box(deckGroup, COL.stone, 0, 0.98, 0, deckLen, 0.25, deckW * 0.62);
+    this._box(deckGroup, COL.stone, 0, 1.4, deckW * 0.5 - 0.4, deckLen, 1.3, 0.7);
+    this._box(deckGroup, COL.stone, 0, 1.4, -deckW * 0.5 + 0.4, deckLen, 1.3, 0.7);
 
     // Piers: two flanking the central arch, plus extra spans outwards.
     const pierXs = [-length * 0.5 + 3, -span * 0.5, span * 0.5, length * 0.5 - 3];
     for (let x = -length * 0.5 + 3 + 52; x < -span * 0.5 - 30; x += 52) pierXs.push(x);
     for (let x = span * 0.5 + 52; x < length * 0.5 - 30; x += 52) pierXs.push(x);
+    pierXs.sort((a, b) => a - b);
 
+    const pierGrounds = [];
     for (const px of pierXs) {
-      this._foundation(parent, pierW + 1.5, pierD + 1.5, COL.concreteDark);
-      this._box(parent, COL.stone, px, (height - 0.9) * 0.5, 0, pierW, height - 0.9, pierD);
-      // Small cutwater taper at the base.
-      this._box(parent, COL.concreteDark, px, 1.6, 0, pierW * 1.25, 3.2, pierD * 1.18);
+      const gPier = Math.min(
+        localGroundY(lm, heightAt, px, -pierD * 0.5),
+        localGroundY(lm, heightAt, px, 0),
+        localGroundY(lm, heightAt, px, pierD * 0.5),
+      );
+      const pierDeckY = deckYAt(px);
+      const pierTop = pierDeckY - 0.8;
+      const pierBot = gPier - 6.0;
+      const pierH = Math.max(2.0, pierTop - pierBot);
+
+      // Deep footing anchored at `(px, 0)` (never hardcoded at origin!).
+      this._foundation(parent, pierW + 1.5, pierD + 1.5, COL.concreteDark, px, 0, gPier + 0.6, pierBot);
+      this._box(parent, COL.stone, px, pierBot + pierH * 0.5, 0, pierW, pierH, pierD);
+      // Cutwater collar seated right at the local pier ground.
+      this._box(parent, COL.concreteDark, px, gPier + 1.0, 0, pierW * 1.25, 3.2, pierD * 1.18);
+
+      pierGrounds.push({ px, gPier, pierBot, pierTop, deckY: pierDeckY });
     }
 
-    // Grand central arch: voussoir blocks along a semicircle from spring to
-    // spring, crown tucked right under the deck underside.
-    const springY = height - 0.9 - archR;
+    // Grand central arch: voussoir blocks springing cleanly from the two
+    // central flanking piers right below the deck underside.
+    const deckCenterY = deckYAt(0);
+    const gLeftPier = localGroundY(lm, heightAt, -archR, 0);
+    const gRightPier = localGroundY(lm, heightAt, archR, 0);
+    const archRise = Math.min(archR, Math.max(6.0, deckCenterY - Math.min(gLeftPier, gRightPier) - 1.5));
+    const springY = deckCenterY - 0.9 - archRise;
     const voussoirs = Math.max(9, Math.round((Math.PI * archR) / 9));
     const seg = (Math.PI * archR) / voussoirs;
     for (let i = 0; i < voussoirs; i++) {
       const a = Math.PI - (i + 0.5) * (Math.PI / voussoirs);
+      const vx = Math.cos(a) * archR;
+      const vy = springY + Math.sin(a) * archRise;
+      const dx = -Math.sin(a) * archR;
+      const dy = Math.cos(a) * archRise;
+      const tilt = Math.atan2(dy, dx);
       this._box(
         parent, COL.stone,
-        Math.cos(a) * archR, springY + Math.sin(a) * archR, 0,
-        seg * 1.16, 1.5, pierD * 0.9,
-        0, 0, a - Math.PI / 2,
+        vx, vy, 0,
+        seg * 1.18, 1.5, pierD * 0.9,
+        0, 0, tilt,
       );
     }
-    // Spandrel infill above the arch haunches, so the opening reads as an arch.
+    // Spandrel infill walls between the arch haunches and the deck underside.
     for (const side of [-1, 1]) {
-      this._box(parent, COL.stone, side * (archR * 0.72 + span * 0.5), springY + archR * 0.86, 0,
-        archR * 0.5, archR * 0.5, pierD * 0.9);
+      const sx = side * archR * 0.72;
+      const haunchY = springY + archRise * 0.68;
+      const topUnder = deckYAt(sx) - 0.85;
+      const spH = Math.max(1.2, topUnder - haunchY);
+      this._box(parent, COL.stone, sx, haunchY + spH * 0.5, 0, archR * 0.46, spH, pierD * 0.88);
     }
+
+    lm._groundMeta = { deckA, deckB, deckMidY, pierGrounds };
   }
 
-  // Massive sloped concrete dam (Solkan / Vogršček): gravity wall leaning
-  // downstream, crest walkway with intake towers, and spillway chutes.
-  _buildDam(parent, lm) {
+  // Canyon-anchored concrete gravity dam (Solkan / Vogršček): samples the
+  // entire dam axis so neither wing floats nor sinks below the canyon floor.
+  _buildDam(parent, lm, heightAt = terrainHeight) {
     const length = lm.length || 180;
     const height = lm.height || 28;
     const baseThick = Math.max(9, height * 0.42);
 
-    this._foundation(parent, length + 4, baseThick + 4, COL.concreteDark);
-    // Gravity wall: a thick slab leaning ~8 degrees downstream (local -Z).
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const t of [-0.5, -0.25, 0, 0.25, 0.5]) {
+      const lx = t * length;
+      for (const lz of [-baseThick * 0.5, 0, baseThick * 0.5]) {
+        const g = localGroundY(lm, heightAt, lx, lz);
+        if (g < minY) minY = g;
+        if (g > maxY) maxY = g;
+      }
+    }
+    const crestY = Math.max(height, maxY + 2.0);
+    const botY = minY - 6.0;
+    const wallH = Math.max(4.0, crestY - botY);
+
+    this._foundation(parent, length + 4, baseThick + 4, COL.concreteDark, 0, 0, minY + 1.0, botY);
+    // Gravity wall leaning ~8 degrees downstream (local -Z).
     this._box(
-      parent, COL.concrete, 0, height * 0.5 + 0.6, 0,
-      length, height * 1.04, baseThick,
+      parent, COL.concrete, 0, botY + wallH * 0.5, 0,
+      length, wallH * 1.02, baseThick,
       -0.14, 0, 0,
     );
     // Crest walkway.
-    this._box(parent, COL.concreteDark, 0, height + 1.4, 0, length, 1.2, baseThick * 0.8);
-    // Downstream toe buttress.
-    this._box(parent, COL.concreteDark, 0, 1.4, -baseThick * 0.42, length * 0.99, 2.8, baseThick * 0.7);
+    this._box(parent, COL.concreteDark, 0, crestY + 0.6, 0, length, 1.2, baseThick * 0.8);
+    // Downstream toe buttress rooted down to `botY`.
+    const toeTop = minY + 3.2;
+    const toeH = Math.max(2.8, toeTop - botY);
+    this._box(parent, COL.concreteDark, 0, botY + toeH * 0.5, -baseThick * 0.42, length * 0.99, toeH, baseThick * 0.7);
 
     // Spillway chutes running down the downstream face.
     const chutes = 4;
     for (let i = 0; i < chutes; i++) {
       const cx = (i - (chutes - 1) * 0.5) * (length / (chutes + 1.4));
-      this._box(parent, COL.steelDark, cx, height * 0.5 + 0.4, -baseThick * 0.46,
-        length / (chutes + 1.4) * 0.42, height * 0.98, 1.4, -0.14, 0, 0);
+      this._box(parent, COL.steelDark, cx, botY + wallH * 0.5, -baseThick * 0.46,
+        (length / (chutes + 1.4)) * 0.42, wallH * 0.96, 1.4, -0.14, 0, 0);
       // Chute lip / stilling basin block at the toe.
-      this._box(parent, COL.concreteDark, cx, 1.2, -baseThick * 0.72, length / (chutes + 1.4) * 0.5, 2.4, 3.2);
+      this._box(parent, COL.concreteDark, cx, botY + toeH * 0.5, -baseThick * 0.72,
+        (length / (chutes + 1.4)) * 0.5, toeH * 0.85, 3.2);
     }
 
     // Crest intake towers + gate blocks.
     const intakes = 3;
     for (let i = 0; i < intakes; i++) {
       const ix = (i - (intakes - 1) * 0.5) * (length * 0.26);
-      this._box(parent, COL.concrete, ix, height + 3.4, 0, 7, 9.5, baseThick * 0.5);
-      this._box(parent, COL.steelDark, ix, height + 8.4, 0, 8, 0.6, baseThick * 0.58);
+      this._box(parent, COL.concrete, ix, crestY + 2.6, 0, 7, 9.5, baseThick * 0.5);
+      this._box(parent, COL.steelDark, ix, crestY + 7.6, 0, 8, 0.6, baseThick * 0.58);
     }
+
+    lm._groundMeta = { botY, crestY, minY, maxY };
   }
 
   // Red-and-white striped broadcast mast with dish platforms and a blinking
   // red aviation strobe at the top (Nanos / Pleša is 95 m).
-  _buildTower(parent, lm) {
+  _buildTower(parent, lm, heightAt = terrainHeight) {
     const height = lm.height || 90;
     const sections = Math.max(6, Math.min(16, Math.round(height / 8)));
     const segH = height / sections;
     const baseR = Math.max(1.4, height * 0.024);
     const topR = Math.max(0.55, baseR * 0.38);
 
-    this._foundation(parent, baseR * 5, baseR * 5, COL.concreteDark);
-    this._box(parent, COL.concrete, 0, 0.75, 0, baseR * 4.4, 1.5, baseR * 4.4);
+    const padRange = footprintRange(lm, heightAt, 0, 0, baseR * 5, baseR * 5);
+    const baseY = Math.max(0, padRange.maxY - 0.5);
 
-    let y = 1.5;
+    this._foundation(parent, baseR * 5, baseR * 5, COL.concreteDark, 0, 0, baseY + 0.8, padRange.minY - 6.0);
+    this._box(parent, COL.concrete, 0, baseY + 0.75, 0, baseR * 4.4, 1.5, baseR * 4.4);
+
+    let y = baseY + 1.5;
     for (let i = 0; i < sections; i++) {
       const t0 = i / sections;
       const t1 = (i + 1) / sections;
@@ -673,7 +812,7 @@ export class LandmarkSystem {
 
     // Steel dish platforms + microwave drums.
     for (const frac of [0.42, 0.68]) {
-      const py = height * frac;
+      const py = baseY + height * frac;
       const pr = baseR * 2.6;
       this._cyl(parent, COL.steelDark, 0, py, 0, pr, 0.5, 8);
       for (let d = 0; d < 3; d++) {
@@ -684,7 +823,7 @@ export class LandmarkSystem {
     }
 
     // Top mast cap + blinking red strobe beacon.
-    this._cyl(parent, COL.steelDark, 0, height + 1.4, 0, topR * 1.5, 2.8, 8);
+    this._cyl(parent, COL.steelDark, 0, baseY + height + 1.4, 0, topR * 1.5, 2.8, 8);
     const beaconMat = new THREE.MeshStandardMaterial({
       color: COL.beaconRed,
       emissive: COL.beaconRed,
@@ -696,7 +835,7 @@ export class LandmarkSystem {
     beaconMat.color.convertSRGBToLinear();
     beaconMat.emissive.convertSRGBToLinear();
     const beacon = new THREE.Mesh(this._resources().sphere, beaconMat);
-    beacon.position.set(0, height + 3.6, 0);
+    beacon.position.set(0, baseY + height + 3.6, 0);
     beacon.scale.setScalar(1.6);
     parent.add(beacon);
     this._beacons.push({
@@ -706,11 +845,13 @@ export class LandmarkSystem {
       phase: (lm.phase ?? lm.x * 0.013 + lm.z * 0.007) % (Math.PI * 2),
       speed: 4 + (Math.abs(lm.z) % 900) * 0.0012,
     });
+
+    lm._groundMeta = { baseY, padRange };
   }
 
   // Limestone keep, crenellated curtain walls and round corner towers.
-  // Gorizia, Predjama and Štanjel.
-  _buildCastle(parent, lm) {
+  // Curtain wall plinth & every corner tower independently reach below ground.
+  _buildCastle(parent, lm, heightAt = terrainHeight) {
     const s = lm.scale;
     const yard = 32 * s;
     const wallH = 9 * s;
@@ -718,18 +859,21 @@ export class LandmarkSystem {
     const keepW = 14 * s;
     const keepH = 20 * s;
 
-    this._foundation(parent, yard + 10, yard + 10, COL.limestoneDark);
-    this._box(parent, COL.stone, 0, 1.2, 0, yard + 6, 2.4, yard + 6);
+    const castRange = footprintRange(lm, heightAt, 0, 0, yard + 10, yard + 10);
+    const baseY = Math.max(0, castRange.maxY - 2.0);
+
+    this._foundation(parent, yard + 10, yard + 10, COL.limestoneDark, 0, 0, baseY + 1.2, castRange.minY - 6.0);
+    this._box(parent, COL.stone, 0, baseY + 1.2, 0, yard + 6, 2.4, yard + 6);
 
     // Curtain walls (four sides) with crenellations along the top.
-    this._box(parent, COL.stone, 0, wallH * 0.5 + 2.2, yard * 0.5, yard, wallH, wallT);
-    this._box(parent, COL.stone, 0, wallH * 0.5 + 2.2, -yard * 0.5, yard, wallH, wallT);
-    this._box(parent, COL.stone, yard * 0.5, wallH * 0.5 + 2.2, 0, wallT, wallH, yard);
-    this._box(parent, COL.stone, -yard * 0.5, wallH * 0.5 + 2.2, 0, wallT, wallH, yard);
+    this._box(parent, COL.stone, 0, baseY + wallH * 0.5 + 2.2, yard * 0.5, yard, wallH, wallT);
+    this._box(parent, COL.stone, 0, baseY + wallH * 0.5 + 2.2, -yard * 0.5, yard, wallH, wallT);
+    this._box(parent, COL.stone, yard * 0.5, baseY + wallH * 0.5 + 2.2, 0, wallT, wallH, yard);
+    this._box(parent, COL.stone, -yard * 0.5, baseY + wallH * 0.5 + 2.2, 0, wallT, wallH, yard);
 
     const merlon = 2.4 * s;
     const step = merlon * 1.9;
-    const topY = wallH + 2.2 + merlon * 0.5;
+    const topY = baseY + wallH + 2.2 + merlon * 0.5;
     const count = Math.floor(yard / step);
     for (let i = 0; i <= count; i++) {
       const t = (i / count - 0.5) * yard * 0.96;
@@ -740,15 +884,15 @@ export class LandmarkSystem {
     }
 
     // Central keep with a terracotta hipped roof and a small inner courtyard.
-    this._box(parent, COL.limestone, 0, keepH * 0.5 + 2, 0, keepW, keepH, keepW);
-    this._box(parent, COL.limestoneDark, 0, keepH + 2.4, 0, keepW * 1.08, 1.2, keepW * 1.08);
-    this._gableRoof(parent, COL.terracotta, keepW * 1.06, keepW * 1.06, keepW * 0.42, keepH + 3);
+    this._box(parent, COL.limestone, 0, baseY + keepH * 0.5 + 2, 0, keepW, keepH, keepW);
+    this._box(parent, COL.limestoneDark, 0, baseY + keepH + 2.4, 0, keepW * 1.08, 1.2, keepW * 1.08);
+    this._gableRoof(parent, COL.terracotta, keepW * 1.06, keepW * 1.06, keepW * 0.42, baseY + keepH + 3);
     // Keep windows.
     for (let i = 0; i < 3; i++) {
-      this._box(parent, COL.window, 0, keepH * (0.35 + i * 0.2) + 2, keepW * 0.5 + 0.1, 2.4, 2.6, 0.3);
+      this._box(parent, COL.window, 0, baseY + keepH * (0.35 + i * 0.2) + 2, keepW * 0.5 + 0.1, 2.4, 2.6, 0.3);
     }
 
-    // Round corner towers with conical roofs and crenellated galleries.
+    // Round corner towers: each tower's base extends down to its own local ground - 6 m.
     const towers = [
       [1, 1], [-1, 1], [1, -1], [-1, -1],
     ];
@@ -756,42 +900,50 @@ export class LandmarkSystem {
       const tx = sx * yard * 0.5;
       const tz = sz * yard * 0.5;
       const r = 5.4 * s;
-      const th = wallH + 5 * s;
-      this._cyl(parent, COL.stone, tx, th * 0.5 + 1, tz, r, th, 8);
-      this._cyl(parent, COL.limestoneDark, tx, th + 1, tz, r * 1.14, 1.2, 8);
-      this._cone(parent, COL.terracotta, tx, th + 4.2 * s, tz, r * 1.05, 6.4 * s, 8);
+      const towerTop = baseY + wallH + 5 * s + 1;
+      const tRange = footprintRange(lm, heightAt, tx, tz, r * 2.2, r * 2.2);
+      const tBot = tRange.minY - 6.0;
+      const th = Math.max(wallH + 5 * s, towerTop - tBot);
+      this._cyl(parent, COL.stone, tx, tBot + th * 0.5, tz, r, th, 8);
+      this._cyl(parent, COL.limestoneDark, tx, towerTop, tz, r * 1.14, 1.2, 8);
+      this._cone(parent, COL.terracotta, tx, towerTop + 3.2 * s, tz, r * 1.05, 6.4 * s, 8);
       for (let m = 0; m < 8; m++) {
         const a = (m / 8) * Math.PI * 2;
         this._box(parent, COL.limestoneDark,
-          tx + Math.cos(a) * r * 0.92, th + 2.4 * s, tz + Math.sin(a) * r * 0.92,
+          tx + Math.cos(a) * r * 0.92, towerTop + 1.4 * s, tz + Math.sin(a) * r * 0.92,
           merlon * 0.8, merlon * 0.8, merlon * 0.8);
       }
     }
+
+    lm._groundMeta = { baseY, castRange };
   }
 
   // Faro della Vittoria: fluted white monument column, lantern gallery and a
   // pulsing bright white beacon with an additive halo.
-  _buildLighthouse(parent, lm) {
+  _buildLighthouse(parent, lm, heightAt = terrainHeight) {
     const height = lm.height || 60;
     const shaftH = height * 0.78;
     const baseR = Math.max(2.2, height * 0.07);
     const topR = baseR * 0.62;
 
-    this._foundation(parent, baseR * 5.5, baseR * 5.5, COL.stone);
+    const padRange = footprintRange(lm, heightAt, 0, 0, baseR * 5.5, baseR * 5.5);
+    const baseY = Math.max(0, padRange.maxY - 0.5);
+
+    this._foundation(parent, baseR * 5.5, baseR * 5.5, COL.stone, 0, 0, baseY + 0.8, padRange.minY - 6.0);
     // Octagonal podium, then the fluted tapered shaft.
-    this._cyl(parent, COL.stone, 0, 1.8, 0, baseR * 2.3, 3.6, 8);
-    this._cyl(parent, COL.white, 0, shaftH * 0.5 + 2.6, 0, (baseR + topR) * 0.5, shaftH, 16);
+    this._cyl(parent, COL.stone, 0, baseY + 1.8, 0, baseR * 2.3, 3.6, 8);
+    this._cyl(parent, COL.white, 0, baseY + shaftH * 0.5 + 2.6, 0, (baseR + topR) * 0.5, shaftH, 16);
     // Fluting ribs around the shaft.
     for (let i = 0; i < 12; i++) {
       const a = (i / 12) * Math.PI * 2;
       const r = baseR * 0.98;
       this._box(parent, COL.limestoneDark,
-        Math.cos(a) * r, shaftH * 0.5 + 2.6, Math.sin(a) * r,
+        Math.cos(a) * r, baseY + shaftH * 0.5 + 2.6, Math.sin(a) * r,
         0.4, shaftH * 0.96, 0.4, 0, -a, 0);
     }
 
     // Lantern gallery + cupola.
-    const galleryY = shaftH + 3.4;
+    const galleryY = baseY + shaftH + 3.4;
     this._cyl(parent, COL.stone, 0, galleryY, 0, topR * 2.3, 1.2, 16);
     this._cyl(parent, COL.limestoneDark, 0, galleryY + 1.5, 0, topR * 2.0, 1.6, 16);
     this._cyl(parent, COL.white, 0, galleryY + 3.4, 0, topR * 1.35, 3.8, 16);
@@ -832,5 +984,7 @@ export class LandmarkSystem {
       phase: (lm.phase ?? lm.x * 0.009 - lm.z * 0.005) % (Math.PI * 2),
       speed: 1.6,
     });
+
+    lm._groundMeta = { baseY, padRange };
   }
 }

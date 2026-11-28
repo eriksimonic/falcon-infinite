@@ -27,20 +27,27 @@ import { MissionDirector, MISSIONS } from './combat/missions.js';
 import { CanyonRunSystem } from './combat/canyon_run.js';
 import { PostFXSystem } from './sim/postfx.js';
 import { FlightJuiceSystem } from './sim/juice.js';
-import { WeaponCamSystem, PhotoModeController } from './aircraft/weapon_cam.js';
+import { WeaponCamSystem, PhotoModeController, FreeCamController } from './aircraft/weapon_cam.js';
 import { HUD } from './ui/hud.js';
 import { TacticalOverlay } from './ui/tactical.js';
 import { KneeboardMap } from './ui/kneeboard.js';
+import { InspectorMap } from './ui/inspector_map.js';
 import { UI } from './ui/menu.js';
 import { spawnPoint, airportNear, airportsNear, setActiveDEM, setCustomAirports, terrainHeight } from './world/terrain.js';
-import { loadVipavaDEM, loadVipavaOSM, loadVipavaWater } from './world/dem.js';
-import { settlementsNear } from './world/settlements.js';
+import { loadVipavaDEM, loadVipavaOSM, loadVipavaBuildings, loadVipavaWater } from './world/dem.js';
+import { settlementsNear, clearSettlementCaches } from './world/settlements.js';
 import { clamp } from './world/noise.js';
 
 const NEUTRAL_CMD = {
   pitch: 0, roll: 0, yaw: 0, throttleDelta: 0,
   gearToggle: false, flapsToggle: false, brake: false,
 };
+
+// Feature 41: localStorage slot holding the last Free Cam pose + environment.
+const LAST_VIEW_KEY = 'falcon.lastView.v1';
+// FreeCamController clamps its speed to 15..5000 m/s; mirror that on restore.
+const LAST_VIEW_SPEED_MIN = 15;
+const LAST_VIEW_SPEED_MAX = 5000;
 
 class App {
   constructor() {
@@ -128,6 +135,8 @@ class App {
       // Feature 33: floating Photo Mode bar buttons.
       onPhotoSave: () => this._savePhoto(),
       onPhotoExit: () => this.exitPhotoMode(),
+      onFreeCamMap: () => this.toggleInspectorMap(),
+      onFreeCamExit: () => this.exitFreeCam(),
     });
 
     this.time = new TimeSystem();
@@ -179,6 +188,40 @@ class App {
     this.juice = new FlightJuiceSystem();
     this.weaponCam = new WeaponCamSystem();
     this.photoMode = new PhotoModeController();
+    this.freeCam = new FreeCamController();
+    this._freeCamReturnMode = 'fly';
+    this._freeCamBarTimer = 0;
+    // Feature 41: throttle for the last-view autosave, and the theater that is
+    // actually loaded right now (so a restore knows whether to switch).
+    this._lastViewTimer = 0;
+    this._activeTheater = null;
+    this._vipavaRoads = [];
+    this._vipavaWater = null;
+    this.inspectorMap = new InspectorMap({
+      onTeleport: (x, z, agl, closeMap) => {
+        const ground = this.world.heightAt(x, z);
+        this.freeCam.teleport(x, ground + agl, z, this.freeCam.yaw, -0.38);
+        if (closeMap) {
+          this.inspectorMap.hide();
+        } else {
+          this.inspectorMap.render(this._inspectorState());
+        }
+        this.ui.toast(`TELEPORT · (${Math.round(x)}, ${Math.round(z)}) · AGL ${agl} M`);
+        this._saveLastView();
+      },
+      onTime: (h) => {
+        this.time.setHour(h);
+        this._saveLastView();
+      },
+      onWeather: (w) => {
+        this.weather.setPreset(w, true);
+        this._saveLastView();
+      },
+      onClose: () => {
+        if (this.freeCam.active) this.input.requestPointerLock();
+      },
+    });
+    this.inspectorMap.attach(document.getElementById('inspector-map'));
     this._canyonState = null;
     this._juiceState = null;
     this._weaponCamState = null;
@@ -207,6 +250,13 @@ class App {
 
     window.addEventListener('resize', () => this.resize());
     window.addEventListener('keydown', (e) => this.onKey(e));
+
+    // Feature 41: flush the Free Cam pose on tab hide / reload. Guarded so a
+    // headless import of this module never touches a missing global.
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', () => this._saveLastView());
+      window.addEventListener('pagehide', () => this._saveLastView());
+    }
     window.addEventListener('mousedown', (e) => {
       if (this.mode === 'fly' && this.kneeboard.visible && e.button === 0) {
         const f = this.aircraft.flight;
@@ -287,6 +337,10 @@ class App {
       this.ready = true;
       this.ui.showMenu();
       this.last = performance.now();
+      // Feature 41: if the last session ended inside Free Cam, drop straight
+      // back onto that pose. No pointer lock here — it needs a user gesture,
+      // and clicking the canvas already grabs it while Free Cam is active.
+      await this._restoreLastView();
       requestAnimationFrame(this.loop);
     } catch (err) {
       console.error(err);
@@ -323,6 +377,7 @@ class App {
     this.postfx.setEnabled(q.name !== 'low');
     this.resize();
     this.ui.toast('QUALITY · ' + name.toUpperCase());
+    this._saveLastView();
   }
 
   /**
@@ -333,6 +388,7 @@ class App {
   async setTheater(name) {
     const th = THEATERS[name];
     if (!th) return;
+    this._activeTheater = name;
     this.sky.setTheater(name);
     this.world.setTheater(name);
     // Feature 33: the canyon course belongs to the Vipava height field; tear it
@@ -343,14 +399,21 @@ class App {
     if (name === 'vipava') {
       let dem = null;
       let osm = null;
+      let buildingsBin = null;
       let water = null;
       try {
-        dem = await loadVipavaDEM(
-          th.demUrl || './media/vipava_dem.png',
-          th.metaUrl || './media/vipava_meta.json',
-        );
-        osm = await loadVipavaOSM();
-        water = await loadVipavaWater();
+        [dem, osm, buildingsBin, water] = await Promise.all([
+          loadVipavaDEM(
+            th.demUrl || './media/vipava_dem.png',
+            th.metaUrl || './media/vipava_meta.json',
+          ).catch((err) => {
+            console.warn('VIPAVA · DEM load failed, keeping procedural terrain', err);
+            return null;
+          }),
+          loadVipavaOSM().catch(() => null),
+          loadVipavaBuildings().catch(() => null),
+          loadVipavaWater().catch(() => null),
+        ]);
       } catch (err) {
         console.warn('VIPAVA · dataset load failed, keeping procedural terrain', err);
       }
@@ -358,23 +421,32 @@ class App {
       const customAirports = dem?.meta?.airports || null;
       if (dem) {
         setActiveDEM(dem);
+        // Procedural site caches may hold settlements chosen against the old
+        // procedural land (now open sea); rebuild them on the real terrain.
+        clearSettlementCaches();
         // The real fields (LJAJ, LJPO, LJDI, LIPQ, LJPZ) replace the procedural
         // grid, so the terrain flattens and runways are paved where they are.
         setCustomAirports(customAirports);
-        this.world.buildings.setCustomBuildings(osm?.buildings || null);
+        // Feature 38/39/41: full 53k binary OSM buildings + urban ground zones,
+        // falling back seamlessly to the compact JSON list if needed.
+        this.world.buildings.setCustomBuildings(
+          buildingsBin?.records || osm?.buildings || null,
+          osm?.urbanZones || null,
+        );
         this.world.roads.setCustomRoads(osm?.roads || null);
-        // Feature 31/33: hand the H4 + valley arteries to the traffic pools so
-        // head/tail-light streaks hug the real asphalt at night.
+        // Feature 31/33/40: hand the H4 + valley arteries (with bridge tags)
+        // to the traffic pools so head/tail-light streaks ride over viaducts.
         this.world.roadTraffic.setCustomRoads(
           osm?.roads || [],
           (x, z) => this.world.heightAt(x, z),
         );
-        // Real OSM rivers/lakes are draped on the freshly active DEM, so the
+        // Real OSM rivers/lakes are draped on the freshly active HD DEM, so the
         // water has to be built after setActiveDEM/setCustomAirports above.
         this.world.inlandWater.setWaterData(water);
-        // Iconic landmarks are re-grounded on the same DEM (hilltop basilicas,
-        // the Nanos mast, the Solkan bridge and the Soča dams).
+        // Iconic landmarks are re-grounded per-pier & per-corner on the HD DEM.
         this.world.landmarks.setLandmarks(osm?.landmarks || null);
+        this._vipavaRoads = osm?.roads || [];
+        this._vipavaWater = water || null;
         // Kneeboard map origin: the DEM centre is Ajdovščina (LJAJ).
         this._vipavaGeoOrigin = dem.meta
           ? { lat0: dem.meta.lat0, lon0: dem.meta.lon0 }
@@ -385,9 +457,17 @@ class App {
           { name: 'Nova Gorica', x: -18700, z: -7500, kind: 'city' },
           { name: 'Gorizia', x: -21000, z: -6200, kind: 'city' },
           { name: 'Solkan', x: -18200, z: -10000, kind: 'town' },
+          { name: 'Dornberk', x: -11660, z: -90, kind: 'town' },
+          { name: 'Branik', x: -7590, z: 3820, kind: 'town' },
+          { name: 'Sempas', x: -11100, z: -4730, kind: 'town' },
+          { name: 'Crnice', x: -8360, z: -2350, kind: 'town' },
+          { name: 'Rence', x: -16890, z: -270, kind: 'town' },
+          { name: 'Miren', x: -21650, z: -940, kind: 'town' },
+          { name: 'Podnanos', x: 7000, z: 10150, kind: 'town' },
           { name: 'Tolmin', x: -12600, z: -32900, kind: 'town' },
           { name: 'Trieste', x: -8300, z: 26400, kind: 'city' },
           { name: 'Koper', x: -12200, z: 37800, kind: 'city' },
+          { name: 'Izola', x: -17430, z: 39060, kind: 'town' },
           { name: 'Piran', x: -24800, z: 39800, kind: 'town' },
           { name: 'Postojna', x: 25400, z: 12600, kind: 'town' },
           { name: 'Sezana', x: -1100, z: 19800, kind: 'town' },
@@ -398,6 +478,13 @@ class App {
           { name: 'Nanos', x: 12900, z: 12900, kind: 'landmark' },
           ...(this.world.landmarks?.landmarks || []).map((l) => ({ name: l.name, x: l.x, z: l.z, kind: 'landmark' })),
         ];
+        this.inspectorMap.setTheaterData({
+          places: this._vipavaPlaces,
+          landmarks: this.world.landmarks?.landmarks || [],
+          roads: this._vipavaRoads,
+          water: this._vipavaWater,
+          geoOrigin: this._vipavaGeoOrigin,
+        });
         // Ajdovscina Airfield (LJAJ) sits at the DEM centre and runs East-West:
         // start on the RWY 09 threshold, nose east into the sunrise.
         const ljaj = customAirports?.find((ap) => ap.id === 'LJAJ' || ap.code === 'LJAJ')
@@ -492,6 +579,64 @@ class App {
 
   onKey(e) {
     const code = e.code;
+    const isFreeCamToggle = (e.ctrlKey && !e.shiftKey && !e.altKey && code === 'KeyF') || code === 'F7';
+    if (isFreeCamToggle && this.ready) {
+      e.preventDefault();
+      this.toggleFreeCam();
+      return;
+    }
+    if (this.freeCam.active) {
+      if (code === 'KeyM' || code === 'Tab') {
+        e.preventDefault();
+        this.toggleInspectorMap();
+        return;
+      }
+      if (code === 'Escape') {
+        if (this.inspectorMap.visible) {
+          this.inspectorMap.hide();
+        } else {
+          this.exitFreeCam();
+        }
+        return;
+      }
+      if (this.inspectorMap.visible) return;
+      if (code === 'BracketLeft') {
+        this.time.addHours(-1);
+        this.ui.toast('TIME ' + this.time.clock);
+        return;
+      }
+      if (code === 'BracketRight') {
+        this.time.addHours(1);
+        this.ui.toast('TIME ' + this.time.clock);
+        return;
+      }
+      if (code === 'KeyY') {
+        const names = Object.keys(WEATHER);
+        const idx = names.indexOf(this.weather.presetName);
+        const next = names[(idx + 1) % names.length];
+        this.weather.setPreset(next, true);
+        this.ui.toast('WEATHER · ' + WEATHER[next].label);
+        return;
+      }
+      if (code === 'Equal' || code === 'NumpadAdd') {
+        this.freeCam.adjustSpeed(2);
+        return;
+      }
+      if (code === 'Minus' || code === 'NumpadSubtract') {
+        this.freeCam.adjustSpeed(-2);
+        return;
+      }
+      if (code === 'F3') {
+        this.debug = !this.debug;
+        if (!this.debug) this.ui.setDebug('', false);
+        return;
+      }
+      if (/^Digit[0-9]$/.test(code)) {
+        this._freeCamTeleport(Number(code.slice(5)));
+        return;
+      }
+      return;
+    }
     if (this.mode === 'menu') {
       if (code === 'Enter') this.startFlight();
       return;
@@ -574,6 +719,284 @@ class App {
       else if (this.mode === 'pause') this.resume();
       return;
     }
+  }
+
+  /** F7: detached 6-DOF spectator camera for fast world inspection without flying. */
+  toggleFreeCam() {
+    if (this.freeCam.active) {
+      this.exitFreeCam();
+      return;
+    }
+    if (this.photoMode.active) this.exitPhotoMode(true);
+    this._freeCamReturnMode = this.mode === 'menu' ? 'menu' : 'fly';
+
+    // Start from the current camera (or slightly above Ajdovščina if in menu).
+    const startPos = this.camera.position.clone();
+    if (this._freeCamReturnMode === 'menu') {
+      const ground = this.world.heightAt(this.spawn.x, this.spawn.z);
+      startPos.set(this.spawn.x - 180, ground + 180, this.spawn.z + 240);
+      this.ui.hideMenu();
+    } else {
+      startPos.y = Math.max(startPos.y, this.world.heightAt(startPos.x, startPos.z) + 12);
+    }
+    const euler = new THREE.Euler().setFromQuaternion(this.camera.quaternion, 'YXZ');
+    this.freeCam.enter(startPos, euler.y, clamp(euler.x, -1.2, 0.8));
+
+    this.audio.setPaused(true);
+    this.hud.setVisible(false);
+    this.ui.hidePause();
+    if (this.kneeboard.visible) this.kneeboard.toggle();
+    this.ui.showFreeCamBar(true);
+    this.input.requestPointerLock();
+    this.ui.toast('FREE CAM (CTRL+F) · WASD/QE MOVE · M BIG MAP · WHEEL SPEED · SHIFT ×4 · 1-9 JUMP');
+    this._saveLastView();
+  }
+
+  /** Toggle the big click-to-teleport Environment Inspector Map while in Free Cam. */
+  toggleInspectorMap() {
+    if (!this.freeCam.active) return;
+    if (this.inspectorMap.visible) {
+      this.inspectorMap.hide();
+    } else {
+      this.input.releasePointerLock();
+      this.inspectorMap.show(this._inspectorState());
+    }
+  }
+
+  _inspectorState() {
+    const bStats = this.world.buildings.stats;
+    const lod = bStats.lod || {};
+    const info = this.renderer.info;
+    return {
+      aircraftPos: this.aircraft.flight.position,
+      camPos: this.freeCam.position,
+      camYaw: this.freeCam.yaw,
+      hour: this.time.hour,
+      weather: this.weather.presetName,
+      debugStats: {
+        fps: Math.round(this.fps),
+        calls: info.render.calls,
+        tris: Math.round(info.render.triangles / 1000),
+        tiles: this.world.terrain.tiles.size,
+        buildings: bStats.buildings || 0,
+        lodClose: lod.close || 0,
+        lodMid: lod.mid || 0,
+        lodFar: lod.far || 0,
+        roofs: lod.roofs || 0,
+        plinths: lod.plinths || 0,
+      },
+    };
+  }
+
+  /** Leave Free Cam and return cleanly to the jet (or menu). */
+  exitFreeCam(silent = false) {
+    if (!this.freeCam.active) return;
+    if (this.inspectorMap.visible) this.inspectorMap.hide();
+    this.freeCam.exit();
+    this.ui.showFreeCamBar(false);
+    this.camera.up.set(0, 1, 0);
+    this.aircraft.setMode(this.aircraft.mode);
+
+    if (this._freeCamReturnMode === 'menu') {
+      this.mode = 'menu';
+      this.input.releasePointerLock();
+      this.ui.showMenu();
+    } else {
+      this.hud.setVisible(!this.uiHidden);
+      this.audio.setPaused(false);
+      if (!silent) {
+        this.ui.toast('FREE CAM · OFF');
+        this.input.requestPointerLock();
+      }
+    }
+    // Feature 41: keep the pose but mark Free Cam inactive, so the next reload
+    // opens the menu instead of snapping back onto the camera.
+    this._saveLastView();
+    this.last = performance.now();
+  }
+
+  /** Quick-jump presets (`1`–`9` Vipava highlights, `0` back to aircraft). */
+  _freeCamTeleport(slot) {
+    if (slot === 0) {
+      const p = this.aircraft.flight.position;
+      this.freeCam.teleport(p.x - 40, p.y + 30, p.z + 60, -0.5, -0.35);
+      this.ui.toast('FREE CAM · AIRCRAFT');
+      this._saveLastView();
+      return;
+    }
+    const spots = [
+      null,
+      { name: 'AJDOVŠČINA & LJAJ', x: -450, z: -130, agl: 220, yaw: -1.2, pitch: -0.35 },
+      { name: 'VIPAVA & H4 VIADUCT', x: 5150, z: 4550, agl: 240, yaw: 0.4, pitch: -0.38 },
+      { name: 'SOLKAN BRIDGE & GORGE', x: -18325, z: -10035, agl: 190, yaw: 0.8, pitch: -0.42 },
+      { name: 'SVETA GORA BASILICA', x: -17930, z: -12391, agl: 140, yaw: 2.4, pitch: -0.38 },
+      { name: 'NOVA GORICA & GORIZIA', x: -19400, z: -7000, agl: 340, yaw: 0.3, pitch: -0.36 },
+      { name: 'ŠTANJEL HILLTOP VILLAGE', x: -3226, z: 7135, agl: 160, yaw: -0.5, pitch: -0.38 },
+      { name: 'NANOS PLATEAU & TOWER', x: 12904, z: 12902, agl: 220, yaw: 0.9, pitch: -0.35 },
+      { name: 'VOGRŠČEK DAM & LAKE', x: -12487, z: -1990, agl: 180, yaw: -1.1, pitch: -0.40 },
+      { name: 'PIRAN & ADRIATIC COAST', x: -24661, z: 39852, agl: 240, yaw: 0.6, pitch: -0.35 },
+    ];
+    const s = spots[slot];
+    if (!s) return;
+    const ground = this.world.heightAt(s.x, s.z);
+    this.freeCam.teleport(s.x, ground + s.agl, s.z, s.yaw, s.pitch);
+    this.ui.toast('FREE CAM · ' + s.name);
+    this._saveLastView();
+  }
+
+  /** Step Free Cam controls while keeping terrain/buildings/water streaming. */
+  _updateFreeCam(dt) {
+    const simDt = Math.min(dt, 0.05);
+    const i = this.input;
+    const mapOpen = this.inspectorMap.visible;
+    if (!mapOpen) {
+      if (i.mouse.dx || i.mouse.dy) {
+        this.freeCam.look(i.mouse.dx, i.mouse.dy);
+      }
+      if (i.mouse.wheel) {
+        // Scroll up (negative deltaY -> wheel = -1) speeds up; scroll down slows down.
+        this.freeCam.adjustSpeed(-i.mouse.wheel);
+      }
+    }
+
+    const move = mapOpen ? {} : {
+      forward: (i.isDown('KeyW') ? 1 : 0) - (i.isDown('KeyS') ? 1 : 0),
+      right: (i.isDown('KeyD') ? 1 : 0) - (i.isDown('KeyA') ? 1 : 0),
+      up: ((i.isDown('KeyE') || i.isDown('Space')) ? 1 : 0) - ((i.isDown('KeyQ') || i.isDown('KeyC')) ? 1 : 0),
+      boost: i.anyDown('ShiftLeft', 'ShiftRight'),
+      slow: i.anyDown('AltLeft', 'AltRight'),
+      lookX: (i.isDown('ArrowRight') ? 1 : 0) - (i.isDown('ArrowLeft') ? 1 : 0),
+      lookY: (i.isDown('ArrowUp') ? 1 : 0) - (i.isDown('ArrowDown') ? 1 : 0),
+    };
+    this.freeCam.update(simDt, this.camera, move, (x, z) => this.world.heightAt(x, z));
+
+    // Keep sky, terrain quadtree, 53k OSM buildings, roads, bridges, traffic
+    // and clouds streaming live around the free camera!
+    this.sky.update(simDt, this.time, this.weather, this.camera, this.weather.flash);
+    this.world.update(simDt, this.camera, this.sky, this.weather);
+    this.clouds.update(simDt, this.camera, this.weather, this.sky);
+
+    // Feature 41: autosave the Free Cam pose roughly twice a second, so a tab
+    // crash or a hard reload still lands close to where the user was.
+    this._lastViewTimer -= simDt;
+    if (this._lastViewTimer <= 0) {
+      this._lastViewTimer = 0.5;
+      this._saveLastView();
+    }
+
+    this._freeCamBarTimer -= simDt;
+    if (this._freeCamBarTimer <= 0) {
+      this._freeCamBarTimer = 0.12;
+      const p = this.freeCam.position;
+      const agl = Math.max(0, Math.round(p.y - this.world.heightAt(p.x, p.z)));
+      const spd = Math.round(this.freeCam.speed * (move.boost ? 4 : move.slow ? 0.2 : 1));
+      const bStats = this.world.buildings.stats;
+      this.ui.setFreeCamInfo(
+        `${spd} M/S · AGL ${agl} M · (${Math.round(p.x)}, ${Math.round(p.z)}) · ` +
+        `BLD ${bStats.buildings} · FPS ${Math.round(this.fps)}`,
+      );
+      if (mapOpen) this.inspectorMap.render(this._inspectorState());
+    }
+  }
+
+  /**
+   * Feature 41: write the Free Cam pose plus the active environment into
+   * localStorage so a reload can drop the user back where they were.
+   * Everything is inside try/catch — private mode, disabled storage, a quota
+   * error or a headless run must never break the frame.
+   */
+  _saveLastView() {
+    if (this._restoringLastView) return;
+    try {
+      const fc = this.freeCam;
+      if (!fc) return;
+      const p = fc.position;
+      localStorage.setItem(LAST_VIEW_KEY, JSON.stringify({
+        active: !!fc.active,
+        x: p.x,
+        y: p.y,
+        z: p.z,
+        yaw: fc.yaw,
+        pitch: fc.pitch,
+        speed: fc.speed,
+        theater: this._activeTheater || this.ui.theater || 'vipava',
+        hour: this.time.hour,
+        weather: this.weather.presetName,
+        quality: this.preset.name,
+      }));
+    } catch {
+      // Storage unavailable (private mode, Safari, headless) — persistence is optional.
+    }
+  }
+
+  /** Feature 41: read back the saved view, or null when absent / corrupt. */
+  _loadLastView() {
+    try {
+      const raw = localStorage.getItem(LAST_VIEW_KEY);
+      if (!raw) return null;
+      const saved = JSON.parse(raw);
+      return saved && typeof saved === 'object' ? saved : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Feature 41: after boot, put the user straight back into the Free Cam pose
+   * they reloaded from. Returns true when a restore actually happened.
+   */
+  async _restoreLastView() {
+    const saved = this._loadLastView();
+    if (!saved || saved.active !== true) return false;
+    if (![saved.x, saved.y, saved.z].every((v) => Number.isFinite(v))) return false;
+
+    // Suppress autosaves until the camera is actually in place, so the
+    // setTheater/setQuality calls below cannot overwrite the saved pose.
+    this._restoringLastView = true;
+    try {
+      // Environment first, using exactly the calls the Inspector Map makes.
+      if (THEATERS[saved.theater] && saved.theater !== (this._activeTheater || this.ui.theater)) {
+        await this.setTheater(saved.theater);
+      }
+      if (saved.quality && QUALITY[saved.quality] && saved.quality !== this.preset.name) {
+        this.setQuality(saved.quality);
+      }
+      if (Number.isFinite(saved.hour)) this.time.setHour(saved.hour);
+      if (saved.weather && WEATHER[saved.weather]) this.weather.setPreset(saved.weather, true);
+
+      // Camera pose, lifted clear of the height field so it never starts buried.
+      const ground = this.world.heightAt(saved.x, saved.z);
+      const y = Number.isFinite(ground) ? Math.max(saved.y, ground + 4) : saved.y;
+      this.freeCam.enter(new THREE.Vector3(saved.x, y, saved.z), saved.yaw, saved.pitch);
+      if (Number.isFinite(saved.speed)) {
+        this.freeCam.speed = clamp(saved.speed, LAST_VIEW_SPEED_MIN, LAST_VIEW_SPEED_MAX);
+      }
+      this._freeCamReturnMode = 'menu';
+      this.freeCam.update(0, this.camera, {}, (x, z) => this.world.heightAt(x, z));
+
+      // Re-ground the world around the restored camera before the first frame.
+      this.world.terrain?.refresh?.(this.camera.position, 24);
+      this.world.update(0.016, this.camera, this.sky, this.weather);
+      this.sky.update(0.016, this.time, this.weather, this.camera, this.weather.flash);
+      this.clouds.update(0.016, this.camera, this.weather, this.sky);
+
+      this.mode = 'menu';
+      this.audio.setPaused(true);
+      this.ui.hideBoot();
+      this.ui.hideMenu();
+      this.hud.setVisible(false);
+      this.ui.showFreeCamBar(true);
+      this.ui.toast('RESTORED LAST POSITION · CLICK TO LOOK · CTRL+F / ESC TO EXIT');
+      this._lastViewTimer = 0.5;
+    } catch (err) {
+      console.warn('LAST VIEW · restore failed, opening menu', err);
+      this.freeCam.exit();
+      this.ui.showMenu();
+      return false;
+    } finally {
+      this._restoringLastView = false;
+    }
+    return true;
   }
 
   /** F5: weapon follow-cam rides the last live round to its impact. */
@@ -898,6 +1321,7 @@ class App {
     this._canyonState = null;
     this._canyonFinishAnnounced = false;
     this.exitPhotoMode(true);
+    this.exitFreeCam(true);
     this.weaponCam.reset();
     this._weaponCamState = null;
     this.juice.reset();
@@ -1024,6 +1448,13 @@ class App {
     // and the render loop keep running.
     if (this.photoMode.active) {
       this._updatePhotoMode(dt);
+      return;
+    }
+
+    // Free Camera (F7): aircraft stays parked/frozen while the world streams
+    // live around the detached 6-DOF spectator camera.
+    if (this.freeCam.active) {
+      this._updateFreeCam(dt);
       return;
     }
 

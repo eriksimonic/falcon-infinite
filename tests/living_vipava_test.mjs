@@ -271,7 +271,9 @@ const heightAt = (x, z) => 420 + x * 0.012 + z * 0.006;
   sys.update(0.1, 1);
   check(beam.material.opacity > 0 && beam.mesh.visible, 'lighthouse beam did not light up');
   check(Math.abs(beam.mesh.rotation.y - beamRot0) > 1e-6, 'lighthouse beam does not rotate');
-  check(washes.every((u) => u.material.opacity > 0.2), 'full night does not brighten the washes');
+  // The bridge arch underglow is deliberately subtle (strength 0.25), so the
+  // floor is 0.1 rather than the 0.2 of the old full-span orange wash.
+  check(washes.every((u) => u.material.opacity > 0.1), 'full night does not brighten the washes');
 
   // Obstruction beacons must flash on at least once over a couple of seconds.
   let sawObstruction = false;

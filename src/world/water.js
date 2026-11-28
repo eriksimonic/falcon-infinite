@@ -112,17 +112,10 @@ function polygonCentroid(pts) {
 }
 
 /**
- * Sample the terrain around a lake perimeter and pick a single flat level.
- *
- * The level must clear both the typical shoreline and the basin centre: a
- * dammed reservoir's dam foot can sit >10 m below the basin, so taking the
- * minimum perimeter height (the old `minPerimeterH + 0.45`) puts the whole
- * sheet underground. The median shoreline plus the centre height is robust to
- * a handful of low dam samples.
- *
- * Returns NaN when the polygon yields no usable samples.
+ * Sample terrain heights evenly around a lake shoreline (every
+ * `LAKE_PERIMETER_STEP_M`), skipping non-finite samples.
  */
-function lakeWaterLevel(pts, heightAt) {
+function samplePerimeterHeights(pts, heightAt) {
   const hs = [];
   let prev = pts[0];
   for (let i = 1; i <= pts.length; i++) {
@@ -138,9 +131,27 @@ function lakeWaterLevel(pts, heightAt) {
     }
     prev = cur;
   }
+  return hs;
+}
+
+/**
+ * Sample the terrain around a lake perimeter and pick a single flat level.
+ *
+ * The level must clear both the typical shoreline and the basin centre: a
+ * dammed reservoir's dam foot can sit >10 m below the basin, so taking the
+ * minimum perimeter height (the old `minPerimeterH + 0.45`) puts the whole
+ * sheet underground. The median shoreline plus the centre height is robust to
+ * a handful of low dam samples.
+ *
+ * `sortedHs` may be passed when the caller has already sampled (and sorted)
+ * the perimeter in order to run the sloping-riverbank filter.
+ *
+ * Returns NaN when the polygon yields no usable samples.
+ */
+function lakeWaterLevel(pts, heightAt, sortedHs) {
+  const hs = sortedHs || samplePerimeterHeights(pts, heightAt).sort((a, b) => a - b);
   if (hs.length === 0) return NaN;
 
-  hs.sort((a, b) => a - b);
   const medianPerimeterH = hs[Math.floor(hs.length * 0.5)];
   const [cx, cz] = polygonCentroid(pts);
   const centerH = heightAt(cx, cz);
@@ -230,11 +241,10 @@ export function buildInlandWaterGeometry(data, heightAt) {
   // valid polygon up front lets the river pass clip those samples instead of
   // stacking a ribbon 0.35 m above the 0.85 m lake sheet.
   const preparedLakes = [];
+  let filteredSlopedBanks = 0;
   for (const raw of lakes) {
     const contour = openPolygon(raw);
     if (!contour) continue;
-    const level = lakeWaterLevel(contour, heightAt);
-    if (!Number.isFinite(level)) continue;
 
     let minX = Infinity;
     let maxX = -Infinity;
@@ -246,6 +256,39 @@ export function buildInlandWaterGeometry(data, heightAt) {
       if (z < minZ) minZ = z;
       if (z > maxZ) maxZ = z;
     }
+
+    const hs = samplePerimeterHeights(contour, heightAt);
+    if (hs.length === 0) continue;
+
+    // OSM `natural=water` also maps long, narrow riverbank polygons (Tolmin
+    // Soča Lake, Solkan, Kanal). They drop tens of metres along their length,
+    // so a single flat level would bury the upstream half and float the
+    // downstream half. Detect them and let the continuous river ribbon draw
+    // the reach instead; real lakes, ponds and dammed reservoirs are compact
+    // (or flat) and stay in `preparedLakes`.
+    const area = Math.abs(signedArea2D(contour));
+    let perimeter = 0;
+    for (let i = 0, j = contour.length - 1; i < contour.length; j = i++) {
+      perimeter += Math.hypot(
+        contour[i][0] - contour[j][0],
+        contour[i][1] - contour[j][1],
+      );
+    }
+    const avgWidth = perimeter > 0 ? (2 * area) / perimeter : Infinity;
+    const span = Math.hypot(maxX - minX, maxZ - minZ);
+    hs.sort((a, b) => a - b);
+    const p10 = hs[Math.floor(hs.length * 0.1)];
+    const p90 = hs[Math.floor(hs.length * 0.9)];
+    const spread = p90 - p10;
+    if (span > 350 && avgWidth < 110
+        && (span / Math.max(avgWidth, 1)) > 4.5 && spread > 3.5) {
+      filteredSlopedBanks++;
+      continue;
+    }
+
+    const level = lakeWaterLevel(contour, heightAt, hs);
+    if (!Number.isFinite(level)) continue;
+
     preparedLakes.push({ minX, maxX, minZ, maxZ, contour, level });
   }
 
@@ -256,58 +299,87 @@ export function buildInlandWaterGeometry(data, heightAt) {
     if (samples.length < 2) continue;
     const halfWidth = Math.max(1.5, (Number.isFinite(river.w) ? river.w : 15) * 0.5);
 
-    let prevPair = null; // [leftIdx, rightIdx] of the previous kept sample
+    // Sample every centreline height first: the flow direction depends on the
+    // whole reach, not on the first run that happens to survive lake clipping.
+    const hs = samples.map(([x, z]) => heightAt(x, z));
+    const finiteHs = hs.filter(Number.isFinite);
+    if (finiteHs.length >= 2) {
+      const edge = Math.min(4, finiteHs.length);
+      let startSum = 0;
+      let endSum = 0;
+      for (let k = 0; k < edge; k++) {
+        startSum += finiteHs[k];
+        endSum += finiteHs[finiteHs.length - 1 - k];
+      }
+      // OSM ways run either direction; make index 0 the upstream end.
+      if (startSum < endSum) {
+        samples.reverse();
+        hs.reverse();
+      }
+    }
+
+    // Emit one ribbon per contiguous kept run, with a strictly non-increasing
+    // downstream elevation. Both banks share the centreline's level, so a
+    // river in a steep canyon (Sabotin) is never tilted sideways up the cliff.
+    const emitRun = (run) => {
+      let prevPair = null;
+      let monoY = NaN;
+      for (let k = 0; k < run.length; k++) {
+        const sampleIndex = run[k];
+        const [x, z] = samples[sampleIndex];
+        const hCentre = hs[sampleIndex];
+        monoY = Number.isFinite(monoY) ? Math.min(monoY, hCentre) : hCentre;
+        const waterY = monoY + RIVER_LIFT_M;
+
+        // Tangent from the neighbours (one-sided at the ends).
+        const a = samples[Math.max(0, sampleIndex - 1)];
+        const b = samples[Math.min(samples.length - 1, sampleIndex + 1)];
+        let dx = b[0] - a[0];
+        let dz = b[1] - a[1];
+        const len = Math.hypot(dx, dz);
+        if (!(len > 1e-6)) {
+          prevPair = null;
+          continue;
+        }
+        dx /= len;
+        dz /= len;
+        const nx = -dz * halfWidth;
+        const nz = dx * halfWidth;
+
+        const leftIdx = positions.length / 3;
+        positions.push(x - nx, waterY, z - nz);
+        normals.push(0, 1, 0);
+        const rightIdx = positions.length / 3;
+        positions.push(x + nx, waterY, z + nz);
+        normals.push(0, 1, 0);
+
+        if (prevPair) {
+          const [pl, pr] = prevPair;
+          pushTriUp(indices, positions, pl, pr, leftIdx);
+          pushTriUp(indices, positions, pr, rightIdx, leftIdx);
+          riverSegments++;
+        }
+        prevPair = [leftIdx, rightIdx];
+      }
+    };
+
+    let run = [];
     for (let i = 0; i < samples.length; i++) {
       const [x, z] = samples[i];
-
-      // The water polygon owns everything inside its shoreline: drop the
-      // ribbon sample and break the strip so no triangle spans the gap.
-      if (pointInLakePolygons(x, z, preparedLakes)) {
-        prevPair = null;
+      const hCentre = hs[i];
+      // The water polygon owns everything inside its shoreline, and the sea
+      // plane owns everything at/below sea level: break the strip so no
+      // triangle spans the gap.
+      const drop = !Number.isFinite(hCentre) || hCentre <= SEA_CUTOFF_M
+        || pointInLakePolygons(x, z, preparedLakes);
+      if (drop) {
+        if (run.length) emitRun(run);
+        run = [];
         continue;
       }
-
-      const hCentre = heightAt(x, z);
-      // The sea plane owns everything at/below sea level.
-      if (!Number.isFinite(hCentre) || hCentre <= SEA_CUTOFF_M) {
-        prevPair = null; // break the strip so no triangle spans the shore
-        continue;
-      }
-
-      // Tangent from the neighbours (one-sided at the ends).
-      const a = samples[Math.max(0, i - 1)];
-      const b = samples[Math.min(samples.length - 1, i + 1)];
-      let dx = b[0] - a[0];
-      let dz = b[1] - a[1];
-      const len = Math.hypot(dx, dz);
-      if (!(len > 1e-6)) continue;
-      dx /= len;
-      dz /= len;
-      const nx = -dz * halfWidth;
-      const nz = dx * halfWidth;
-
-      const lx = x - nx;
-      const lz = z - nz;
-      const rx = x + nx;
-      const rz = z + nz;
-      const hl = heightAt(lx, lz);
-      const hr = heightAt(rx, rz);
-
-      const leftIdx = positions.length / 3;
-      positions.push(lx, (Number.isFinite(hl) ? hl : hCentre) + RIVER_LIFT_M, lz);
-      normals.push(0, 1, 0);
-      const rightIdx = positions.length / 3;
-      positions.push(rx, (Number.isFinite(hr) ? hr : hCentre) + RIVER_LIFT_M, rz);
-      normals.push(0, 1, 0);
-
-      if (prevPair) {
-        const [pl, pr] = prevPair;
-        pushTriUp(indices, positions, pl, pr, leftIdx);
-        pushTriUp(indices, positions, pr, rightIdx, leftIdx);
-        riverSegments++;
-      }
-      prevPair = [leftIdx, rightIdx];
+      run.push(i);
     }
+    if (run.length) emitRun(run);
   }
 
   // -- Lakes: one flat level per polygon, earcut triangulation -------------
@@ -345,6 +417,7 @@ export function buildInlandWaterGeometry(data, heightAt) {
     indices: new Uint32Array(indices),
     riverSegments,
     lakeCount,
+    filteredSlopedBanks,
   };
 }
 
@@ -370,9 +443,10 @@ export class InlandWaterSystem {
         uSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.2) },
         uSunColor: { value: new THREE.Color(0xfff2d0) },
         uSkyColor: { value: new THREE.Color(0x8fb4c8) },
-        // Emerald-blue Soča/Vipava palette (linear space, like WaterSurface).
-        uDeep: { value: new THREE.Color(0x103c3d).convertSRGBToLinear() },
-        uShallow: { value: new THREE.Color(0x2f8f83).convertSRGBToLinear() },
+        // Natural alpine river palette (linear space, like WaterSurface):
+        // deep muted slate-teal and a glacial emerald-green, never neon blue.
+        uDeep: { value: new THREE.Color(0x0d2b2e).convertSRGBToLinear() },
+        uShallow: { value: new THREE.Color(0x1e4e4a).convertSRGBToLinear() },
         fogColor: { value: new THREE.Color(0x9fb9c9) },
         fogDensity: { value: 0.00002 },
       },
@@ -393,30 +467,111 @@ export class InlandWaterSystem {
         varying vec3 vWorld;
         #include <common>
         #include <fog_pars_fragment>
+
+        // --- 2D quintic value noise with analytic derivatives ----------------
+        float rHash(vec2 p) {
+          p = fract(p * vec2(123.34, 456.21));
+          p += dot(p, p + 45.32);
+          return fract(p.x * p.y);
+        }
+
+        // Returns (value, d/dx, d/dy). Quintic smoothstep gives C2 continuity,
+        // so drifting ripples never show the facet seams of linear noise.
+        vec3 rNoise(vec2 p) {
+          vec2 i = floor(p);
+          vec2 f = fract(p);
+          vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+          vec2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+
+          float a = rHash(i + vec2(0.0, 0.0));
+          float b = rHash(i + vec2(1.0, 0.0));
+          float c = rHash(i + vec2(0.0, 1.0));
+          float d = rHash(i + vec2(1.0, 1.0));
+
+          float k1 = b - a;
+          float k2 = c - a;
+          float k3 = a - b - c + d;
+
+          float v = a + k1 * u.x + k2 * u.y + k3 * u.x * u.y;
+          vec2 dv = du * vec2(k1 + k3 * u.y, k2 + k3 * u.x);
+          return vec3(v, dv);
+        }
+
+        // One rotated, drifting ripple octave at world wavelength L (metres).
+        // Returns (height, dH/dx, dH/dz) where the gradient already includes
+        // the 1/L world-space scaling.
+        vec3 rLayer(vec2 p, float L, float angle, vec2 drift, float t) {
+          float ca = cos(angle);
+          float sa = sin(angle);
+          mat2 rot = mat2(ca, -sa, sa, ca);
+          vec3 n = rNoise(rot * (p + drift * t) / L);
+          vec2 grad = (n.yz * rot) / L;
+          return vec3(n.x, grad.x, grad.y);
+        }
+
+        // Screen-space Nyquist filter: fade an octave out once a pixel footprint
+        // approaches its wavelength, so narrow rivers never shimmer.
+        float rNyquist(float L, float px) {
+          return 1.0 - smoothstep(L * 0.10, L * 0.45, px);
+        }
+
         void main() {
           vec3 viewDir = normalize(cameraPosition - vWorld);
           vec2 p = vWorld.xz;
           float t = uTime;
-          // Fade ripple normals out with distance: no sub-pixel shimmer where
-          // a narrow river is only a couple of pixels wide.
-          float distFade = 1.0 - smoothstep(1200.0, 9000.0,
-            length(vWorld.xz - cameraPosition.xz));
-          float r1 = sin(p.x * 0.16 + p.y * 0.11 + t * 1.6);
-          float r2 = sin(p.x * -0.09 + p.y * 0.21 - t * 1.1);
-          float r3 = sin((p.x + p.y) * 0.42 + t * 2.3);
-          vec3 n = normalize(vec3(
-            (r1 * 0.07 + r3 * 0.03) * distFade,
-            1.0,
-            (r2 * 0.07 + r3 * 0.03) * distFade));
-          float fres = pow(1.0 - max(dot(n, viewDir), 0.0), 3.0);
-          vec3 col = mix(uDeep, uShallow, 0.45 + 0.2 * r2);
-          col = mix(col, uSkyColor, clamp(fres * 0.55, 0.0, 0.7));
+          float pixSize = max(length(fwidth(p)), 0.05);
+
+          // Three counter-drifting, rotated ripple octaves (4 / 12 / 36 m) plus
+          // a slow 2D macro patch (180 m) that keeps kilometre-long reaches
+          // from looking uniformly tiled.
+          float w4 = 0.030 * rNyquist(4.0, pixSize);
+          float w12 = 0.140 * rNyquist(12.0, pixSize);
+          float w36 = 0.500 * rNyquist(36.0, pixSize);
+          float w180 = 0.560 * rNyquist(180.0, pixSize);
+
+          vec3 o4 = rLayer(p, 4.0, 0.35, vec2(0.90, 0.35), t);
+          vec3 o12 = rLayer(p, 12.0, -0.60, vec2(-0.45, 0.60), t * 0.80);
+          vec3 o36 = rLayer(p, 36.0, 1.10, vec2(0.22, -0.16), t * 0.55);
+          vec3 m180 = rLayer(p, 180.0, 0.20, vec2(0.035, 0.02), t * 0.30);
+
+          float rippleH = o4.x * w4 + o12.x * w12 + o36.x * w36
+            + (m180.x - 0.5) * w180;
+          vec2 rippleG = o4.yz * w4 + o12.yz * w12 + o36.yz * w36 + m180.yz * w180;
+
+          // Gentle normal tilt: cap the horizontal slope at 0.075 so distant
+          // water stays a smooth sheet rather than a crumpled mirror.
+          vec2 tilt = rippleG;
+          float tiltLen = length(tilt);
+          if (tiltLen > 0.075) tilt *= 0.075 / tiltLen;
+          vec3 n = normalize(vec3(tilt.x, 1.0, tilt.y));
+
+          // Water darkens toward dusk and reads as near-black at night.
+          float dayLum = mix(0.14, 1.0, smoothstep(-0.08, 0.35, uSunDir.y));
+
+          float macroVal = m180.x;
+          vec3 body = mix(uDeep, uShallow,
+            clamp(0.42 + rippleH * 0.8 + (macroVal - 0.5) * 0.35, 0.12, 0.88));
+          body *= dayLum;
+
+          // Schlick Fresnel toward the sky (F0 = 0.02), soft horizon gradient.
+          float F0 = 0.02;
+          float fres = F0 + (1.0 - F0) * pow(1.0 - max(dot(n, viewDir), 0.0), 5.0);
+          vec3 horizon = mix(uSkyColor * 0.82, uSkyColor,
+            clamp(viewDir.y * 2.0, 0.0, 1.0));
+          vec3 col = mix(body, horizon * dayLum, clamp(fres * 0.9, 0.0, 0.65));
+
+          // Soft sun glitter, suppressed when the sun is below the horizon.
+          float sunVis = smoothstep(-0.02, 0.12, uSunDir.y);
           vec3 r = reflect(-uSunDir, n);
-          float spec = pow(max(dot(r, viewDir), 0.0), 90.0);
-          float sparkle = pow(max(dot(r, viewDir), 0.0), 14.0) * 0.1;
-          col += uSunColor * (spec * 1.2 + sparkle) * distFade;
+          float rv = max(dot(r, viewDir), 0.0);
+          float spec = pow(rv, 220.0);
+          float glitter = pow(rv, 40.0) * 0.06;
+          col += uSunColor * (spec * 1.3 + glitter) * sunVis * dayLum;
+
           gl_FragColor = vec4(col, 1.0);
           #include <fog_fragment>
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
         }
       `,
       fog: true,
@@ -453,6 +608,7 @@ export class InlandWaterSystem {
     mesh.renderOrder = 0;
     mesh.userData.riverSegments = built.riverSegments;
     mesh.userData.lakeCount = built.lakeCount;
+    mesh.userData.filteredSlopedBanks = built.filteredSlopedBanks;
 
     this.geometry = geometry;
     this.mesh = mesh;

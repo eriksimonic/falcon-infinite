@@ -13,10 +13,10 @@ export const CONFIG = {
   world: {
     seaLevel: 0,
     terrainRootSize: 32768,
-    terrainMinSize: 256,
-    terrainMaxLevel: 7,
-    terrainDetailDistance: 1.35,
-    tileCacheLimit: 700,
+    terrainMinSize: 128,
+    terrainMaxLevel: 8,
+    terrainDetailDistance: 1.55,
+    tileCacheLimit: 900,
     waterSize: 260000,
   },
 

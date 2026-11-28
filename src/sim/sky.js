@@ -209,7 +209,7 @@ export class SkySystem {
 
     // lighting
     this.sun.color.copy(sunCol);
-    this.sun.intensity = 3.4 * smoothstep(-0.06, 0.18, _sun.y) * (1 - overcast * 0.62);
+    this.sun.intensity = 2.25 * smoothstep(-0.08, 0.22, _sun.y) * (1 - overcast * 0.62);
     this.sun.position.copy(camera.position).addScaledVector(_sun, 8000);
     this.sun.target.position.copy(camera.position);
     this.sun.target.updateMatrixWorld();
@@ -220,13 +220,13 @@ export class SkySystem {
     this.moon.target.position.copy(camera.position);
     this.moon.target.updateMatrixWorld();
 
-    const dayAmb = new THREE.Color(0x9fc6e4);
+    const dayAmb = new THREE.Color(0xb4d6f2);
     const nightAmb = new THREE.Color(0x1b2b4a);
     const amb = nightAmb.clone().lerp(dayAmb, dayT);
-    const groundAmb = new THREE.Color(0x24301f).lerp(new THREE.Color(th.groundAmb || 0x5d5b45), dayT);
+    const groundAmb = new THREE.Color(0x363e34).lerp(new THREE.Color(th.groundAmb || 0x767864), dayT);
     this.hemi.color.copy(amb);
     this.hemi.groundColor.copy(groundAmb);
-    this.hemi.intensity = lerp(0.30, 1.35, dayT) * (1 - overcast * 0.15);
+    this.hemi.intensity = lerp(0.42, 1.75, dayT) * (1 - overcast * 0.10);
 
     // fog color = horizon, warmer at dusk, warm desert dust haze in desert theater
     const fogCol = hor.clone().lerp(sunCol, duskT * 0.18);

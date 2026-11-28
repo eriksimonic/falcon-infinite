@@ -8,10 +8,15 @@ import { RoadNetwork } from './roadnet.js';
 import { InlandWaterSystem } from './water.js';
 import { LandmarkSystem } from './landmarks.js';
 import { RoadTrafficSystem } from './traffic_roads.js';
-import { terrainHeight, slopeAt, airportNear, airportsNear } from './terrain.js';
+import { terrainHeight, slopeAt, airportNear, airportsNear, getActiveDEM } from './terrain.js';
 
 // Vehicle budget per quality preset (mirrors traffic_roads.js).
 const TRAFFIC_BUDGET = { low: 120, medium: 220, high: 320 };
+
+// Live AWS Terrarium streaming kicks in when the camera crosses (or nears) the
+// edge of the baked 500x500 km macro ring, where baked detail runs out.
+const STREAM_MACRO_RING = 180000;
+const STREAM_INTERVAL = 0.5;
 
 export class World {
   constructor(scene, preset) {
@@ -33,6 +38,9 @@ export class World {
     this.roadTraffic = new RoadTrafficSystem(scene, preset);
     // Optional offshore carrier group; main.js attaches one once it is placed.
     this.carrier = null;
+    // Live AWS Terrarium streamer bound to the active DEM (null when offline).
+    this._streamTimer = 0;
+    this._boundStreamDEM = null;
   }
 
   setPreset(preset) {
@@ -65,6 +73,7 @@ export class World {
   }
 
   update(dt, camera, sky, weather) {
+    this._updateDEMStreaming(dt, camera);
     this.terrain.update(dt, camera);
     this.terrain.setAtmosphere(sky.sunDir, sky.sunColor, sky.skyColor);
     this.airports.update(dt, camera, weather, sky);
@@ -75,6 +84,37 @@ export class World {
     this.landmarks.update(dt, sky.night);
     // Feature 31: night lights on the H4/Vipava arteries, culled at 22 km.
     this.roadTraffic.update(dt, camera.position, sky.night);
+  }
+
+  // Live AWS Terrarium tiles: rebind the tile-ready hook whenever a different
+  // streamer becomes active, and fetch a 3x3 tile block around the camera once
+  // the baked macro bake runs out. Headless/offline safe — requestAround() is a
+  // no-op without fetch/document and never throws.
+  _updateDEMStreaming(dt, camera) {
+    const dem = getActiveDEM();
+    const stream = dem && dem.streamingDEM;
+    if (!stream) return;
+
+    if (this._boundStreamDEM !== stream) {
+      stream.onTileLoaded = (b) => {
+        if (b && this.terrain?.invalidateBounds) {
+          this.terrain.invalidateBounds(b.xMin, b.xMax, b.zMin, b.zMax);
+        }
+      };
+      this._boundStreamDEM = stream;
+      this._streamTimer = 0;
+    }
+
+    const pos = camera?.position;
+    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.z)) return;
+    if (Math.max(Math.abs(pos.x), Math.abs(pos.z)) <= STREAM_MACRO_RING) return;
+
+    this._streamTimer -= dt;
+    if (this._streamTimer > 0) return;
+    this._streamTimer = STREAM_INTERVAL;
+    if (typeof stream.requestAround === 'function') {
+      stream.requestAround(pos.x, pos.z, 1);
+    }
   }
 
   heightAt(x, z) {

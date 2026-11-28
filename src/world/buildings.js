@@ -12,7 +12,7 @@
 // craters and rubble collapse directly under Node.
 import * as THREE from 'three';
 import { settlementsNear } from './settlements.js';
-import { terrainHeight } from './terrain.js';
+import { terrainHeight, getCustomAirports } from './terrain.js';
 import { hash2, clamp } from './noise.js';
 
 const HAS_DOM = typeof document !== 'undefined' && typeof document.createElement === 'function';
@@ -34,21 +34,39 @@ const CUSTOM_SETTLEMENT_ID = 'vipava-osm';
 const CUSTOM_SETTLEMENT_RADIUS = 52000; // reachable everywhere inside the 100 km region
 const LARGE_SETTLEMENT_RADIUS = 24000; // per-building stream radius for the OSM city
 const LARGE_SETTLEMENT_MIN_SIZE = 3000; // settlements larger than this stream per building
-const DEM_HALF = 50000; // the baked DEM owns +-50 km; procedural cities outside it stay
-const CUSTOM_KINDS = ['house', 'apartment', 'industrial', 'tower'];
+const SPATIAL_CELL_SIZE = 1000; // 1 km spatial hash cells for O(visible) queries
+const CUSTOM_KINDS = ['house', 'apartment', 'industrial', 'tower', 'church', 'shed'];
 // LJAJ (Ajdovscina) is a true East-West strip at the DEM centre: RWY 09/27 runs
 // along +-X. Nothing built by OSM may sit on the pavement or the graded strip.
 const LJAJ_RUNWAY_HALF_LENGTH_M = 960; // 1800 m runway + 60 m overrun either end
 const LJAJ_RUNWAY_HALF_WIDTH_M = 95;   // 36 m runway + shoulders/apron clearance
 
-// Roof/wall palettes matching settlements.js, so baked buildings read as the
-// same architecture as their procedural neighbours.
-const CUSTOM_PALETTE = {
-  house: [0xd9cdb6, 0xcfc0a6, 0xe3d9c8, 0xc4b49a, 0xb9a88c, 0xd6c1a3],
-  apartment: [0xa9a49a, 0xb8b2a6, 0x9b9a93, 0xc0b6a8, 0x8f9095],
-  industrial: [0x8e918c, 0x9c978b, 0x82857f, 0xa39a86],
-  tower: [0x8fa6ba, 0x7d93a8, 0xa6b8c6, 0x93a3b3, 0x8298a8, 0xb3c2cc],
+// 4-tier procedural display/hide LOD thresholds (metres) per quality preset.
+const LOD_THRESHOLDS = {
+  low: { close: 2200, mid: 6500, far: 14000 },
+  medium: { close: 3600, mid: 10500, far: 22000 },
+  high: { close: 5000, mid: 14500, far: 28000 },
 };
+
+// Warm Vipava / Primorska / Adriatic regional wall palettes.
+const CUSTOM_PALETTE = {
+  house: [0xe0d1b5, 0xd6c3a1, 0xe4d5bf, 0xd0b28e, 0xc7b59a, 0xdbbe9e, 0xd1c5b2, 0xc5a687],
+  apartment: [0xcec5b8, 0xc0bab0, 0xb6b0a4, 0xd4c9b4, 0xa5a39e, 0xc5b9aa],
+  industrial: [0x9da09a, 0xa8a397, 0x8d918b, 0xb0a796, 0x94989a],
+  tower: [0x8fa6ba, 0x7d93a8, 0xa6b8c6, 0x93a3b3, 0x8298a8, 0xb3c2cc],
+  church: [0xdfd7c6, 0xd6cdb9, 0xe5ddcc, 0xcfc5b0],
+  shed: [0xb9ae99, 0xa89d8a, 0xc2b59f, 0x9d9382],
+};
+
+// Weathered Primorska / Vipava roof palettes (sun-baked muted clay, dusty
+// terracotta, aged taupe-grey tiles, slate & industrial metal — no candy red).
+const ROOF_TERRACOTTA = [0x9a735c, 0x8f6652, 0xa37c62, 0x84604e, 0x916e59, 0x7d5d4e];
+const ROOF_TAUPE = [0x7e7468, 0x72695f, 0x8a8073, 0x696259];
+const ROOF_SLATE = [0x585b5e, 0x66686a, 0x4e5256, 0x6e6f6c];
+const ROOF_INDUSTRIAL = [0x7c7f7e, 0x6c7072, 0x8a8b87, 0x5f6468];
+const PLINTH_STONE = [0xa8a193, 0x9c9688, 0xb2aa9c, 0x928c7f];
+
+const cellKey = (cx, cz) => (cx + 32768) * 65536 + (cz + 32768);
 
 const _c = new THREE.Color();
 const _m = new THREE.Matrix4();
@@ -60,8 +78,20 @@ const _e = new THREE.Euler();
 const buildingKey = (s, b) => `${s.id}:${Math.round(b.x)}:${Math.round(b.z)}`;
 
 // ---------------------------------------------------------------------------
-// Materials
+// Materials & procedural roof geometries
 // ---------------------------------------------------------------------------
+const BAYER_GLSL = /* glsl */`
+  float bayer4(vec2 p) {
+    vec2 f = floor(mod(p, 4.0));
+    float m0 = mod(f.x, 2.0);
+    float m1 = mod(f.y, 2.0);
+    float m2 = floor(f.x * 0.5);
+    float m3 = floor(f.y * 0.5);
+    float v = mod(m0 + m1, 2.0) * 8.0 + m1 * 4.0 + mod(m2 + m3, 2.0) * 2.0 + m3;
+    return (v + 0.5) / 16.0;
+  }
+`;
+
 function makeBuildingMaterial() {
   return new THREE.ShaderMaterial({
     fog: true,
@@ -72,6 +102,7 @@ function makeBuildingMaterial() {
         uSunColor: { value: new THREE.Color(0xfff2d8) },
         uAmbient: { value: new THREE.Color(0x334455) },
         uNight: { value: 0 },
+        uCullDist: { value: 24000 },
       },
     ]),
     vertexShader: /* glsl */`
@@ -107,7 +138,7 @@ function makeBuildingMaterial() {
     `,
     fragmentShader: /* glsl */`
       uniform vec3 uSunDir, uSunColor, uAmbient;
-      uniform float uNight;
+      uniform float uNight, uCullDist;
       varying vec3 vWorld;
       varying vec3 vN;
       varying vec3 vLocalN;
@@ -117,6 +148,8 @@ function makeBuildingMaterial() {
       #include <common>
       #include <fog_pars_fragment>
 
+      ${BAYER_GLSL}
+
       float h21(vec2 p) {
         p = fract(p * vec2(123.34, 456.21));
         p += dot(p, p + 45.32);
@@ -124,13 +157,16 @@ function makeBuildingMaterial() {
       }
 
       void main() {
+        float distXZ = length(vWorld.xz - cameraPosition.xz);
+        float fade = smoothstep(uCullDist * 0.86, uCullDist, distXZ);
+        if (fade > 0.001 && fade >= bayer4(gl_FragCoord.xy)) discard;
+
         vec3 n = normalize(vN);
         vec3 ln = normalize(vLocalN);
         float ndl = max(dot(n, uSunDir), 0.0);
         float wrap = max(dot(n, uSunDir) * 0.5 + 0.5, 0.0);
-        // Softened diffuse keeps sunlit facades under the bloom threshold while
-        // sharpening the sunlit-vs-shadow side contrast.
-        vec3 col = vCol * (uAmbient * 0.85 + uSunColor * (ndl * 0.78 + wrap * 0.10)) + vCol * 0.06;
+        // Balanced diffuse + sky fill prevents crushed shadows and ACES highlight clipping.
+        vec3 col = vCol * (uAmbient * 1.15 + uSunColor * (ndl * 0.72 + wrap * 0.22));
 
         // Wall-aligned facade coordinates. The axis that runs *across* each
         // wall (local z for the ±X walls, local x for the ±Z walls) is taken in
@@ -184,9 +220,9 @@ function makeBuildingMaterial() {
         // lit clusters at altitude instead of glowing blobs.
         col += winColor * lit * uNight * 1.45 * brightness;
 
-        // Deeper base ambient occlusion over the bottom of each block so every
-        // building sits crisply anchored on the terrain.
-        col *= mix(0.54, 1.0, smoothstep(0.0, 0.18, vLocal.y));
+        // Subtle base ambient occlusion over the bottom of each block so every
+        // building sits crisply anchored on the terrain without crushing to black.
+        col *= mix(0.72, 1.0, smoothstep(0.0, 0.18, vLocal.y));
 
         // Vipava/Adriatic roofs: mostly weathered terracotta tiles with a
         // minority of dark slate, hashed per building, mottled per tile and lit
@@ -196,18 +232,279 @@ function makeBuildingMaterial() {
         float mottle = h21(floor(rp) + floor(vCol.yz * 131.0));
         float tileGrain = h21(floor(rp * 5.0) + floor(vCol.yz * 57.0) + 2.3);
         float roofPick = h21(vec2(buildingSeed * 131.7 + 0.5, 7.3));
-        vec3 terracotta = mix(vec3(0.56, 0.26, 0.17), vec3(0.44, 0.21, 0.15), mottle);
-        vec3 slate = mix(vec3(0.26, 0.28, 0.31), vec3(0.35, 0.36, 0.37), mottle);
-        vec3 roofBase = mix(terracotta, slate, step(0.68, roofPick));
+        vec3 terracotta = mix(vec3(0.32, 0.18, 0.12), vec3(0.24, 0.14, 0.10), mottle);
+        vec3 slate = mix(vec3(0.16, 0.17, 0.18), vec3(0.24, 0.23, 0.22), mottle);
+        vec3 roofBase = mix(terracotta, slate, step(0.58, roofPick));
         roofBase *= 0.94 + 0.12 * tileGrain;
-        vec3 roofCol = roofBase * (uAmbient * 0.8 + uSunColor * (ndl * 0.82 + 0.12));
+        vec3 roofCol = roofBase * (uAmbient * 1.12 + uSunColor * (ndl * 0.72 + wrap * 0.22));
         col = mix(col, roofCol, roof);
 
         gl_FragColor = vec4(col, 1.0);
         #include <fog_fragment>
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
       }
     `,
   });
+}
+
+// Weathered Karst limestone / retaining-wall foundation plinths (no windows).
+function makePlinthMaterial() {
+  return new THREE.ShaderMaterial({
+    fog: true,
+    uniforms: THREE.UniformsUtils.merge([
+      THREE.UniformsLib.fog,
+      {
+        uSunDir: { value: new THREE.Vector3(0.3, 0.8, 0.2) },
+        uSunColor: { value: new THREE.Color(0xfff2d8) },
+        uAmbient: { value: new THREE.Color(0x334455) },
+        uNight: { value: 0 },
+        uCullDist: { value: 24000 },
+      },
+    ]),
+    vertexShader: /* glsl */`
+      varying vec3 vWorld;
+      varying vec3 vN;
+      varying vec3 vLocal;
+      varying vec3 vScale;
+      varying vec3 vCol;
+      #include <fog_pars_vertex>
+      void main() {
+        vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0);
+        vWorld = wp.xyz;
+        vN = normalize(mat3(instanceMatrix) * normal);
+        vLocal = position;
+        vScale = vec3(
+          length(instanceMatrix[0].xyz),
+          length(instanceMatrix[1].xyz),
+          length(instanceMatrix[2].xyz)
+        );
+        #ifdef USE_INSTANCING_COLOR
+          vCol = instanceColor;
+        #else
+          vCol = vec3(0.55, 0.52, 0.46);
+        #endif
+        vec4 mvPosition = viewMatrix * wp;
+        gl_Position = projectionMatrix * mvPosition;
+        #include <fog_vertex>
+      }
+    `,
+    fragmentShader: /* glsl */`
+      uniform vec3 uSunDir, uSunColor, uAmbient;
+      uniform float uNight, uCullDist;
+      varying vec3 vWorld;
+      varying vec3 vN;
+      varying vec3 vLocal;
+      varying vec3 vScale;
+      varying vec3 vCol;
+      #include <common>
+      #include <fog_pars_fragment>
+
+      ${BAYER_GLSL}
+
+      float h21(vec2 p) {
+        p = fract(p * vec2(127.1, 311.7));
+        p += dot(p, p + 34.5);
+        return fract(p.x * p.y);
+      }
+
+      void main() {
+        float distXZ = length(vWorld.xz - cameraPosition.xz);
+        float fade = smoothstep(uCullDist * 0.86, uCullDist, distXZ);
+        if (fade > 0.001 && fade >= bayer4(gl_FragCoord.xy)) discard;
+
+        vec3 n = normalize(vN);
+        float ndl = max(dot(n, uSunDir), 0.0);
+        float wrap = max(dot(n, uSunDir) * 0.5 + 0.5, 0.0);
+
+        // Dressed Karst stone courses (subtle horizontal beds + block variation).
+        float courseY = floor(vWorld.y / 0.85);
+        float blockX = floor((vWorld.x + vWorld.z) / 1.6 + mod(courseY, 2.0) * 0.5);
+        float stoneVar = 0.86 + 0.24 * h21(vec2(blockX, courseY));
+        float mortarY = smoothstep(0.0, 0.12, fract(vWorld.y / 0.85));
+        vec3 base = vCol * stoneVar * (0.86 + 0.14 * mortarY);
+
+        vec3 col = base * (uAmbient * 1.10 + uSunColor * (ndl * 0.68 + wrap * 0.22));
+        // Ground contact darkening along the base of the retaining wall.
+        col *= mix(0.76, 1.0, smoothstep(0.0, 0.35, vLocal.y));
+        col *= 1.0 - uNight * 0.25;
+
+        gl_FragColor = vec4(col, 1.0);
+        #include <fog_fragment>
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+}
+
+// 3D pitched terracotta / dark slate / industrial metal roof shader.
+function makeRoofMaterial() {
+  return new THREE.ShaderMaterial({
+    fog: true,
+    uniforms: THREE.UniformsUtils.merge([
+      THREE.UniformsLib.fog,
+      {
+        uSunDir: { value: new THREE.Vector3(0.3, 0.8, 0.2) },
+        uSunColor: { value: new THREE.Color(0xfff2d8) },
+        uAmbient: { value: new THREE.Color(0x334455) },
+        uNight: { value: 0 },
+        uCullDist: { value: 24000 },
+      },
+    ]),
+    vertexShader: /* glsl */`
+      varying vec3 vWorld;
+      varying vec3 vN;
+      varying vec3 vLocal;
+      varying vec3 vScale;
+      varying vec3 vCol;
+      #include <fog_pars_vertex>
+      void main() {
+        vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0);
+        vWorld = wp.xyz;
+        // Correct normal transform under non-uniform instance scale (pitch rise).
+        vec3 sx = vec3(
+          length(instanceMatrix[0].xyz),
+          length(instanceMatrix[1].xyz),
+          length(instanceMatrix[2].xyz)
+        );
+        vScale = sx;
+        vec3 invS = vec3(1.0 / max(sx.x, 0.01), 1.0 / max(sx.y, 0.01), 1.0 / max(sx.z, 0.01));
+        vec3 rotN = mat3(
+          instanceMatrix[0].xyz * invS.x,
+          instanceMatrix[1].xyz * invS.y,
+          instanceMatrix[2].xyz * invS.z
+        ) * (normal * invS);
+        vN = normalize(rotN);
+        vLocal = position;
+        #ifdef USE_INSTANCING_COLOR
+          vCol = instanceColor;
+        #else
+          vCol = vec3(0.52, 0.24, 0.16);
+        #endif
+        vec4 mvPosition = viewMatrix * wp;
+        gl_Position = projectionMatrix * mvPosition;
+        #include <fog_vertex>
+      }
+    `,
+    fragmentShader: /* glsl */`
+      uniform vec3 uSunDir, uSunColor, uAmbient;
+      uniform float uNight, uCullDist;
+      varying vec3 vWorld;
+      varying vec3 vN;
+      varying vec3 vLocal;
+      varying vec3 vScale;
+      varying vec3 vCol;
+      #include <common>
+      #include <fog_pars_fragment>
+
+      ${BAYER_GLSL}
+
+      float h21(vec2 p) {
+        p = fract(p * vec2(123.34, 456.21));
+        p += dot(p, p + 45.32);
+        return fract(p.x * p.y);
+      }
+
+      void main() {
+        float distXZ = length(vWorld.xz - cameraPosition.xz);
+        float fade = smoothstep(uCullDist * 0.86, uCullDist, distXZ);
+        if (fade > 0.001 && fade >= bayer4(gl_FragCoord.xy)) discard;
+
+        vec3 n = normalize(vN);
+        float ndl = max(dot(n, uSunDir), 0.0);
+        float wrap = max(dot(n, uSunDir) * 0.5 + 0.5, 0.0);
+
+        // Tile courses + subtle ridge highlight + sun-bleached weathering.
+        vec2 rp = vec2(vLocal.x * vScale.x, vLocal.z * vScale.z);
+        float course = 0.93 + 0.07 * sin(vLocal.y * vScale.y * 14.0);
+        float mottle = 0.90 + 0.18 * h21(floor(rp * 0.8) + floor(vCol.rg * 83.0));
+        float ridgeAO = mix(0.88, 1.04, smoothstep(0.0, 1.0, vLocal.y));
+        vec3 base = vCol * course * mottle * ridgeAO;
+        float lum = dot(base, vec3(0.299, 0.587, 0.114));
+        base = mix(base, vec3(lum), 0.18);
+
+        vec3 col = base * (uAmbient * 1.12 + uSunColor * (ndl * 0.72 + wrap * 0.22));
+        col *= 1.0 - uNight * 0.20;
+
+        gl_FragColor = vec4(col, 1.0);
+        #include <fog_fragment>
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+}
+
+// Pure procedural triangular prism: width 1 (X), height 1 (Y in [0..1]),
+// depth 1 (Z), ridge along Z. Used for Primorska gable roofs & industrial halls.
+function makeGableRoofGeometry() {
+  const sn = 1 / Math.hypot(1, 0.5);
+  const nx = 1 * sn;
+  const ny = 0.5 * sn;
+  const positions = new Float32Array([
+    // Left slope (-X facing)
+    -0.5, 0, -0.5,  -0.5, 0,  0.5,   0.0, 1,  0.5,
+    -0.5, 0, -0.5,   0.0, 1,  0.5,   0.0, 1, -0.5,
+    // Right slope (+X facing)
+     0.5, 0, -0.5,   0.0, 1, -0.5,   0.0, 1,  0.5,
+     0.5, 0, -0.5,   0.0, 1,  0.5,   0.5, 0,  0.5,
+    // Front gable (+Z)
+    -0.5, 0,  0.5,   0.5, 0,  0.5,   0.0, 1,  0.5,
+    // Back gable (-Z)
+     0.5, 0, -0.5,  -0.5, 0, -0.5,   0.0, 1, -0.5,
+    // Bottom cap (-Y)
+    -0.5, 0, -0.5,   0.5, 0, -0.5,   0.5, 0,  0.5,
+    -0.5, 0, -0.5,   0.5, 0,  0.5,  -0.5, 0,  0.5,
+  ]);
+  const normals = new Float32Array([
+    -nx, ny, 0,  -nx, ny, 0,  -nx, ny, 0,
+    -nx, ny, 0,  -nx, ny, 0,  -nx, ny, 0,
+     nx, ny, 0,   nx, ny, 0,   nx, ny, 0,
+     nx, ny, 0,   nx, ny, 0,   nx, ny, 0,
+      0,  0, 1,    0,  0, 1,    0,  0, 1,
+      0,  0, -1,   0,  0, -1,   0,  0, -1,
+      0, -1, 0,    0, -1, 0,    0, -1, 0,
+      0, -1, 0,    0, -1, 0,    0, -1, 0,
+  ]);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  geo.computeBoundingSphere();
+  return geo;
+}
+
+// Pure procedural 4-sided pyramid / hipped roof: width 1, height 1 [0..1], depth 1.
+function makeHipRoofGeometry() {
+  const sn = 1 / Math.hypot(1, 0.5);
+  const nh = 1 * sn;
+  const ny = 0.5 * sn;
+  const positions = new Float32Array([
+    // Front (+Z)
+    -0.5, 0,  0.5,   0.5, 0,  0.5,   0.0, 1,  0.0,
+    // Right (+X)
+     0.5, 0,  0.5,   0.5, 0, -0.5,   0.0, 1,  0.0,
+    // Back (-Z)
+     0.5, 0, -0.5,  -0.5, 0, -0.5,   0.0, 1,  0.0,
+    // Left (-X)
+    -0.5, 0, -0.5,  -0.5, 0,  0.5,   0.0, 1,  0.0,
+    // Bottom (-Y)
+    -0.5, 0, -0.5,   0.5, 0, -0.5,   0.5, 0,  0.5,
+    -0.5, 0, -0.5,   0.5, 0,  0.5,  -0.5, 0,  0.5,
+  ]);
+  const normals = new Float32Array([
+      0, ny,  nh,    0, ny,  nh,    0, ny,  nh,
+     nh, ny,   0,   nh, ny,   0,   nh, ny,   0,
+      0, ny, -nh,    0, ny, -nh,    0, ny, -nh,
+    -nh, ny,   0,  -nh, ny,   0,  -nh, ny,   0,
+      0, -1,   0,    0, -1,   0,    0, -1,   0,
+      0, -1,   0,    0, -1,   0,    0, -1,   0,
+  ]);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  geo.computeBoundingSphere();
+  return geo;
 }
 
 // Asphalt with a dashed centre line and crisp shoulders. RepeatWrapping lets
@@ -254,12 +551,12 @@ function makeUrbanTexture() {
   c.width = c.height = S;
   const ctx = c.getContext('2d');
   if (!ctx) return null;
-  ctx.fillStyle = '#5a5d56';
+  ctx.fillStyle = '#8a8679';
   ctx.fillRect(0, 0, S, S);
   const rng = (() => { let a = 987654321; return () => { a = (a * 1664525 + 1013904223) >>> 0; return a / 4294967296; }; })();
   for (let i = 0; i < 2600; i++) {
-    const v = 62 + Math.floor(rng() * 44);
-    ctx.fillStyle = `rgba(${v},${v + 2},${v - 2},${0.1 + rng() * 0.35})`;
+    const v = 104 + Math.floor(rng() * 44);
+    ctx.fillStyle = `rgba(${v + 4},${v + 2},${v - 6},${0.08 + rng() * 0.26})`;
     ctx.fillRect(rng() * S, rng() * S, 2 + rng() * 14, 2 + rng() * 10);
   }
   // Fade the edge broadly so the patch melts into the terrain instead of
@@ -559,10 +856,16 @@ export class BuildingSystem {
     this.stats = {
       buildings: 0, roads: 0, settlements: 0, lights: 0,
       destroyed: 0, craters: 0, ruins: 0, ruinFires: 0,
+      lod: { close: 0, mid: 0, far: 0, roofs: 0, plinths: 0 },
     };
 
     // Everything below needs a scene; in Node we stop here (headless-safe).
     this.mesh = null;
+    this.plinthMesh = null;
+    this.gableRoofMesh = null;
+    this.hipRoofMesh = null;
+    this.plinthMaterial = null;
+    this.roofMaterial = null;
     this.roadMesh = null;
     this.craterMesh = null;
     this.lightMesh = null;
@@ -579,15 +882,46 @@ export class BuildingSystem {
       return;
     }
 
+    // Allocate the instanced pools to hold at least High quality (26k) so
+    // runtime quality switches never exceed the allocated WebGL buffers.
+    const poolCap = Math.max(26000, this.preset.buildingLimit || 16000);
     const geo = new THREE.BoxGeometry(1, 1, 1);
     geo.translate(0, 0.5, 0);
     this.material = makeBuildingMaterial();
-    this.mesh = new THREE.InstancedMesh(geo, this.material, this.preset.buildingLimit || 16000);
+    this.mesh = new THREE.InstancedMesh(geo, this.material, poolCap);
     this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.mesh.frustumCulled = false;
     this.mesh.count = 0;
     this.mesh.name = 'buildings';
     this.scene.add(this.mesh);
+
+    // Batched weathered Karst stone foundation plinths (windowless, grounding
+    // hillside buildings naturally without stretching window facades).
+    const plinthGeo = new THREE.BoxGeometry(1, 1, 1);
+    plinthGeo.translate(0, 0.5, 0);
+    this.plinthMaterial = makePlinthMaterial();
+    this.plinthMesh = new THREE.InstancedMesh(plinthGeo, this.plinthMaterial, poolCap);
+    this.plinthMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.plinthMesh.frustumCulled = false;
+    this.plinthMesh.count = 0;
+    this.plinthMesh.name = 'building-plinths';
+    this.scene.add(this.plinthMesh);
+
+    // Batched 3D pitched gable roofs & hipped roofs / church spires.
+    this.roofMaterial = makeRoofMaterial();
+    this.gableRoofMesh = new THREE.InstancedMesh(makeGableRoofGeometry(), this.roofMaterial, poolCap);
+    this.gableRoofMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.gableRoofMesh.frustumCulled = false;
+    this.gableRoofMesh.count = 0;
+    this.gableRoofMesh.name = 'building-gable-roofs';
+    this.scene.add(this.gableRoofMesh);
+
+    this.hipRoofMesh = new THREE.InstancedMesh(makeHipRoofGeometry(), this.roofMaterial, Math.max(8000, Math.floor(poolCap * 0.5)));
+    this.hipRoofMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.hipRoofMesh.frustumCulled = false;
+    this.hipRoofMesh.count = 0;
+    this.hipRoofMesh.name = 'building-hip-roofs';
+    this.scene.add(this.hipRoofMesh);
 
     // Ruined footprints live in their own instanced mesh: a bombed block is
     // drawn as a multi-piece debris field (wall stubs, slabs, core) without
@@ -597,7 +931,7 @@ export class BuildingSystem {
     this.ruinMesh = new THREE.InstancedMesh(
       ruinGeo,
       this.material,
-      Math.max(2000, this.preset.ruinLimit || this.preset.buildingLimit || 16000),
+      Math.max(2000, this.preset.ruinLimit || poolCap),
     );
     this.ruinMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.ruinMesh.frustumCulled = false;
@@ -636,7 +970,7 @@ export class BuildingSystem {
     this.groundMaterial = new THREE.MeshLambertMaterial({
       map: makeUrbanTexture(),
       transparent: true,
-      opacity: 0.38,
+      opacity: 0.18,
       depthWrite: false,
       polygonOffset: true,
       polygonOffsetFactor: -1,
@@ -703,10 +1037,17 @@ export class BuildingSystem {
     if (this._cratersDirty && !this._needsRebuild) this._rebuildCraters();
     if (!camera) return;
     if (sky) {
-      this.material.uniforms.uSunDir.value.copy(sky.sunDir);
-      this.material.uniforms.uSunColor.value.copy(sky.sunColor);
-      this.material.uniforms.uAmbient.value.copy(sky.skyColor).multiplyScalar(0.55).addScalar(0.12);
-      this.material.uniforms.uNight.value = sky.night;
+      for (const mat of [this.material, this.plinthMaterial, this.roofMaterial]) {
+        if (!mat) continue;
+        mat.uniforms.uSunDir.value.copy(sky.sunDir);
+        mat.uniforms.uSunColor.value.copy(sky.sunColor);
+        mat.uniforms.uAmbient.value
+          .copy(sky.skyColor)
+          .multiplyScalar(0.65)
+          .addScalar(0.18)
+          .multiplyScalar(1.0 - sky.night * 0.75);
+        mat.uniforms.uNight.value = sky.night;
+      }
       this.lightMaterial.opacity = clamp(sky.night * 1.3, 0, 0.95);
       this.lightMesh.visible = sky.night > 0.12 && this.lightMesh.count > 0;
     }
@@ -714,7 +1055,7 @@ export class BuildingSystem {
     const dx = camera.position.x - this._lastX;
     const dz = camera.position.z - this._lastZ;
     const dAlt = Math.abs(camera.position.y - this._lastAlt);
-    if (dx * dx + dz * dz > 500 * 500 || dAlt > 900 || this._needsRebuild) {
+    if (dx * dx + dz * dz > 250 * 250 || dAlt > 650 || this._needsRebuild) {
       this.rebuild(camera);
     }
   }
@@ -725,26 +1066,47 @@ export class BuildingSystem {
   /**
    * Swap the procedural city for a baked real-world building set.
    *
-   * Each `rawList` item is `[x, z, w, d, h, rot, kindCode]` in world metres,
-   * with `kindCode` 0 = house, 1 = apartment, 2 = industrial, 3 = tower. The
-   * whole list becomes one virtual settlement (`id: 'vipava-osm'`, type
-   * `metro`, radius 22 km) so grounding, side-wall hits, cumulative damage,
-   * burn/collapse and permanent ruins all run through the existing pipeline.
-   * Procedural settlements inside the 100 km DEM box are dropped while baked
-   * buildings are active; those outside it survive.
+   * Accepts both legacy 7-element tuples `[x, z, w, d, h, rot, kindCode]` and
+   * compact binary 10-element tuples
+   * `[x, z, w, d, h, rot, kindCode, roofCode, tier, colorSeed]`.
+   * Builds a 1 km spatial chunk index so 50k+ buildings stream in O(visible).
    *
    * Passing `null` (or an empty list) reverts cleanly to procedural cities.
    *
+   * @param {Array<number[]>|null} rawList
+   * @param {Array|null} urbanZones optional town/village ground footprints
    * @returns {object|null} the virtual settlement, or null when reverting
    */
-  setCustomBuildings(rawList) {
+  setCustomBuildings(rawList, urbanZones = null) {
     if (!Array.isArray(rawList) || rawList.length === 0) {
       this.customSettlement = null;
       this._needsRebuild = true;
       return null;
     }
 
+    // Prepare runway exclusion strips for every active custom airport (in
+    // addition to the fixed LJAJ strip at the DEM centre).
+    const customAps = getCustomAirports();
+    const apStrips = [];
+    if (Array.isArray(customAps)) {
+      for (const ap of customAps) {
+        if (!ap || !Number.isFinite(ap.x) || !Number.isFinite(ap.z)) continue;
+        const rad = ((Number(ap.heading) || 0) * Math.PI) / 180;
+        const halfLen = (Number(ap.length) || 1600) * 0.5 + 80;
+        const halfWid = Math.max((Number(ap.width) || 36) * 1.5, 65);
+        apStrips.push({
+          x: ap.x,
+          z: ap.z,
+          dirX: Math.sin(rad),
+          dirZ: -Math.cos(rad),
+          halfLen,
+          halfWid,
+        });
+      }
+    }
+
     const buildings = [];
+    const cells = new Map();
     for (const item of rawList) {
       if (!Array.isArray(item) || item.length < 7) continue;
       const x = Number(item[0]);
@@ -755,11 +1117,57 @@ export class BuildingSystem {
       const rot = Number(item[5]);
       if (!Number.isFinite(x) || !Number.isFinite(z) || !Number.isFinite(rot)) continue;
       if (!(w > 0) || !(d > 0) || !(h > 0)) continue;
-      // Never drop an OSM building on the real Ajdovscina runway (RWY 09/27).
-      if (Math.abs(x) < LJAJ_RUNWAY_HALF_LENGTH_M && Math.abs(z) < LJAJ_RUNWAY_HALF_WIDTH_M) continue;
-      const kind = CUSTOM_KINDS[Math.floor(Number(item[6])) | 0] || 'house';
-      const palette = CUSTOM_PALETTE[kind];
-      buildings.push({
+      // When no custom airport list is installed (headless unit tests), keep
+      // the fallback LJAJ runway-strip exclusion at the DEM centre; when real
+      // custom airports ARE active, exclude along each airport's exact runway
+      // and apron footprint so downtown Ajdovščina is never clipped.
+      if (apStrips.length === 0) {
+        if (Math.abs(x) < LJAJ_RUNWAY_HALF_LENGTH_M && Math.abs(z) < LJAJ_RUNWAY_HALF_WIDTH_M) continue;
+      } else {
+        let onRunway = false;
+        for (let ai = 0; ai < apStrips.length; ai++) {
+          const st = apStrips[ai];
+          const dx = x - st.x;
+          const dz = z - st.z;
+          const along = dx * st.dirX + dz * st.dirZ;
+          const across = -dx * st.dirZ + dz * st.dirX;
+          if (Math.abs(along) < st.halfLen && Math.abs(across) < st.halfWid) {
+            onRunway = true;
+            break;
+          }
+        }
+        if (onRunway) continue;
+      }
+
+      const kindCode = Math.floor(Number(item[6])) | 0;
+      const kind = CUSTOM_KINDS[kindCode] || 'house';
+      const palette = CUSTOM_PALETTE[kind] || CUSTOM_PALETTE.house;
+
+      const area = w * d;
+      let roofCode;
+      if (item.length >= 8 && Number.isFinite(Number(item[7]))) {
+        roofCode = Math.floor(Number(item[7])) | 0;
+      } else if (kind === 'church') roofCode = 4;
+      else if (kind === 'industrial') roofCode = 3;
+      else if (kind === 'tower' || (kind === 'apartment' && h >= 14)) roofCode = 2;
+      else roofCode = 0;
+
+      let tier;
+      if (item.length >= 9 && Number.isFinite(Number(item[8]))) {
+        tier = clamp(Math.floor(Number(item[8])) | 0, 0, 2);
+      } else if (kind === 'church' || kind === 'tower' || h >= 12 || area >= 320) {
+        tier = 2;
+      } else if (kind === 'shed' || area < 55) {
+        tier = 0;
+      } else {
+        tier = 1;
+      }
+
+      const colorSeed = item.length >= 10 && Number.isFinite(Number(item[9]))
+        ? (Math.floor(Number(item[9])) & 255)
+        : Math.floor(hash2(Math.round(x), Math.round(z), 0x51ed270b) * 256);
+
+      const b = {
         x,
         z,
         w,
@@ -767,8 +1175,42 @@ export class BuildingSystem {
         h,
         rot,
         kind,
-        color: palette[Math.floor(hash2(Math.round(x), Math.round(z), 0x51ed270b) * palette.length)],
-      });
+        roofCode,
+        tier,
+        colorSeed,
+        color: palette[colorSeed % palette.length],
+      };
+      buildings.push(b);
+
+      const cx = Math.floor(x / SPATIAL_CELL_SIZE);
+      const cz = Math.floor(z / SPATIAL_CELL_SIZE);
+      const ck = cellKey(cx, cz);
+      let bucket = cells.get(ck);
+      if (!bucket) {
+        bucket = [];
+        cells.set(ck, bucket);
+      }
+      bucket.push(b);
+    }
+
+    const zones = [];
+    if (Array.isArray(urbanZones)) {
+      for (let i = 0; i < urbanZones.length; i++) {
+        const zItem = urbanZones[i];
+        if (!zItem) continue;
+        const zx = Array.isArray(zItem) ? Number(zItem[0]) : Number(zItem.x);
+        const zz = Array.isArray(zItem) ? Number(zItem[1]) : Number(zItem.z);
+        const zr = Array.isArray(zItem) ? Number(zItem[2]) : Number(zItem.radius ?? zItem.r);
+        const zd = Array.isArray(zItem) ? Number(zItem[3] ?? 1) : Number(zItem.density ?? 1);
+        if (!Number.isFinite(zx) || !Number.isFinite(zz) || !(zr > 20)) continue;
+        zones.push({
+          id: `uz:${i}`,
+          x: zx,
+          z: zz,
+          radius: Math.min(zr * 0.72, 280),
+          density: Number.isFinite(zd) ? zd : 1,
+        });
+      }
     }
 
     this.customSettlement = {
@@ -780,32 +1222,47 @@ export class BuildingSystem {
       radius: CUSTOM_SETTLEMENT_RADIUS,
       population: buildings.length * 3,
       buildings,
+      cells,
+      urbanZones: zones,
       roads: [],
     };
     this._needsRebuild = true;
     return this.customSettlement;
   }
 
+  /** Iterate buildings of `s` overlapping the square `(cx ± r, cz ± r)`. */
+  _buildingsInBox(s, cx, cz, r) {
+    if (!s.cells) return s.buildings;
+    const x0 = Math.floor((cx - r) / SPATIAL_CELL_SIZE);
+    const x1 = Math.floor((cx + r) / SPATIAL_CELL_SIZE);
+    const z0 = Math.floor((cz - r) / SPATIAL_CELL_SIZE);
+    const z1 = Math.floor((cz + r) / SPATIAL_CELL_SIZE);
+    const out = [];
+    for (let ix = x0; ix <= x1; ix++) {
+      for (let iz = z0; iz <= z1; iz++) {
+        const bucket = s.cells.get(cellKey(ix, iz));
+        if (!bucket) continue;
+        for (let i = 0; i < bucket.length; i++) out.push(bucket[i]);
+      }
+    }
+    return out;
+  }
+
   /**
    * Settlements visible in the query circle, with the baked OSM city swapped in.
-   * While it is active, procedural cities inside the DEM box are hidden so the
-   * real valley is not covered by an invented grid; everything outside survives.
+   * While it is active the real-world theater owns the whole map: no invented
+   * procedural grid is returned at any distance, because the baked DEM/ortho
+   * (and the live Terrarium stream) now covers coasts, sea and far terrain that
+   * the procedural site cache once treated as dry land.
    */
   _settlementsNear(x, z, radius) {
-    const near = settlementsNear(x, z, radius);
     const custom = this.customSettlement;
-    if (!custom) return near;
+    if (!custom) return settlementsNear(x, z, radius);
 
-    const out = [];
-    for (const s of near) {
-      if (Math.abs(s.x) <= DEM_HALF && Math.abs(s.z) <= DEM_HALF) continue;
-      out.push(s);
-    }
     const dx = custom.x - x;
     const dz = custom.z - z;
     const reach = radius + custom.radius;
-    if (dx * dx + dz * dz <= reach * reach) out.unshift(custom);
-    return out;
+    return dx * dx + dz * dz <= reach * reach ? [custom] : [];
   }
 
   // -------------------------------------------------------------------------
@@ -849,7 +1306,8 @@ export class BuildingSystem {
 
     const near = this._settlementsNear(px, pz, splash + 1600);
     for (const s of near) {
-      for (const b of s.buildings) {
+      const candidates = s.cells ? this._buildingsInBox(s, px, pz, splash + 140) : s.buildings;
+      for (const b of candidates) {
         const key = buildingKey(s, b);
         if (this.destroyed.has(key) || this.collapsing.has(key)) continue;
         const reach = splash + Math.max(b.w, b.d) * 0.4;
@@ -989,7 +1447,8 @@ export class BuildingSystem {
       const sReach = s.radius + halfLen + 60;
       if (sdx * sdx + sdz * sdz > sReach * sReach) continue;
 
-      for (const b of s.buildings) {
+      const candidates = s.cells ? this._buildingsInBox(s, mx, mz, halfLen + 140) : s.buildings;
+      for (const b of candidates) {
         const key = buildingKey(s, b);
         if (this.destroyed.has(key)) continue;
 
@@ -1112,7 +1571,7 @@ export class BuildingSystem {
   }
 
   // -------------------------------------------------------------------------
-  // Grounding cache: footprint corners never move, so sample them once.
+  // Grounding cache: 5-point rotated corners + center + terrain-LOD sag margin.
   // -------------------------------------------------------------------------
   _ground(b) {
     let g = this._groundCache.get(b);
@@ -1121,16 +1580,55 @@ export class BuildingSystem {
     const s = Math.sin(b.rot);
     const hw = b.w * 0.5;
     const hd = b.d * 0.5;
-    let lo = Infinity;
-    let hi = -Infinity;
-    for (let i = 0; i < 4; i++) {
-      const su = (i & 1) ? hw : -hw;
-      const sv = (i & 2) ? hd : -hd;
-      const h = terrainHeight(b.x + su * c - sv * s, b.z + su * s + sv * c);
-      if (h < lo) lo = h;
-      if (h > hi) hi = h;
+    // Exact Three.js Euler(0, rot, 0) world transform:
+    //   wx = x + su * cos(rot) + sv * sin(rot)
+    //   wz = z - su * sin(rot) + sv * cos(rot)
+    const h0 = terrainHeight(b.x - hw * c - hd * s, b.z + hw * s - hd * c);
+    const h1 = terrainHeight(b.x + hw * c - hd * s, b.z - hw * s - hd * c);
+    const h2 = terrainHeight(b.x - hw * c + hd * s, b.z + hw * s + hd * c);
+    const h3 = terrainHeight(b.x + hw * c + hd * s, b.z - hw * s + hd * c);
+    const centerH = terrainHeight(b.x, b.z);
+
+    let lo = h0;
+    if (h1 < lo) lo = h1;
+    if (h2 < lo) lo = h2;
+    if (h3 < lo) lo = h3;
+    if (centerH < lo) lo = centerH;
+
+    let hi = h0;
+    if (h1 > hi) hi = h1;
+    if (h2 > hi) hi = h2;
+    if (h3 > hi) hi = h3;
+    if (centerH > hi) hi = centerH;
+
+    const avgCorner = (h0 + h1 + h2 + h3) * 0.25;
+    const curvMargin = Math.abs(centerH - avgCorner) * 1.5;
+    const slopeRelief = hi - lo;
+    const plinthDepth = Math.max(6.0, Math.min(36.0, 4.5 + slopeRelief * 0.55 + curvMargin * 2.0));
+
+    let floorY;
+    if (slopeRelief <= 3.0) {
+      floorY = lo + slopeRelief * 0.35;
+    } else {
+      floorY = Math.max(centerH, hi - Math.min(b.h * 0.45, 3.2));
     }
-    g = { base: lo - 1.2, top: hi + b.h, ground: lo };
+    // Guarantee the roof is never buried below the uphill corner (even for
+    // short sheds on steep terrain) while keeping habitable walls proportional.
+    const minRoofClear = Math.min(b.h * 0.72, 1.8);
+    if (floorY + b.h < hi + minRoofClear) {
+      floorY = hi + minRoofClear - b.h;
+    }
+    if (floorY < lo) floorY = lo;
+
+    const plinthBase = lo - plinthDepth;
+    g = {
+      base: plinthBase,
+      floorY,
+      top: floorY + b.h,
+      ground: lo,
+      hi,
+      relief: slopeRelief,
+    };
     this._groundCache.set(b, g);
     return g;
   }
@@ -1141,12 +1639,9 @@ export class BuildingSystem {
   /**
    * Buildings of `s` that should be drawn from the current camera position.
    *
-   * Small procedural settlements return their list untouched. The large baked
-   * OSM settlement streams per building: everything outside
-   * `clamp(buildingRadius + alt * 5, buildingRadius, 24 km)` is skipped, so
-   * flying into any of the ten valley towns always draws that town first, and
-   * when more buildings are in range than the instance budget allows the
-   * nearest ones win.
+   * Uses the 1 km spatial cell index when present (`O(visible cells)` instead
+   * of scanning 50k+ buildings). Returns buildings within `radius` capped to
+   * the nearest `budget`.
    *
    * @param {object} s settlement
    * @param {number} camX
@@ -1163,12 +1658,33 @@ export class BuildingSystem {
 
     const r2 = radius * radius;
     const picks = [];
-    for (const b of s.buildings) {
-      const dx = b.x - camX;
-      const dz = b.z - camZ;
-      const d2 = dx * dx + dz * dz;
-      if (d2 > r2) continue;
-      picks.push({ b, d2 });
+    if (s.cells) {
+      const x0 = Math.floor((camX - radius) / SPATIAL_CELL_SIZE);
+      const x1 = Math.floor((camX + radius) / SPATIAL_CELL_SIZE);
+      const z0 = Math.floor((camZ - radius) / SPATIAL_CELL_SIZE);
+      const z1 = Math.floor((camZ + radius) / SPATIAL_CELL_SIZE);
+      for (let ix = x0; ix <= x1; ix++) {
+        for (let iz = z0; iz <= z1; iz++) {
+          const bucket = s.cells.get(cellKey(ix, iz));
+          if (!bucket) continue;
+          for (let i = 0; i < bucket.length; i++) {
+            const b = bucket[i];
+            const dx = b.x - camX;
+            const dz = b.z - camZ;
+            const d2 = dx * dx + dz * dz;
+            if (d2 > r2) continue;
+            picks.push({ b, d2 });
+          }
+        }
+      }
+    } else {
+      for (const b of s.buildings) {
+        const dx = b.x - camX;
+        const dz = b.z - camZ;
+        const d2 = dx * dx + dz * dz;
+        if (d2 > r2) continue;
+        picks.push({ b, d2 });
+      }
     }
     if (picks.length > budget) {
       picks.sort((a, b) => a.d2 - b.d2);
@@ -1179,18 +1695,132 @@ export class BuildingSystem {
     return out;
   }
 
+  /**
+   * 4-tier LOD-filtered spatial streaming for rebuild().
+   * Filters buildings by `(dist, b.tier)` right inside the spatial cell loop so
+   * hidden distant sheds/houses never consume budget or sort time.
+   */
+  _streamBuildingsLOD(s, camX, camZ, rClose, rMid, rFar, budget) {
+    if (!(budget > 0)) return [];
+    const rClose2 = rClose * rClose;
+    const rMid2 = rMid * rMid;
+    const rFar2 = rFar * rFar;
+
+    const nearPicks = [];
+    const farPicks = [];
+    const visit = (b) => {
+      const dx = b.x - camX;
+      const dz = b.z - camZ;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > rFar2) return;
+      const bTier = b.tier !== undefined ? b.tier
+        : (b.kind === 'tower' || b.kind === 'church' || b.h >= 12 || b.w * b.d >= 320
+          ? 2 : (b.kind === 'shed' || b.w * b.d < 55 ? 0 : 1));
+      if (d2 <= rClose2) {
+        nearPicks.push({ b, d2, lodLevel: 0 });
+      } else if (d2 <= rMid2) {
+        if (bTier < 1) return;
+        nearPicks.push({ b, d2, lodLevel: 1 });
+      } else {
+        if (bTier < 2) return;
+        farPicks.push({ b, d2, lodLevel: 2 });
+      }
+    };
+
+    if (s.cells) {
+      const x0 = Math.floor((camX - rFar) / SPATIAL_CELL_SIZE);
+      const x1 = Math.floor((camX + rFar) / SPATIAL_CELL_SIZE);
+      const z0 = Math.floor((camZ - rFar) / SPATIAL_CELL_SIZE);
+      const z1 = Math.floor((camZ + rFar) / SPATIAL_CELL_SIZE);
+      for (let ix = x0; ix <= x1; ix++) {
+        for (let iz = z0; iz <= z1; iz++) {
+          const bucket = s.cells.get(cellKey(ix, iz));
+          if (!bucket) continue;
+          for (let i = 0; i < bucket.length; i++) visit(bucket[i]);
+        }
+      }
+    } else {
+      for (let i = 0; i < s.buildings.length; i++) visit(s.buildings[i]);
+    }
+
+    // Always reserve a skyline slice (up to 10% of budget) for Tier 2 far
+    // prominent buildings so distant towns/churches never vanish when flying
+    // over a dense valley city like Nova Gorica / Gorizia.
+    const farReserve = farPicks.length > 0
+      ? Math.min(farPicks.length, Math.max(200, Math.floor(budget * 0.10)))
+      : 0;
+    if (farPicks.length > farReserve) {
+      farPicks.sort((a, b) => a.d2 - b.d2);
+      farPicks.length = farReserve;
+    }
+    // Account for multi-box close silhouettes (~1.55 boxes/building on average)
+    // so the far skyline entries always fit inside the remaining instance slots.
+    // Always sort nearPicks nearest-first so close buildings next to the camera
+    // are emitted before distant ones and never dropped when approaching limit.
+    const nearBudget = Math.max(0, Math.floor((budget - farReserve) * 0.68));
+    if (nearPicks.length > 1) nearPicks.sort((a, b) => a.d2 - b.d2);
+    if (nearPicks.length > nearBudget) nearPicks.length = nearBudget;
+    // Emit far skyline landmarks first so close chimneys never starve them.
+    if (farPicks.length === 0) return nearPicks;
+    if (nearPicks.length === 0) return farPicks;
+    return farPicks.concat(nearPicks);
+  }
+
   // -------------------------------------------------------------------------
   // Rebuild the visible set around the camera
   // -------------------------------------------------------------------------
   rebuild(camera) {
     if (!this.scene || !camera) return;
+    const camX = camera.position.x;
+    const camZ = camera.position.z;
     const alt = Math.max(0, camera.position.y);
+
+    const lodCfg = LOD_THRESHOLDS[this.preset.name] || LOD_THRESHOLDS.medium;
+    const altBoost = Math.min(alt * 0.3, 600);
+    const rClose = lodCfg.close + altBoost * 0.5;
+    const rMid = lodCfg.mid + altBoost;
+    const rFar = clamp(lodCfg.far + alt * 2.5, lodCfg.far, Math.max(lodCfg.far + 4000, 28000));
+
+    // Synchronize smooth shader dissolve radius across walls, plinths and roofs.
+    for (const mat of [this.material, this.plinthMaterial, this.roofMaterial]) {
+      if (mat && mat.uniforms && mat.uniforms.uCullDist) {
+        mat.uniforms.uCullDist.value = rFar;
+      }
+    }
+
     const baseRadius = this.preset.buildingRadius || 8000;
-    const radius = clamp(baseRadius + alt * 5, baseRadius, LARGE_SETTLEMENT_RADIUS);
-    const settlements = this._settlementsNear(camera.position.x, camera.position.z, radius);
+    const queryRadius = this.customSettlement
+      ? rFar
+      : clamp(baseRadius + alt * 5, baseRadius, LARGE_SETTLEMENT_RADIUS);
+    const settlements = this._settlementsNear(camX, camZ, queryRadius);
     this._groundUse.clear();
     for (const s of settlements) {
-      if (s.id === CUSTOM_SETTLEMENT_ID) continue; // real OSM city: no giant ground decal
+      if (s.id === CUSTOM_SETTLEMENT_ID) {
+        // Real OSM towns: drape subtle urban ground patches for the nearest
+        // clustered urban zones so mid/far towns stay legible from cruise alt.
+        const uzList = s.urbanZones;
+        if (Array.isArray(uzList) && uzList.length > 0) {
+          const uzRange2 = (rFar + 1200) * (rFar + 1200);
+          const nearZones = [];
+          for (let i = 0; i < uzList.length; i++) {
+            const uz = uzList[i];
+            const dx = uz.x - camX;
+            const dz = uz.z - camZ;
+            const d2 = dx * dx + dz * dz;
+            if (d2 <= uzRange2) nearZones.push({ uz, d2 });
+          }
+          if (nearZones.length > 42) {
+            nearZones.sort((a, b) => a.d2 - b.d2);
+            nearZones.length = 42;
+          }
+          for (let i = 0; i < nearZones.length; i++) {
+            const uz = nearZones[i].uz;
+            this._ensureGround(uz);
+            this._groundUse.add(uz.id);
+          }
+        }
+        continue;
+      }
       if (s.type === 'metro' || s.type === 'town') {
         this._ensureGround(s);
         this._groundUse.add(s.id);
@@ -1204,12 +1834,25 @@ export class BuildingSystem {
     }
 
     let n = 0;
+    let pn = 0;
+    let gn = 0;
+    let hn = 0;
     let rn = 0;
     let ln = 0;
+    let lodClose = 0;
+    let lodMid = 0;
+    let lodFar = 0;
     let colorDirty = false;
+    let plinthColorDirty = false;
+    let gableColorDirty = false;
+    let hipColorDirty = false;
     let ruinColorDirty = false;
 
-    const limit = this.preset.buildingLimit || 16000;
+    const meshCap = this.mesh ? this.mesh.instanceMatrix.count : 0;
+    const limit = Math.min(this.preset.buildingLimit || 16000, meshCap);
+    const plinthLimit = this.plinthMesh ? this.plinthMesh.instanceMatrix.count : 0;
+    const gableLimit = this.gableRoofMesh ? this.gableRoofMesh.instanceMatrix.count : 0;
+    const hipLimit = this.hipRoofMesh ? this.hipRoofMesh.instanceMatrix.count : 0;
     const ruinLimit = this.ruinMesh ? this.ruinMesh.instanceMatrix.count : 0;
     const lightLimit = this.lightMesh.instanceMatrix.count;
 
@@ -1225,6 +1868,56 @@ export class BuildingSystem {
       this.mesh.setColorAt(n, _c);
       n++;
       colorDirty = true;
+      return true;
+    };
+
+    const addPlinth = (x, baseY, z, w, h, d, rot, color) => {
+      if (pn >= plinthLimit || !(h > 0) || !(w > 0) || !(d > 0)) return false;
+      _p.set(x, baseY, z);
+      _e.set(0, rot || 0, 0);
+      _q.setFromEuler(_e);
+      _s.set(w, h, d);
+      _m.compose(_p, _q, _s);
+      this.plinthMesh.setMatrixAt(pn, _m);
+      _c.setHex(color).convertSRGBToLinear();
+      this.plinthMesh.setColorAt(pn, _c);
+      pn++;
+      plinthColorDirty = true;
+      return true;
+    };
+
+    const addGableRoof = (x, baseY, z, w, rise, d, rot, color) => {
+      if (gn >= gableLimit || !(rise > 0) || !(w > 0) || !(d > 0)) return false;
+      // Orient ridge along the longer horizontal footprint axis.
+      const wide = w > d;
+      const rw = (wide ? d : w) * 1.06;
+      const rd = (wide ? w : d) * 1.06;
+      const rRot = (rot || 0) + (wide ? Math.PI * 0.5 : 0);
+      _p.set(x, baseY, z);
+      _e.set(0, rRot, 0);
+      _q.setFromEuler(_e);
+      _s.set(rw, rise, rd);
+      _m.compose(_p, _q, _s);
+      this.gableRoofMesh.setMatrixAt(gn, _m);
+      _c.setHex(color).convertSRGBToLinear();
+      this.gableRoofMesh.setColorAt(gn, _c);
+      gn++;
+      gableColorDirty = true;
+      return true;
+    };
+
+    const addHipRoof = (x, baseY, z, w, rise, d, rot, color, overhang = 1.06) => {
+      if (hn >= hipLimit || !(rise > 0) || !(w > 0) || !(d > 0)) return false;
+      _p.set(x, baseY, z);
+      _e.set(0, rot || 0, 0);
+      _q.setFromEuler(_e);
+      _s.set(w * overhang, rise, d * overhang);
+      _m.compose(_p, _q, _s);
+      this.hipRoofMesh.setMatrixAt(hn, _m);
+      _c.setHex(color).convertSRGBToLinear();
+      this.hipRoofMesh.setColorAt(hn, _c);
+      hn++;
+      hipColorDirty = true;
       return true;
     };
 
@@ -1245,10 +1938,14 @@ export class BuildingSystem {
       return true;
     };
 
+    const builders = { addBox, addPlinth, addGableRoof, addHipRoof };
+
     for (const s of settlements) {
-      const stream = this._streamBuildings(s, camera.position.x, camera.position.z, radius, limit - n);
-      for (const b of stream) {
+      if (n >= limit) break;
+      const stream = this._streamBuildingsLOD(s, camX, camZ, rClose, rMid, rFar, limit - n);
+      for (let i = 0; i < stream.length; i++) {
         if (n >= limit) break;
+        const { b, lodLevel } = stream[i];
         const g = this._ground(b);
         const key = buildingKey(s, b);
         if (this.destroyed.has(key)) {
@@ -1262,6 +1959,10 @@ export class BuildingSystem {
           this._addCollapse(addBox, b, g, c);
           continue;
         }
+        if (lodLevel === 0) lodClose++;
+        else if (lodLevel === 1) lodMid++;
+        else lodFar++;
+
         // Partially strafed blocks darken toward char as their HP drains.
         let tint = 1;
         const hp = this.buildingHp.get(key);
@@ -1269,13 +1970,25 @@ export class BuildingSystem {
           const ratio = clamp(hp / this._hpFor(b), 0, 1);
           tint = 0.58 + 0.42 * ratio;
         }
-        this._addSilhouette(addBox, b, g.base, g.top, tint);
+        this._addSilhouette(builders, b, g, lodLevel, tint);
       }
     }
 
     this.mesh.count = n;
     this.mesh.instanceMatrix.needsUpdate = true;
     if (colorDirty && this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
+
+    this.plinthMesh.count = pn;
+    this.plinthMesh.instanceMatrix.needsUpdate = true;
+    if (plinthColorDirty && this.plinthMesh.instanceColor) this.plinthMesh.instanceColor.needsUpdate = true;
+
+    this.gableRoofMesh.count = gn;
+    this.gableRoofMesh.instanceMatrix.needsUpdate = true;
+    if (gableColorDirty && this.gableRoofMesh.instanceColor) this.gableRoofMesh.instanceColor.needsUpdate = true;
+
+    this.hipRoofMesh.count = hn;
+    this.hipRoofMesh.instanceMatrix.needsUpdate = true;
+    if (hipColorDirty && this.hipRoofMesh.instanceColor) this.hipRoofMesh.instanceColor.needsUpdate = true;
 
     this.ruinMesh.count = rn;
     this.ruinMesh.instanceMatrix.needsUpdate = true;
@@ -1288,20 +2001,20 @@ export class BuildingSystem {
     if (this.preset.roadDetail) {
       const streets = [];
       for (const s of settlements) {
-        const sdx = s.x - camera.position.x;
-        const sdz = s.z - camera.position.z;
+        const sdx = s.x - camX;
+        const sdz = s.z - camZ;
         const reach = STREET_RANGE + s.radius;
         if (sdx * sdx + sdz * sdz > reach * reach) continue;
         for (const r of s.roads) streets.push(r);
       }
       roadCount = streets.length;
       const hasRibbon = !!this.roadMesh.geometry.attributes.position;
-      const mdx = camera.position.x - (this._streetX ?? Infinity);
-      const mdz = camera.position.z - (this._streetZ ?? Infinity);
+      const mdx = camX - (this._streetX ?? Infinity);
+      const mdz = camZ - (this._streetZ ?? Infinity);
       if (!hasRibbon || mdx * mdx + mdz * mdz > STREET_REBUILD_DIST * STREET_REBUILD_DIST) {
         this._rebuildStreetRibbons(streets);
-        this._streetX = camera.position.x;
-        this._streetZ = camera.position.z;
+        this._streetX = camX;
+        this._streetZ = camZ;
       }
       for (const r of streets) {
         const dx = r.x2 - r.x1;
@@ -1335,8 +2048,8 @@ export class BuildingSystem {
 
     if (this._cratersDirty) this._rebuildCraters();
 
-    this._lastX = camera.position.x;
-    this._lastZ = camera.position.z;
+    this._lastX = camX;
+    this._lastZ = camZ;
     this._lastAlt = camera.position.y;
     this._needsRebuild = false;
     this.stats.buildings = n;
@@ -1346,51 +2059,167 @@ export class BuildingSystem {
     this.stats.destroyed = this.destroyed.size + this.collapsing.size;
     this.stats.craters = this.craters.length;
     this.stats.ruins = rn;
+    this.stats.lod = {
+      close: lodClose,
+      mid: lodMid,
+      far: lodFar,
+      roofs: gn + hn,
+      plinths: pn,
+    };
   }
 
-  // Ground floor `base` -> `top` boxes for one building, per kind.
-  // `tint` (1 = pristine) darkens a block that has taken structural damage.
-  _addSilhouette(addBox, b, base, top, tint = 1) {
-    const h = top - base;
+  // Authentic Primorska / Karst architecture per kind & LOD tier:
+  //   - windowless Karst stone foundation plinth from g.base to g.floorY + 0.35
+  //   - habitable walls from g.floorY to g.top
+  //   - 3D pitched terracotta/slate gable & hip roofs + church campaniles
+  //   - close-range rooftop details (chimneys, clerestories, penthouses)
+  _addSilhouette(builders, b, g, lodLevel = 0, tint = 1) {
+    const { addBox, addPlinth, addGableRoof, addHipRoof } = builders;
+    const base = g.base;
+    const floorY = g.floorY;
+    const top = g.top;
+    const wallH = Math.max(1.0, top - floorY);
+    const seed = b.colorSeed !== undefined
+      ? b.colorSeed
+      : (Math.floor(hash2(Math.round(b.x), Math.round(b.z), 0x51ed270b) * 256) & 255);
+
     const body = tint >= 0.999 ? b.color : shade(b.color, tint);
-    const dark = shade(body, 0.72);
+    const plinthRaw = PLINTH_STONE[seed % PLINTH_STONE.length];
+    const plinthCol = tint >= 0.999 ? plinthRaw : shade(plinthRaw, tint);
+    const plinthH = Math.max(0.5, floorY + 0.35 - base);
+
+    // Every building rests on a windowless stone retaining plinth extending
+    // well below the lowest footprint corner (eliminates floating & wall stretch).
+    addPlinth(b.x, base, b.z, b.w * 1.03, plinthH, b.d * 1.03, b.rot, plinthCol);
+
+    const roofCode = b.roofCode !== undefined ? b.roofCode
+      : (b.kind === 'church' ? 4
+        : b.kind === 'industrial' ? 3
+          : b.kind === 'tower' ? 2
+            : (b.kind === 'apartment' && b.h >= 14 ? 2 : 0));
+
+    const minSpan = Math.min(b.w, b.d);
+    const maxSpan = Math.max(b.w, b.d);
+    // Natural regional mix: ~58% weathered sun-baked clay/terracotta,
+    // ~26% muted taupe/grey-brown tiles, ~16% dark slate.
+    const roofRoll = seed % 19;
+    const roofRaw = roofRoll < 11
+      ? ROOF_TERRACOTTA[seed % ROOF_TERRACOTTA.length]
+      : roofRoll < 16
+        ? ROOF_TAUPE[seed % ROOF_TAUPE.length]
+        : ROOF_SLATE[seed % ROOF_SLATE.length];
+    const roofCol = tint >= 0.999 ? roofRaw : shade(roofRaw, tint);
+
     switch (b.kind) {
+      case 'church': {
+        // Karst limestone nave + terracotta gable roof + slender white
+        // campanile bell tower with a pointed pyramidal spire.
+        const naveH = wallH * 0.72;
+        const naveTop = floorY + naveH;
+        addBox(b.x, floorY, b.z, b.w, naveH, b.d, b.rot, body);
+        const naveRise = Math.min(8.5, Math.max(2.0, minSpan * 0.32));
+        addGableRoof(b.x, naveTop - 0.1, b.z, b.w, naveRise, b.d, b.rot, roofCol);
+
+        // Campanile at one end of the nave's long axis (exact +rot world offset).
+        const campW = clamp(minSpan * 0.34, 3.2, 6.8);
+        const campH = wallH * (1.35 + (seed % 31) * 0.01);
+        const wide = b.w >= b.d;
+        const lx = wide ? -b.w * 0.42 : 0;
+        const lz = wide ? 0 : -b.d * 0.42;
+        const c = Math.cos(b.rot);
+        const s = Math.sin(b.rot);
+        const tx = b.x + lx * c + lz * s;
+        const tz = b.z - lx * s + lz * c;
+
+        addPlinth(tx, base, tz, campW * 1.12, plinthH, campW * 1.12, b.rot, plinthCol);
+        addBox(tx, floorY, tz, campW, campH, campW, b.rot, body);
+        const spireH = clamp(campW * 1.55, 4.5, 11.5);
+        addHipRoof(tx, floorY + campH - 0.1, tz, campW, spireH, campW, b.rot, roofCol, 1.08);
+        break;
+      }
       case 'tower': {
-        // Wide podium, main shaft, stepped crown, plant room, spire.
-        const podiumH = Math.min(h * 0.16, h - 2);
-        addBox(b.x, base, b.z, b.w * 1.12, podiumH, b.d * 1.12, b.rot, body);
-        addBox(b.x, base + podiumH, b.z, b.w, h - podiumH, b.d, b.rot, body);
-        const crownH = Math.min(12, Math.max(2.5, h * 0.12));
-        const cw = b.w * 0.72;
-        const cd = b.d * 0.72;
-        addBox(b.x, top, b.z, cw, crownH, cd, b.rot, body);
-        addBox(b.x, top + crownH, b.z, cw * 0.34, 2.6, cd * 0.34, b.rot + 0.2, 0x545a5c);
-        if (b.h > 75) {
-          addBox(b.x, top + crownH + 2.6, b.z, 0.8, Math.min(14, b.h * 0.1), 0.8, b.rot, 0x6b7072);
+        const podiumH = Math.min(wallH * 0.16, Math.max(2, wallH - 2));
+        addBox(b.x, floorY, b.z, b.w * 1.08, podiumH, b.d * 1.08, b.rot, body);
+        addBox(b.x, floorY + podiumH, b.z, b.w, wallH - podiumH, b.d, b.rot, body);
+        if (lodLevel <= 1) {
+          const crownH = Math.min(12, Math.max(2.5, wallH * 0.12));
+          const cw = b.w * 0.72;
+          const cd = b.d * 0.72;
+          addBox(b.x, top, b.z, cw, crownH, cd, b.rot, body);
+          addBox(b.x, top + crownH, b.z, cw * 0.34, 2.6, cd * 0.34, b.rot + 0.2, 0x545a5c);
+          if (b.h > 75) {
+            addBox(b.x, top + crownH + 2.6, b.z, 0.8, Math.min(14, b.h * 0.1), 0.8, b.rot, 0x6b7072);
+          }
         }
         break;
       }
       case 'apartment': {
-        addBox(b.x, base, b.z, b.w, h, b.d, b.rot, body);
-        // Rooftop parapet / utility penthouse.
-        addBox(b.x, top, b.z, b.w * 0.82, Math.min(2.2, Math.max(1, h * 0.05)), b.d * 0.82, b.rot, shade(body, 0.85));
+        addBox(b.x, floorY, b.z, b.w, wallH, b.d, b.rot, body);
+        if (roofCode === 1) {
+          const rise = Math.min(4.8, Math.max(1.4, minSpan * 0.16));
+          addHipRoof(b.x, top - 0.1, b.z, b.w, rise, b.d, b.rot, roofCol);
+        } else if (roofCode === 0) {
+          const rise = Math.min(5.0, Math.max(1.4, minSpan * 0.18));
+          addGableRoof(b.x, top - 0.1, b.z, b.w, rise, b.d, b.rot, roofCol);
+        } else if (lodLevel <= 1) {
+          // Flat parapet & rooftop mechanical penthouse.
+          addBox(b.x, top, b.z, b.w * 0.82, Math.min(2.2, Math.max(1, wallH * 0.05)), b.d * 0.82, b.rot, shade(body, 0.85));
+        }
         break;
       }
       case 'industrial': {
-        addBox(b.x, base, b.z, b.w, h, b.d, b.rot, body);
-        // Clerestory roof monitor running the length of the hall.
-        addBox(b.x, top, b.z, b.w * 0.42, 1.6, b.d * 0.88, b.rot, 0x6f736e);
+        addBox(b.x, floorY, b.z, b.w, wallH, b.d, b.rot, body);
+        const indRaw = ROOF_INDUSTRIAL[seed % ROOF_INDUSTRIAL.length];
+        const indRoof = tint >= 0.999 ? indRaw : shade(indRaw, tint);
+        const rise = Math.min(5.5, Math.max(1.1, minSpan * 0.14));
+        addGableRoof(b.x, top - 0.1, b.z, b.w, rise, b.d, b.rot, indRoof);
+        if (lodLevel === 0 && maxSpan >= 16) {
+          // Clerestory roof monitor along the hall ridge at close range.
+          const wide = b.w > b.d;
+          addBox(
+            b.x, top + rise * 0.72, b.z,
+            wide ? b.w * 0.65 : b.w * 0.24,
+            1.4,
+            wide ? b.d * 0.24 : b.d * 0.65,
+            b.rot, 0x6f736e,
+          );
+        }
         break;
       }
       case 'shed': {
-        addBox(b.x, base, b.z, b.w, h, b.d, b.rot, body);
-        addBox(b.x, top, b.z, b.w * 0.94, 0.7, b.d * 0.94, b.rot, dark);
+        addBox(b.x, floorY, b.z, b.w, wallH, b.d, b.rot, body);
+        const shedRoofRaw = (seed & 3) === 0 ? ROOF_INDUSTRIAL[seed % ROOF_INDUSTRIAL.length] : roofRaw;
+        const shedRoof = tint >= 0.999 ? shedRoofRaw : shade(shedRoofRaw, tint);
+        const rise = Math.min(2.6, Math.max(0.7, minSpan * 0.24));
+        addGableRoof(b.x, top - 0.08, b.z, b.w, rise, b.d, b.rot, shedRoof);
         break;
       }
       default: {
-        // house / shop: main block plus a darker stepped roof cap.
-        addBox(b.x, base, b.z, b.w, h, b.d, b.rot, body);
-        addBox(b.x, top, b.z, b.w * 0.88, 1.1, b.d * 0.88, b.rot, dark);
+        // Primorska / Vipava house: warm stucco walls + pitched terracotta
+        // gable (or hipped) roof + close-range terracotta chimney.
+        addBox(b.x, floorY, b.z, b.w, wallH, b.d, b.rot, body);
+        const rise = Math.min(5.2, Math.max(1.2, minSpan * (0.28 + (seed % 11) * 0.01)));
+        if (roofCode === 1) {
+          addHipRoof(b.x, top - 0.1, b.z, b.w, rise, b.d, b.rot, roofCol);
+        } else if (roofCode === 2) {
+          addBox(b.x, top, b.z, b.w * 0.9, 0.9, b.d * 0.9, b.rot, shade(body, 0.78));
+        } else {
+          addGableRoof(b.x, top - 0.1, b.z, b.w, rise, b.d, b.rot, roofCol);
+        }
+        if (lodLevel === 0 && roofCode !== 2 && minSpan >= 5.5) {
+          // Small rooftop chimney protruding on one side of the ridge.
+          const c = Math.cos(b.rot);
+          const s = Math.sin(b.rot);
+          const ox = ((seed & 1) ? 0.18 : -0.18) * b.w;
+          const oz = ((seed & 2) ? 0.18 : -0.18) * b.d;
+          addBox(
+            b.x + ox * c + oz * s,
+            top + rise * 0.55,
+            b.z - ox * s + oz * c,
+            0.75, Math.max(1.1, rise * 0.55), 0.75,
+            b.rot, 0xb8866e,
+          );
+        }
       }
     }
   }
@@ -1473,8 +2302,8 @@ export class BuildingSystem {
         lx = sign * hw;
         lz = (c - 0.5) * b.d * 0.84;
       }
-      const wx = b.x + lx * cos - lz * sin;
-      const wz = b.z + lx * sin + lz * cos;
+      const wx = b.x + lx * cos + lz * sin;
+      const wz = b.z - lx * sin + lz * cos;
 
       const span = alongX ? b.w : b.d;
       const len = span * (0.2 + a * 0.24);
@@ -1622,6 +2451,11 @@ export class BuildingSystem {
     if (!this.scene) return;
     this.mesh.geometry.dispose();
     this.material.dispose();
+    this.plinthMesh?.geometry.dispose();
+    this.plinthMaterial?.dispose();
+    this.gableRoofMesh?.geometry.dispose();
+    this.hipRoofMesh?.geometry.dispose();
+    this.roofMaterial?.dispose();
     this.ruinMesh.geometry.dispose();
     this.roadMesh.geometry.dispose();
     this.roadMaterial.dispose();
@@ -1634,6 +2468,9 @@ export class BuildingSystem {
     this.groundMaterial.map?.dispose();
     this.groundMaterial.dispose();
     this.mesh.removeFromParent();
+    this.plinthMesh?.removeFromParent();
+    this.gableRoofMesh?.removeFromParent();
+    this.hipRoofMesh?.removeFromParent();
     this.ruinMesh.removeFromParent();
     this.roadMesh.removeFromParent();
     this.lightMesh.removeFromParent();

@@ -6,20 +6,31 @@
   "grid": 2048,
   "offset": -200.0,
   "scale": 16.0,
-  "minElevation": -7.7,
-  "maxElevation": 2251.8,
-  "seaFraction": 0.1302,
+  "minElevation": -8.5,
+  "maxElevation": 2257.8,
+  "seaFraction": 0.1306,
+  "hd": {
+    "url": "./media/vipava_dem_hd.png",
+    "grid": 2048,
+    "xMin": -25000.0,
+    "xMax": 15000.0,
+    "zMin": -15000.0,
+    "zMax": 15000.0,
+    "blendM": 1500.0,
+    "offset": -200.0,
+    "scale": 16.0
+  },
   "airports": [
     {
       "id": "LJAJ",
       "code": "LJAJ",
       "name": "Ajdovscina Airfield",
-      "heading": 90,
-      "length": 1800,
-      "width": 36,
-      "x": 0,
-      "z": 0,
-      "elevation": 112.3
+      "heading": 84,
+      "length": 1100,
+      "width": 28,
+      "x": -450,
+      "z": -130,
+      "elevation": 113.1
     },
     {
       "id": "LJPO",
@@ -41,7 +52,7 @@
       "width": 32,
       "x": 8360,
       "z": 23527,
-      "elevation": 436.9
+      "elevation": 440.7
     },
     {
       "id": "LIPQ",
@@ -52,7 +63,7 @@
       "width": 45,
       "x": -32160,
       "z": 6701,
-      "elevation": 7.2
+      "elevation": 7.3
     },
     {
       "id": "LJPZ",
@@ -63,7 +74,18 @@
       "width": 36,
       "x": -21086,
       "z": 46065,
-      "elevation": -1.7
+      "elevation": -1.2
     }
-  ]
+  ],
+  "macro": {
+    "url": "./media/vipava_dem_macro.png",
+    "grid": 1024,
+    "xMin": -250000.0,
+    "xMax": 250000.0,
+    "zMin": -250000.0,
+    "zMax": 250000.0,
+    "blendM": 20000.0,
+    "offset": -200.0,
+    "scale": 16.0
+  }
 }

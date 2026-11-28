@@ -68,6 +68,24 @@ export function baseHeight(x, z) {
   const dem = _activeDEM;
   if (dem === null) return proceduralBaseHeight(x, z);
 
+  // Three-tier DEM stack (HD inset -> regional bake -> 500 km macro bake ->
+  // live z=9 Terrarium tiles). The DEM resolves the whole chain and reports
+  // how much of the result is real data, so procedural terrain only fills the
+  // gaps: open ocean far from every bake, or an offline run past the ring.
+  if (typeof dem.sampleWithFallback === 'function') {
+    const res = dem.sampleWithFallback(x, z);
+    if (res) {
+      const h = res.height;
+      const w = res.weight;
+      if (h !== null && h !== undefined) {
+        if (w >= 0.9999) return h;
+        if (w > 0) return h * w + proceduralBaseHeight(x, z) * (1 - w);
+      }
+    }
+    return proceduralBaseHeight(x, z);
+  }
+
+  // Legacy path for custom/mock DEMs without the resolver.
   const w = dem.blendWeight(x, z);
   if (w > 0) {
     const demH = dem.sample(x, z);

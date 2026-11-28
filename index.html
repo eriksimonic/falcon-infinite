@@ -162,6 +162,7 @@
           <div><kbd>P</kbd><kbd>ESC</kbd><span>Pause</span></div>
           <div><kbd>F5</kbd><span>Weapon follow-cam</span></div>
           <div><kbd>F6</kbd><span>Photo mode (drag orbit · wheel zoom · S saves PNG)</span></div>
+          <div><kbd>CTRL+F</kbd><kbd>F7</kbd><span>Free camera + big inspector map (WASD/QE · M map · 1-9 jump)</span></div>
           <div><kbd>F2</kbd><kbd>F4</kbd><span>Replay / replay speed</span></div>
           <div><kbd>F1</kbd><span>Hide interface</span></div>
           <div><kbd>F3</kbd><span>Performance panel</span></div>
@@ -194,6 +195,54 @@
     <span class="pb-hint">DRAG ORBIT · SCROLL ZOOM · [ ] FOV</span>
     <button id="photo-save" type="button">SAVE PNG (S)</button>
     <button id="photo-exit" type="button">EXIT (F6 / ESC)</button>
+  </div>
+
+  <!-- Detached Free Camera bar (Ctrl+F / F7) -->
+  <div id="freecam-bar" class="hidden">
+    <span class="pb-title">FREE CAM</span>
+    <span class="pb-hint" id="freecam-info">240 M/S</span>
+    <span class="pb-hint">WASD/QE · WHEEL SPEED · SHIFT ×4 · 1-9 JUMP</span>
+    <button id="freecam-map" type="button">MAP (M)</button>
+    <button id="freecam-exit" type="button">EXIT (CTRL+F / ESC)</button>
+  </div>
+
+  <!-- Big Interactive Environment Inspector & Click-to-Teleport Map -->
+  <div id="inspector-map" class="screen hidden">
+    <div class="im-panel">
+      <div class="im-top">
+        <div class="im-title">ENVIRONMENT INSPECTOR · CLICK MAP TO TELEPORT</div>
+        <div class="im-controls">
+          <span class="im-lbl">DROP AGL</span>
+          <button type="button" data-agl="45">45M</button>
+          <button type="button" data-agl="180" class="on">180M</button>
+          <button type="button" data-agl="600">600M</button>
+          <button type="button" data-agl="2000">2KM</button>
+          <button type="button" id="inspector-fit-valley">VALLEY</button>
+          <button type="button" id="inspector-fit-all">100KM</button>
+          <span class="im-lbl">TIME <b id="inspector-time-val">17:36</b></span>
+          <input type="range" id="inspector-time" min="0" max="24" step="0.25" value="17.6" />
+          <select id="inspector-weather">
+            <option value="clear">CLEAR</option>
+            <option value="few">FEW</option>
+            <option value="scattered">SCATTERED</option>
+            <option value="overcast">OVERCAST</option>
+            <option value="storm">STORM</option>
+          </select>
+          <button type="button" id="inspector-close">CLOSE (M / ESC)</button>
+        </div>
+      </div>
+      <div class="im-body">
+        <canvas id="inspector-canvas" width="840" height="620"></canvas>
+        <div class="im-side">
+          <div class="im-side-head">QUICK JUMP (AIRPORTS · LANDMARKS · TOWNS)</div>
+          <div id="inspector-list" class="im-list"></div>
+        </div>
+      </div>
+      <div class="im-foot">
+        <span id="inspector-hover">DRAG TO PAN · WHEEL TO ZOOM · CLICK TO TELEPORT · SHIFT+CLICK KEEP MAP OPEN</span>
+        <span id="inspector-stats"></span>
+      </div>
+    </div>
   </div>
 
   <script type="module" src="/src/main.js"></script>

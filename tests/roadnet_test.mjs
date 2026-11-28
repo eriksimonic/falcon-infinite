@@ -227,6 +227,54 @@ const hillHeight = (x, z) => 10 + 0.25 * x + 0.1 * z;
   check(added.length === 0, 'dispose must remove the mesh from the scene');
 }
 
+// --------------------------------------------- 6. Feature 40 bridged canyon
+{
+  // Deep canyon: 120 m at both ends (x = 0 and x = 300), dipping to 70 m at x = 150.
+  const canyon = (x) => {
+    const u = (x - 150) / 150;
+    return 70 + 50 * u * u;
+  };
+  const bridgeLine = {
+    width: 10.5,
+    bridge: true,
+    points: [{ x: 0, z: 0 }, { x: 150, z: 0 }, { x: 300, z: 0 }],
+  };
+  const data = buildRoadRibbonData([bridgeLine], canyon);
+  check(data.bridgeCount >= 1, `canyon bridge: expected bridgeCount >= 1, got ${data.bridgeCount}`);
+  check(Array.isArray(data.piers) && data.piers.length >= 3,
+    `canyon bridge: expected >= 3 grounded piers, got ${data.piers?.length}`);
+
+  // Every deck vertex must stay smoothly elevated well above the canyon floor.
+  let minDeckY = Infinity;
+  let buried = 0;
+  for (let i = 0; i < data.positions.length / 3; i++) {
+    if (i % 4 >= 2) continue;
+    const x = data.positions[i * 3];
+    const y = data.positions[i * 3 + 1];
+    if (y < minDeckY) minDeckY = y;
+    if (y < canyon(x) + 0.3) buried++;
+  }
+  check(minDeckY >= 119.5, `canyon bridge deck sagged into canyon (minY=${fmt(minDeckY)} m)`);
+  check(buried === 0, `canyon bridge had ${buried} buried deck vertices`);
+
+  // Every pier must reach >= 4 m below the canyon floor and meet the deck underside.
+  for (const pr of data.piers) {
+    const g = canyon(pr.x);
+    check(pr.bottomY <= g - 4.0, `canyon pier at x=${fmt(pr.x)} floats above canyon floor`);
+    check(pr.topY >= 119.0, `canyon pier at x=${fmt(pr.x)} does not reach bridge deck`);
+  }
+
+  // RoadNetwork must preserve `b: 1` in setCustomRoads and attach pierMesh as child of mesh.
+  const added = [];
+  const scene = { add: (o) => added.push(o), remove: (o) => { const i = added.indexOf(o); if (i >= 0) added.splice(i, 1); } };
+  const net = new RoadNetwork(scene, { name: 'medium', roadDetail: true });
+  check(added.length === 1 && added[0] === net.mesh, 'RoadNetwork must still add only 1 root mesh');
+  check(net.pierMesh && net.pierMesh.parent === net.mesh, 'pierMesh must be a child of net.mesh');
+  const parsed = net.setCustomRoads([{ w: 12, b: 1, pts: [[0, 0], [150, 0], [300, 0]] }]);
+  check(!!parsed && parsed[0].bridge === true, 'setCustomRoads did not preserve b === 1 bridge flag');
+  net.dispose();
+}
+
 // -------------------------------------------------------------------- report
 if (failures.length) {
   console.error(`ROADNET CHECKS FAILED (${failures.length}/${checks}):`);

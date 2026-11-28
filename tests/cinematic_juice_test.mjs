@@ -9,7 +9,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import { FlightJuiceSystem } from '../src/sim/juice.js';
-import { WeaponCamSystem, PhotoModeController } from '../src/aircraft/weapon_cam.js';
+import { WeaponCamSystem, PhotoModeController, FreeCamController } from '../src/aircraft/weapon_cam.js';
+import { InspectorMap } from '../src/ui/inspector_map.js';
 import { PostFXSystem } from '../src/sim/postfx.js';
 
 let checks = 0;
@@ -453,6 +454,98 @@ function proj(id, type, x, y, z, vx, vy, vz) {
   ok(/PRIORITY = \{ BFFG: 0, MK82: 1, AIM9: 2 \}/.test(camSrc),
     'ordnance priority is BFFG > MK82 > AIM9');
   ok(/FALCON \/ INFINITE/.test(camSrc), 'snapshot stamp carries the wordmark');
+}
+
+// ---------------------------------------------------------------------------
+// 6. FreeCamController & InspectorMap — headless motion, speed, ground clamp,
+//    teleport & map coordinate round-trip
+// ---------------------------------------------------------------------------
+{
+  const fc = new FreeCamController();
+  const cam = new THREE.PerspectiveCamera(60, 1.6, 0.1, 60000);
+  ok(fc.active === false, 'free cam starts inactive');
+
+  fc.enter(new THREE.Vector3(0, 200, 0), 0, 0);
+  ok(fc.active === true, 'free cam enters cleanly');
+  fc.update(0.1, cam, { forward: 1 }, () => 100);
+  ok(fc.position.z < -20 && Math.abs(cam.position.z - fc.position.z) < 1e-6,
+    'W moves free cam forward along -Z');
+
+  // Ground clearance clamp prevents clipping below terrain + 2 m.
+  fc.teleport(50, 50, 50, 0, 0);
+  fc.update(0.1, cam, { up: -1 }, () => 120);
+  ok(fc.position.y >= 121.99, `free cam clipped below terrain (${fc.position.y})`);
+
+  // Speed wheel clamps between 15 and 5000 m/s.
+  fc.adjustSpeed(100);
+  ok(fc.speed === 5000, `max speed clamp failed (${fc.speed})`);
+  fc.adjustSpeed(-100);
+  ok(fc.speed === 15, `min speed clamp failed (${fc.speed})`);
+
+  fc.exit();
+  ok(fc.active === false, 'free cam exits cleanly');
+
+  // InspectorMap world <-> canvas coordinate round-trip (headless-safe).
+  const imap = new InspectorMap();
+  const cPt = imap.worldToCanvas(-18201, -10035, 840, 620);
+  const wPt = imap.canvasToWorld(cPt.px, cPt.py, 840, 620);
+  ok(Math.abs(wPt.x - (-18201)) < 1e-4 && Math.abs(wPt.z - (-10035)) < 1e-4,
+    'InspectorMap world <-> canvas coordinate round-trip failed');
+}
+
+// ---------------------------------------------------------------------------
+// 7. Last-view persistence — Free Cam pose survives a browser reload
+// ---------------------------------------------------------------------------
+{
+  // main.js owns the browser bootstrap, so its contract is asserted statically
+  // (it cannot be imported headlessly: it pulls CSS and builds a WebGL context).
+  const mainSrc = read('../src/main.js');
+  ok(/const LAST_VIEW_KEY = 'falcon\.lastView\.v1'/.test(mainSrc),
+    'last view persists under falcon.lastView.v1');
+  ok(/\n  _saveLastView\(\) \{/.test(mainSrc), 'main defines _saveLastView()');
+  ok(/\n  _loadLastView\(\) \{/.test(mainSrc), 'main defines _loadLastView()');
+  ok(/localStorage\.setItem\(\s*LAST_VIEW_KEY/.test(mainSrc),
+    '_saveLastView writes the localStorage slot');
+  ok(/typeof window !== 'undefined'[\s\S]{0,200}beforeunload[\s\S]{0,200}pagehide/.test(mainSrc),
+    'beforeunload + pagehide flush the view (window-guarded)');
+
+  // Both storage paths must sit inside try/catch, so private mode never throws.
+  for (const fn of ['_saveLastView', '_loadLastView']) {
+    const body = mainSrc.slice(mainSrc.indexOf(fn + '() {'));
+    const head = body.slice(0, 700);
+    ok(/try \{/.test(head) && /\} catch/.test(head),
+      `${fn}() wraps localStorage in try/catch`);
+  }
+
+  // The record carries pose, speed and the full environment.
+  for (const field of ['active', 'x', 'y', 'z', 'yaw', 'pitch', 'speed', 'theater', 'hour', 'weather', 'quality']) {
+    ok(new RegExp(`\\n\\s+${field}:`).test(mainSrc), `saved view carries ${field}`);
+  }
+
+  // Autosave triggers: free cam loop, enter/exit, teleport, map, quality, boot.
+  const saveCalls = (mainSrc.match(/this\._saveLastView\(\)/g) || []).length;
+  ok(saveCalls >= 9, `_saveLastView() is wired to every trigger (${saveCalls} call sites)`);
+  ok(/this\._lastViewTimer = 0\.5;\s*\n\s*this\._saveLastView\(\)/.test(mainSrc),
+    'free cam autosaves on a 0.5 s throttle');
+
+  // Boot restores the pose without stealing a pointer lock (needs a gesture).
+  ok(/await this\._restoreLastView\(\);/.test(mainSrc),
+    'boot() awaits the last-view restore after the menu is ready');
+  const restore = mainSrc.slice(mainSrc.indexOf('_restoreLastView() {'));
+  const restoreBody = restore.slice(0, restore.indexOf('\n  /** F5:'));
+  ok(!/requestPointerLock/.test(restoreBody),
+    'restore never calls requestPointerLock()');
+  ok(/this\.time\.setHour\(saved\.hour\)/.test(restoreBody),
+    'restore applies the hour exactly like the Inspector Map');
+  ok(/this\.weather\.setPreset\(saved\.weather, true\)/.test(restoreBody),
+    'restore applies the weather exactly like the Inspector Map');
+  ok(/this\._freeCamReturnMode = 'menu'/.test(restoreBody),
+    'restored free cam returns to the menu on exit');
+  ok(/RESTORED LAST POSITION/.test(restoreBody), 'restore toasts the user');
+
+  // Solkan quick-jump follows the recentered stone arch bridge.
+  ok(/'SOLKAN BRIDGE & GORGE', x: -18325/.test(mainSrc),
+    'quick-jump 3 sits at the recentered Solkan bridge');
 }
 
 console.log(`cinematic juice checks: ${checks}, failures: ${failures.length}`);

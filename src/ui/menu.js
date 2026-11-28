@@ -43,9 +43,10 @@ const KEY_ROWS = [
   [
     { k: 'CTRL', s: 'THR-', c: 'flt', w: 1.6 },
     { k: 'SPACE', s: 'FIRE WEAPON', c: 'cbt', w: 4.2 },
-    { k: 'F5', s: 'WPN CAM', c: 'wld', w: 1.6 },
-    { k: 'F6', s: 'PHOTO', c: 'wld', w: 1.4 },
-    { k: 'ESC', s: 'PAUSE', c: 'sys', w: 1.5 },
+    { k: 'F5', s: 'WPN CAM', c: 'wld', w: 1.5 },
+    { k: 'F6', s: 'PHOTO', c: 'wld', w: 1.3 },
+    { k: 'F7', s: 'FREE', c: 'wld', w: 1.3 },
+    { k: 'ESC', s: 'PAUSE', c: 'sys', w: 1.4 },
   ],
 ];
 
@@ -98,6 +99,7 @@ const CONTROL_GROUPS = [
       [['[', ']'], 'Time − / + 1h'],
       [['F5'], 'Weapon follow-cam'],
       [['F6'], 'Photo mode / PNG'],
+      [['CTRL+F'], 'Free cam & big map (M)'],
       [['F2', 'F4'], 'Replay / replay speed'],
       [['F1', 'F3'], 'Hide UI / Perf'],
     ],
@@ -185,6 +187,13 @@ export class UI {
     this.photoSave?.addEventListener('click', () => this.cb.onPhotoSave?.());
     this.photoExit?.addEventListener('click', () => this.cb.onPhotoExit?.());
 
+    this.freeCamBar = this.$('freecam-bar');
+    this.freeCamInfo = this.$('freecam-info');
+    this.freeCamMap = this.$('freecam-map');
+    this.freeCamExit = this.$('freecam-exit');
+    this.freeCamMap?.addEventListener('click', () => this.cb.onFreeCamMap?.());
+    this.freeCamExit?.addEventListener('click', () => this.cb.onFreeCamExit?.());
+
     this._toastTimer = null;
     this._toastQueue = [];
     this._atcTimer = 0;
@@ -255,6 +264,16 @@ export class UI {
   showPhotoBar(on) {
     if (!this.photoBar) return;
     this.photoBar.classList.toggle('hidden', !on);
+  }
+
+  /** Show / hide the floating Free Camera status bar (F7). */
+  showFreeCamBar(on) {
+    if (!this.freeCamBar) return;
+    this.freeCamBar.classList.toggle('hidden', !on);
+  }
+
+  setFreeCamInfo(text) {
+    if (this.freeCamInfo) this.freeCamInfo.textContent = text;
   }
 
   toast(text, ms = 2200) {

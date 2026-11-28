@@ -1,7 +1,7 @@
 // Keyboard + mouse input. Edge triggers are consumed once per frame.
 const PREVENT = new Set([
   'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Tab',
-  'BracketLeft', 'BracketRight', 'F5', 'F6',
+  'BracketLeft', 'BracketRight', 'F5', 'F6', 'F7',
 ]);
 
 // Alt-held camera bindings: stop browser scrolling (arrows), page zoom (+/−)
@@ -45,7 +45,9 @@ export class Input {
   _onKeyDown(e) {
     if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
     const code = e.code;
-    if ((e.altKey && ALT_PREVENT.has(code)) || PREVENT.has(code)) e.preventDefault();
+    if ((e.altKey && ALT_PREVENT.has(code)) || (e.ctrlKey && code === 'KeyF') || PREVENT.has(code)) {
+      e.preventDefault();
+    }
     if (!e.repeat) {
       if (!this.down.has(code)) this.pressed.add(code);
       if (this.onKey) this.onKey(code, e);

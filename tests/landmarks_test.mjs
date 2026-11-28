@@ -306,6 +306,94 @@ const ALL_KINDS = [
 }
 
 // ---------------------------------------------------------------------------
+// 5. Feature 40 — per-pier canyon bridge & corner-grounded hilltop church
+// ---------------------------------------------------------------------------
+{
+  const stubScene = {
+    children: [],
+    add(obj) { this.children.push(obj); obj.parent = this; },
+    remove(obj) { const i = this.children.indexOf(obj); if (i >= 0) this.children.splice(i, 1); obj.parent = null; },
+  };
+  const sys = new LandmarkSystem(stubScene);
+
+  // Deep asymmetric canyon: banks at x = ±110 m differ by 60 m (100 m & 160 m)
+  // while the gorge floor dips to 40 m at x = 0!
+  const canyonHeight = (x) => {
+    const u = Math.max(-1, Math.min(1, x / 110));
+    const bankSlope = 130 + 30 * u; // 100 m at -110, 160 m at +110
+    const gorge = -90 * (1 - u * u); // -90 m deep at x = 0 -> 40 m floor
+    return bankSlope + gorge;
+  };
+  const bridgeRec = {
+    id: 'canyon-viaduct',
+    name: 'Steep Canyon Bridge',
+    kind: 'bridge',
+    x: 0,
+    z: 0,
+    rot: 0,
+    length: 220,
+    height: 36,
+    scale: 1,
+  };
+  sys.setLandmarks([bridgeRec], canyonHeight);
+  const lm = sys.landmarks[0];
+  check(!!lm && !!lm._groundMeta, 'canyon bridge missing _groundMeta');
+  if (lm && lm._groundMeta) {
+    const { deckA, deckB, pierGrounds } = lm._groundMeta;
+    check(pierGrounds.length >= 4, `expected >= 4 grounded bridge piers, got ${pierGrounds.length}`);
+    for (const pg of pierGrounds) {
+      check(pg.pierBot <= pg.gPier - 4.0,
+        `pier at px=${pg.px} did not reach <= gPier - 4 m (bot=${pg.pierBot}, g=${pg.gPier})`);
+      check(pg.deckY > pg.gPier + 0.5,
+        `bridge deck buried at px=${pg.px} (deckY=${pg.deckY}, g=${pg.gPier})`);
+    }
+    const grade = Math.abs(deckB - deckA) / 220;
+    check(grade <= 0.085, `bridge grade exceeded 8% (${(grade * 100).toFixed(1)}%)`);
+  }
+
+  // Hilltop church on a steep 12 m slope along Z: BOTH nave and campanile
+  // foundations must extend below their own local corners.
+  const hillChurchHeight = (x, z) => 600 + 0.25 * z + 0.1 * x;
+  const churchRec = {
+    id: 'hilltop-basilica',
+    name: 'Hilltop Basilica',
+    kind: 'church',
+    x: 0,
+    z: 0,
+    rot: 0,
+    scale: 1.3,
+  };
+  sys.setLandmarks([churchRec], hillChurchHeight);
+  const ch = sys.landmarks[0];
+  check(!!ch && !!ch._groundMeta, 'hilltop church missing _groundMeta');
+  if (ch && ch._groundMeta) {
+    const { naveRange, towerRange, baseY } = ch._groundMeta;
+    check(naveRange.maxY - naveRange.minY >= 8, 'hilltop church nave slope test too flat');
+    check(baseY >= naveRange.maxY - 1.6, 'hilltop church portal buried on uphill side');
+    // Audit actual world bounding box of nave & campanile foundation meshes.
+    ch.object.updateMatrixWorld(true);
+    const overall = new THREE.Box3().setFromObject(ch.object);
+    const lowestCornerWorld = ch.y + Math.min(naveRange.minY, towerRange.minY);
+    check(overall.min.y <= lowestCornerWorld - 4.0,
+      `hilltop church foundation floats (minY=${overall.min.y.toFixed(1)}, lowestCorner=${lowestCornerWorld.toFixed(1)})`);
+    // Verify campanile foundation mesh specifically sits at tz (not hardcoded 0)
+    // and extends below towerRange.minY - 4 m!
+    const tz = -28 * 1.3 * 0.5 - 7 * 1.3 * 0.5 - 1;
+    let campMinY = Infinity;
+    for (const child of ch.object.children) {
+      if (Math.abs(child.position.z - tz) < 1.0) {
+        const b = new THREE.Box3().setFromObject(child);
+        if (b.min.y < campMinY) campMinY = b.min.y;
+      }
+    }
+    check(campMinY <= ch.y + towerRange.minY - 4.0,
+      `campanile foundation did not ground at tz=${tz.toFixed(1)} (minY=${campMinY.toFixed(1)}, want <= ${(ch.y + towerRange.minY - 4).toFixed(1)})`);
+  }
+
+  sys.dispose();
+}
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 console.log('Vipava cities & iconic landmarks — acceptance test');
