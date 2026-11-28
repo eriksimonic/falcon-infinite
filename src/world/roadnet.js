@@ -57,7 +57,10 @@ function makeRoadTexture() {
   const t = new THREE.CanvasTexture(c);
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
   t.colorSpace = THREE.SRGBColorSpace;
-  t.anisotropy = 4;
+  // Sharper anisotropic filtering (Three.js clamps to maxAnisotropy on GPU) so
+  // the dashed centre line and shoulder lines stay smooth on distant highway
+  // ribbons at shallow grazing angles instead of flickering.
+  t.anisotropy = 8;
   return t;
 }
 

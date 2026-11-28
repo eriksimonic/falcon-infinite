@@ -2,11 +2,16 @@
 // photoreal Vipava pass.
 //
 // Three.js's built-in EffectComposer chain: RenderPass -> UnrealBloomPass ->
-// OutputPass. The bloom threshold is deliberately high (1.05 by day, easing to
-// 0.88 at night) so the sunlit sky, clouds, terrain and building facades stay
-// clean while only HDR/un-tonemapped emissives — afterburner Mach diamonds,
-// BFFG plasma, fireball cores, city night windows, H4 traffic streaks, runway
-// strobes and landmark beacons — flare properly.
+// OutputPass -> FXAA, rendered into an explicit 4x WebGL2 multisampled HDR
+// target so hardware MSAA is not silently disabled by the composer's default
+// `samples: 0` buffer. FXAA sits after OutputPass, i.e. it filters tonemapped
+// sRGB luma rather than linear HDR. The bloom threshold is deliberately high
+// (1.05 by day, easing to 0.94 at night) so the sunlit sky, clouds, terrain,
+// terrain-lit facades and ordinary lit house windows stay crisp while only
+// HDR/un-tonemapped emissives — afterburner Mach diamonds, BFFG plasma,
+// fireball cores, landmark beacons, H4 traffic streaks and runway strobes —
+// flare properly. A tight radius keeps the night glow as a sharp halo instead
+// of a diffuse fog over the whole frame.
 //
 // Headless-safe: with no renderer, no WebGL context, or `enabled: false` the
 // system degrades to a plain `renderer.render(scene, camera)` passthrough, so
@@ -17,14 +22,17 @@ import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader.js';
 
 // Day is conservative (blue sky sits well under the threshold), night opens up
-// so window/beacon/traffic emissives pop in the dark without washing out.
+// so beacons/traffic/ordnance emissives pop in the dark without turning every
+// dim house window into a blurry halo.
 const DAY_THRESHOLD = 1.05;
-const NIGHT_THRESHOLD = 0.88;
+const NIGHT_THRESHOLD = 0.94;
 const DAY_STRENGTH = 0.14;
-const NIGHT_STRENGTH = 0.24;
-const BLOOM_RADIUS = 0.36;
+const NIGHT_STRENGTH = 0.19;
+const BLOOM_RADIUS = 0.26;
 
 const NIGHT_BLEND_RATE = 1.6; // blend units per second (smooth dusk/dawn)
 const PULSE_DECAY = 0.6; // seconds for a detonation bloom spike to fade
@@ -74,6 +82,13 @@ export class PostFXSystem {
     this.renderPass = null;
     this.bloomPass = null;
     this.outputPass = null;
+    // Dedicated HDR MSAA target + post-tonemap FXAA pass. Without an explicit
+    // multisampled target, EffectComposer allocates `samples: 0` and WebGL2
+    // hardware MSAA is silently off whenever PostFX is enabled, so distant
+    // rooflines and facade edges flicker frame to frame.
+    this.renderTarget = null;
+    this.fxaaPass = null;
+    this.samples = 0;
 
     this.supported = this._hasRenderableContext();
     this.enabled = !!enabled && this.supported;
@@ -112,7 +127,24 @@ export class PostFXSystem {
           ? this.renderer.getPixelRatio() || 1
           : 1;
 
-      this.composer = new EffectComposer(this.renderer);
+      // WebGL2 hardware MSAA: EffectComposer's default target has samples 0, so
+      // an explicit multisampled HalfFloat HDR target is what restores it.
+      // Anything without multisample-target support (WebGL1, odd drivers) falls
+      // back to samples: 0 and still gets the FXAA pass on top.
+      const rtW = Math.max(1, Math.round(size.x * dpr));
+      const rtH = Math.max(1, Math.round(size.y * dpr));
+      const caps = this.renderer && this.renderer.capabilities;
+      const isWebGL2 = !!(caps && caps.isWebGL2);
+      const maxSamples = (caps && Number.isFinite(caps.maxSamples) && caps.maxSamples > 0)
+        ? caps.maxSamples
+        : 4;
+      this.samples = isWebGL2 ? Math.min(4, maxSamples) : 0;
+      this.renderTarget = new THREE.WebGLRenderTarget(rtW, rtH, {
+        type: THREE.HalfFloatType,
+        samples: this.samples,
+      });
+
+      this.composer = new EffectComposer(this.renderer, this.renderTarget);
       this.composer.setPixelRatio(dpr);
       this.composer.setSize(size.x, size.y);
 
@@ -124,23 +156,47 @@ export class PostFXSystem {
         this.threshold,
       );
       this.outputPass = new OutputPass();
+      // FXAA runs *after* OutputPass so it filters tonemapped sRGB luma (and
+      // the bloom halo) instead of linear HDR, where a single firefly pixel
+      // would dominate the edge blend.
+      this.fxaaPass = new ShaderPass(FXAAShader);
+      this._updateFxaaResolution(size.x, size.y, dpr);
 
       this.composer.addPass(this.renderPass);
       this.composer.addPass(this.bloomPass);
       this.composer.addPass(this.outputPass);
+      this.composer.addPass(this.fxaaPass);
 
       this.supported = true;
       this._applyBloom();
     } catch (err) {
       // Any failure (no GL, stubbed renderer, odd canvas) is a passthrough.
+      if (this.fxaaPass && this.fxaaPass.material &&
+          typeof this.fxaaPass.material.dispose === 'function') {
+        this.fxaaPass.material.dispose();
+      }
+      if (this.renderTarget && typeof this.renderTarget.dispose === 'function') {
+        this.renderTarget.dispose();
+      }
       this.composer = null;
       this.renderPass = null;
       this.bloomPass = null;
       this.outputPass = null;
+      this.fxaaPass = null;
+      this.renderTarget = null;
+      this.samples = 0;
       this.supported = false;
       this.enabled = false;
       this.lastError = err;
     }
+  }
+
+  /** Keep FXAA's texel size in step with the drawing buffer (DPR included). */
+  _updateFxaaResolution(width, height, dpr) {
+    if (!this.fxaaPass || !this.fxaaPass.material?.uniforms?.resolution) return;
+    const w = Math.max(1, width * dpr);
+    const h = Math.max(1, height * dpr);
+    this.fxaaPass.material.uniforms.resolution.value.set(1 / w, 1 / h);
   }
 
   // ------------------------------------------------------------------- API
@@ -212,6 +268,7 @@ export class PostFXSystem {
     if (!this.composer) return this;
     this.composer.setPixelRatio(ratio);
     this.composer.setSize(w, h);
+    this._updateFxaaResolution(w, h, ratio);
     if (this.bloomPass && typeof this.bloomPass.setSize === 'function') {
       this.bloomPass.setSize(w, h);
     }
@@ -249,10 +306,20 @@ export class PostFXSystem {
       if (this.renderPass && typeof this.renderPass.dispose === 'function') this.renderPass.dispose();
       if (typeof this.composer.dispose === 'function') this.composer.dispose();
     }
+    if (this.fxaaPass && this.fxaaPass.material &&
+        typeof this.fxaaPass.material.dispose === 'function') {
+      this.fxaaPass.material.dispose();
+    }
+    if (this.renderTarget && typeof this.renderTarget.dispose === 'function') {
+      this.renderTarget.dispose();
+    }
     this.composer = null;
     this.renderPass = null;
     this.bloomPass = null;
     this.outputPass = null;
+    this.fxaaPass = null;
+    this.renderTarget = null;
+    this.samples = 0;
     this.enabled = false;
     return this;
   }

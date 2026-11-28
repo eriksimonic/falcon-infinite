@@ -341,6 +341,8 @@ export class LandmarkSystem {
     mesh.position.set(x, y, z);
     mesh.rotation.set(rx, ry, rz);
     mesh.scale.set(w, h, d);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
     parent.add(mesh);
     return mesh;
   }
@@ -352,6 +354,8 @@ export class LandmarkSystem {
     mesh.position.set(x, y, z);
     mesh.rotation.set(rx, ry, rz);
     mesh.scale.set(radius * 2, h, radius * 2);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
     parent.add(mesh);
     return mesh;
   }
@@ -365,6 +369,8 @@ export class LandmarkSystem {
     mesh.position.set(x, y, z);
     mesh.rotation.set(rx, ry, rz);
     mesh.scale.set(radius * 2, h, radius * 2);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
     parent.add(mesh);
     return mesh;
   }

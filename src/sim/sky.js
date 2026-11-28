@@ -5,6 +5,7 @@ import { clamp, smoothstep, lerp } from '../world/noise.js';
 
 const _sun = new THREE.Vector3();
 const _moon = new THREE.Vector3();
+const _zeroPos = new THREE.Vector3();
 
 function sunDirection(hour, out) {
   // Hour 12 = high south, hour 6 = east, hour 18 = west.
@@ -36,6 +37,22 @@ export class SkySystem {
     this.scene.add(this.sun);
     this.scene.add(this.sun.target);
 
+    // Real-time shadow caster. The ortho frustum is re-centred (and texel
+    // snapped) on the camera every frame in update(), so a ±1.4 km box is
+    // plenty for buildings, trees, landmarks and the aircraft.
+    this.sun.castShadow = true;
+    this.sun.shadow.mapSize.set(2048, 2048);
+    this.sun.shadow.camera.near = 100;
+    this.sun.shadow.camera.far = 14000;
+    const S = 1400;
+    this.sun.shadow.camera.left = -S;
+    this.sun.shadow.camera.right = S;
+    this.sun.shadow.camera.top = S;
+    this.sun.shadow.camera.bottom = -S;
+    this.sun.shadow.bias = -0.0004;
+    this.sun.shadow.normalBias = 1.4;
+    this._shadowEnabled = true;
+
     this.moon = new THREE.DirectionalLight(0x9fb8ff, 0.0);
     this.scene.add(this.moon);
     this.scene.add(this.moon.target);
@@ -52,6 +69,22 @@ export class SkySystem {
 
   setTheater(name) {
     this.theater = THEATERS[name] ? name : 'temperate';
+  }
+
+  /**
+   * Shadow quality follows the render preset: off on `low`, 1024² on
+   * `medium`, 2048² on `high`. Resizing the map needs the old target freed
+   * and rebuilt, otherwise WebGL keeps the previous resolution.
+   */
+  setShadowQuality(name) {
+    this._shadowEnabled = name !== 'low';
+    const size = name === 'high' ? 2048 : 1024;
+    this.sun.castShadow = this._shadowEnabled;
+    if (this.sun.shadow.mapSize.x !== size || this.sun.shadow.mapSize.y !== size) {
+      this.sun.shadow.mapSize.set(size, size);
+      this.sun.shadow.map?.dispose();
+      this.sun.shadow.map = null;
+    }
   }
 
   _makeDome() {
@@ -149,6 +182,9 @@ export class SkySystem {
 
   update(dt, time, weather, camera, stormFlash = 0) {
     const hour = time.hour;
+    // Headless tests may hand us a stub (or no) camera: fall back to origin so
+    // the light rig still resolves instead of throwing.
+    const camPos = camera && camera.position ? camera.position : _zeroPos;
     sunDirection(hour, _sun);
     // moon opposite-ish
     sunDirection(hour + 12.4, _moon);
@@ -210,14 +246,33 @@ export class SkySystem {
     // lighting
     this.sun.color.copy(sunCol);
     this.sun.intensity = 2.25 * smoothstep(-0.08, 0.22, _sun.y) * (1 - overcast * 0.62);
-    this.sun.position.copy(camera.position).addScaledVector(_sun, 8000);
-    this.sun.target.position.copy(camera.position);
+    // Sun and moon rides stay far outside the world so the light stays
+    // directional; the shadow frustum follows the camera below.
+    this.sun.position.copy(camPos).addScaledVector(_sun, 6000);
+    this.sun.target.position.copy(camPos);
     this.sun.target.updateMatrixWorld();
+
+    // Real-time shadows. `castShadow` is gated on the preset, sun elevation and
+    // cloud cover so the shadow pass costs nothing at night or overcast. The
+    // shadow target is snapped to a 12 m world grid: without it the ortho
+    // frustum slides sub-texel every frame and shadow edges crawl.
+    const activeShadow = this._shadowEnabled && _sun.y > 0.05 && overcast < 0.85;
+    this.sun.castShadow = activeShadow;
+    if (activeShadow) {
+      const SNAP = 12;
+      const tx = Math.round(camPos.x / SNAP) * SNAP;
+      const ty = Math.round(camPos.y / SNAP) * SNAP;
+      const tz = Math.round(camPos.z / SNAP) * SNAP;
+      this.sun.target.position.set(tx, ty, tz);
+      this.sun.position.set(tx, ty, tz).addScaledVector(_sun, 6000);
+      this.sun.target.updateMatrixWorld();
+      this.sun.shadow.camera.updateProjectionMatrix();
+    }
 
     this.moon.intensity = 0.35 * this.night * (1 - overcast * 0.5);
     this.moon.color.setHex(0x9fb8ff);
-    this.moon.position.copy(camera.position).addScaledVector(_moon, 8000);
-    this.moon.target.position.copy(camera.position);
+    this.moon.position.copy(camPos).addScaledVector(_moon, 8000);
+    this.moon.target.position.copy(camPos);
     this.moon.target.updateMatrixWorld();
 
     const dayAmb = new THREE.Color(0xb4d6f2);
@@ -236,7 +291,7 @@ export class SkySystem {
     this.scene.fog.color.copy(fogCol);
     this.scene.fog.density = weather.state.fog * (1 + overcast * 0.6) * (th.hazeBoost || 1.0);
 
-    this.dome.position.copy(camera.position);
+    this.dome.position.copy(camPos);
     this.dome.rotation.y = 0;
 
     // bloom-free exposure adaptation

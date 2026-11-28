@@ -11,9 +11,11 @@
 //      and the uplights / obstruction beacons / lighthouse beam light up on a
 //      stub scene.
 //   4. AirportSystem is headless-safe with the Feature 31 call shape.
-//   5. The buildings shader carries the warm / amber / cool office window
-//      palette and the 1.45x night boost.
+// 5. The buildings shader carries the realistic night-window contract:
+//    warm/amber/LED/TV palette, per-building occupancy split, slow uTime
+//    room switching and a dimmer, crisper emissive.
 
+import * as THREE from 'three';
 import { RoadTrafficSystem } from '../src/world/traffic_roads.js';
 import { LandmarkSystem } from '../src/world/landmarks.js';
 import { AirportSystem } from '../src/world/airports.js';
@@ -325,20 +327,121 @@ const heightAt = (x, z) => 420 + x * 0.012 + z * 0.006;
 }
 
 // ---------------------------------------------------------------------------
-// 5. Buildings — night window palette in the shader
+// 5. Buildings — realistic, dimmer, time-varying night windows in the shader
 // ---------------------------------------------------------------------------
 {
   const scene = makeStubScene();
   const sys = new BuildingSystem(scene, QUALITY.medium);
   const frag = sys.material.fragmentShader;
+  const vert = sys.material.vertexShader;
+
+  // Palette: warm tungsten, cozy amber, cool indoor LED and television blue.
   check(frag.includes('vec3(1.0, 0.78, 0.42)'), 'warm tungsten window colour missing');
   check(frag.includes('vec3(1.0, 0.62, 0.25)'), 'cozy amber window colour missing');
-  check(frag.includes('vec3(0.78, 0.90, 1.0)'), 'cool office window colour missing');
-  check(frag.includes('0.45 + 0.20 * buildingSeed'),
-    'per-building lit-window occupancy variation missing');
-  check(frag.includes('* 1.45 *'), 'warm 1.45x night emissive boost missing');
+  check(frag.includes('vec3(0.78, 0.90, 1.0)'), 'cool office/LED window colour missing');
+  check(frag.includes('vec3(0.36, 0.64, 1.0)') && frag.includes('vec3(0.34, 0.60, 1.0)'),
+    'television blue window colour missing');
+  check(frag.includes('tvWave') && frag.includes('sin(uTime *'),
+    'television screen flicker over uTime missing');
+
+  // Per-building stable identity from the instance translation.
+  check(vert.includes('varying vec2 vInstXZ') && vert.includes('instanceMatrix[3].xz'),
+    'per-building instance seed varying missing from the vertex shader');
+  check(frag.includes('varying vec2 vInstXZ') && frag.includes('vec2 instCell = floor(vInstXZ * 0.25)'),
+    'fragment shader does not derive the per-building instance cell');
+  check(frag.includes('float buildingSeed = h21(instCell'), 'building seed ignores the instance cell');
+
+  // Residential vs larger-building occupancy split, with whole houses asleep.
+  check(frag.includes('float isBig = clamp(smoothstep(10.0, 14.5, vScale.y)'),
+    'building size classification (isBig) missing');
+  check(frag.includes('0.10 + 0.08 * buildingSeed') &&
+    frag.includes('0.20 + 0.10 * buildingSeed'),
+    'residential / large-building occupancy split missing');
+  check(frag.includes('h21(instCell + 19.3)'), 'asleep-house roll missing');
+  check(frag.includes('float occupancy = mix(resOcc, bigOcc, isBig);'),
+    'occupancy is not blended by building size');
+
+  // Dynamic room switching over uTime.
+  check(frag.includes('uniform float uNight, uCullDist, uTime;'),
+    'uTime uniform is not declared in the fragment shader');
+  check(frag.includes('float swPeriod = 45.0 + 95.0') &&
+    frag.includes('smoothstep(0.0, 0.015, fract(swT))'),
+    'slow room light switching over uTime missing');
+
+  // Dimmer, less uniform emission: ~1.15x instead of the old 1.45x floodlight.
+  check(frag.includes('* 1.15 * brightness'), 'dimmer 1.15x night emissive missing');
+  check(!frag.includes('* 1.45 *'), 'old 1.45x night emissive still present');
+  check(frag.includes('0.38 + 0.60 * h21('), 'wide per-room brightness variation missing');
+  check(frag.includes('smoothstep(0.21 - aa.x') && frag.includes('smoothstep(0.84 - aa.y') &&
+    frag.includes('fwidth(uvCell)') && frag.includes('roofDetailAA'),
+    'fwidth-antialiased window cutout / roof detail filter missing');
   check(frag.includes('uNight'), 'night uniform is no longer used');
+
+  // Street lamps dimmed ~15%.
+  check(BuildingSystem.prototype.update.toString().includes('clamp(sky.night * 1.08'),
+    'street lamp night opacity was not dimmed to 1.08/0.80');
+
+  // Headless update(0.5) — no camera, no sky — must advance the clock, not throw.
+  sys.update(0.5);
+  near(sys.material.uniforms.uTime.value, 0.5, 1e-9, 'update(0.5) did not advance uTime');
+  sys.update(0.25);
+  near(sys.material.uniforms.uTime.value, 0.75, 1e-9, 'uTime does not accumulate across updates');
   sys.dispose();
+
+  // Night sky contract: sky.sunColor stays saturated orange-red below the
+  // horizon, but walls/plinths/roofs must be lit by cool moonlight and a dark
+  // slate-blue ambient — never by the underground sun.
+  const skySys = new BuildingSystem(makeStubScene(), QUALITY.medium);
+  const dummyCam = { position: new THREE.Vector3(0, 450, 0) };
+  skySys._needsRebuild = false;
+  skySys._lastX = 0;
+  skySys._lastZ = 0;
+  skySys._lastAlt = 450;
+  const skyMaterials = ['material', 'plinthMaterial', 'roofMaterial'];
+
+  const nightSky = {
+    sunColor: new THREE.Color(0xff6a2e),
+    sunElevation: -0.5,
+    sunDir: new THREE.Vector3(0.5, -0.5, 0.3).normalize(),
+    moonDir: new THREE.Vector3(-0.3, 0.6, -0.4).normalize(),
+    skyColor: new THREE.Color(0x030711),
+    night: 1,
+  };
+  skySys.update(0.016, dummyCam, nightSky);
+  for (const name of skyMaterials) {
+    const u = skySys[name].uniforms;
+    // <= 20% sRGB reflection cap: linear night light must stay ~3x dimmer than
+    // the old twilight values so unlit walls/roofs match terrain and trees.
+    check(u.uSunColor.value.r < 0.04,
+      `${name}: underground orange-red sun still lights walls (r=${u.uSunColor.value.r})`);
+    check(u.uSunColor.value.b <= 0.06,
+      `${name}: moon fill is above the 20% sRGB reflection cap (b=${u.uSunColor.value.b})`);
+    check(u.uSunColor.value.b >= u.uSunColor.value.r,
+      `${name}: night sun colour is not cool moonlight (r=${u.uSunColor.value.r}, b=${u.uSunColor.value.b})`);
+    check(u.uAmbient.value.r < 0.025,
+      `${name}: night ambient red is above the 20% sRGB reflection cap (r=${u.uAmbient.value.r})`);
+    check(u.uAmbient.value.b <= 0.035,
+      `${name}: night ambient blue is above the 20% sRGB reflection cap (b=${u.uAmbient.value.b})`);
+    check(u.uAmbient.value.b >= u.uAmbient.value.r,
+      `${name}: night ambient is not dark cool blue (r=${u.uAmbient.value.r}, b=${u.uAmbient.value.b})`);
+    check(u.uNight.value === 1, `${name}: night uniform was not propagated`);
+  }
+
+  const daySky = {
+    ...nightSky,
+    sunColor: new THREE.Color(0xfff4e2),
+    sunElevation: 0.6,
+    sunDir: new THREE.Vector3(0.4, 0.6, 0.2).normalize(),
+    night: 0,
+  };
+  skySys.update(0.016, dummyCam, daySky);
+  for (const name of skyMaterials) {
+    const u = skySys[name].uniforms;
+    check(u.uSunColor.value.r > 0.9,
+      `${name}: daytime sun colour was attenuated (r=${u.uSunColor.value.r})`);
+    check(u.uNight.value === 0, `${name}: daytime night uniform is not zero`);
+  }
+  skySys.dispose();
 }
 
 // ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ import { WeaponCamSystem, PhotoModeController, FreeCamController } from './aircr
 import { HUD } from './ui/hud.js';
 import { TacticalOverlay } from './ui/tactical.js';
 import { KneeboardMap } from './ui/kneeboard.js';
-import { InspectorMap } from './ui/inspector_map.js';
+import { InspectorMap, camYawToHeadingDeg } from './ui/inspector_map.js';
 import { UI } from './ui/menu.js';
 import { spawnPoint, airportNear, airportsNear, setActiveDEM, setCustomAirports, terrainHeight } from './world/terrain.js';
 import { loadVipavaDEM, loadVipavaOSM, loadVipavaBuildings, loadVipavaWater } from './world/dem.js';
@@ -45,15 +45,30 @@ const NEUTRAL_CMD = {
 
 // Feature 41: localStorage slot holding the last Free Cam pose + environment.
 const LAST_VIEW_KEY = 'falcon.lastView.v1';
+// Sticky menu choices (quality/theater/mission/weather/wind/hour) live in their
+// own slot so a restored camera pose can never overwrite them.
+const SETTINGS_KEY = 'falcon.settings.v1';
 // FreeCamController clamps its speed to 15..5000 m/s; mirror that on restore.
 const LAST_VIEW_SPEED_MIN = 15;
 const LAST_VIEW_SPEED_MAX = 5000;
+
+// Map / Free Cam "Spawn F-16" drop: 5,000 ft and 300 kts, heading wherever the
+// Free Camera is looking. The altitude is a floor so a spawn over the Julian
+// Alps still clears the peaks by ~1,000 ft.
+const MAP_SPAWN_ALT_M = 5000 * 0.3048;       // 1524 m (5,000 ft MSL)
+const MAP_SPAWN_SPEED_MS = 300 * 0.514444444; // 154.33 m/s (300 kts)
+const MAP_SPAWN_MIN_AGL_M = 305;              // ~1,000 ft AGL floor over high peaks
 
 class App {
   constructor() {
     this.canvas = document.getElementById('scene');
     this.scene = new THREE.Scene();
-    this.preset = QUALITY.medium;
+    // Feature 41: read the sticky menu choices first — the quality preset must
+    // exist before WebGLRenderer / World / PostFX initialise, otherwise a
+    // returning player boots at `medium` and starts over.
+    const savedSettings = this._loadSettings();
+    this._savedSettings = savedSettings;
+    this.preset = (savedSettings.quality && QUALITY[savedSettings.quality]) || QUALITY.medium;
     this.mode = 'boot';
     this.ready = false;
     this.paused = false;
@@ -79,6 +94,10 @@ class App {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = CONFIG.render.exposure;
+    // Real-time directional shadows (off on the low preset, which is built for
+    // integrated GPUs; PCFSoft gives soft penumbrae for free).
+    this.renderer.shadowMap.enabled = this.preset.name !== 'low';
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
     this.input = new Input();
     this.input.attach(this.canvas);
@@ -117,32 +136,54 @@ class App {
       onMenu: () => this.returnToMenu(),
       onMission: (m) => {
         if (MISSIONS[m]) this.ui.toast('MISSION · ' + MISSIONS[m].label);
+        this._saveSettings();
       },
-      onTheater: (th) => this.setTheater(th),
+      onTheater: (th) => {
+        this.setTheater(th);
+        this._saveSettings();
+      },
       onWeather: (w) => {
         this.weather.setPreset(w, true);
         this.ui.toast('WEATHER · ' + WEATHER[w].label);
+        this._saveSettings();
       },
       onWind: (w) => {
         this.weather.setWindPreset(w, true);
         this.ui.toast('WIND · ' + WIND[w].label);
+        this._saveSettings();
       },
-      onQuality: (q) => this.setQuality(q),
+      onQuality: (q) => {
+        this.setQuality(q);
+        this._saveSettings();
+      },
       onTime: (h) => {
         this.time.setHour(h);
         this.ui.toast('TIME ' + this.time.clock);
+        this._saveSettings();
       },
       // Feature 33: floating Photo Mode bar buttons.
       onPhotoSave: () => this._savePhoto(),
       onPhotoExit: () => this.exitPhotoMode(),
       onFreeCamMap: () => this.toggleInspectorMap(),
+      onFreeCamSpawn: () => this.spawnAircraftAt(
+        this.freeCam.position.x,
+        this.freeCam.position.z,
+        camYawToHeadingDeg(this.freeCam.yaw),
+      ),
       onFreeCamExit: () => this.exitFreeCam(),
     });
+
+    // Feature 41: paint the saved pills and adopt their values *before* the
+    // time / weather systems read this.ui.hour and this.ui.weather below.
+    this.ui.applySettings(savedSettings);
 
     this.time = new TimeSystem();
     this.time.setHour(this.ui.hour);
     this.weather = new WeatherSystem(this.ui.weather, this.ui.wind);
     this.sky = new SkySystem(this.scene, this.renderer);
+    // Feature 41: the sky builds its shadow map at 2048²; match the preset that
+    // was actually restored (medium/low must drop back to 1024² / off).
+    this.sky.setShadowQuality?.(this.preset.name);
 
     this.spawn = this.chooseSpawn();
     // Kept so switching back from a baked theater restores the procedural start.
@@ -209,6 +250,7 @@ class App {
         this.ui.toast(`TELEPORT · (${Math.round(x)}, ${Math.round(z)}) · AGL ${agl} M`);
         this._saveLastView();
       },
+      onSpawnAircraft: (x, z, heading) => this.spawnAircraftAt(x, z, heading),
       onTime: (h) => {
         this.time.setHour(h);
         this._saveLastView();
@@ -256,6 +298,11 @@ class App {
     if (typeof window !== 'undefined') {
       window.addEventListener('beforeunload', () => this._saveLastView());
       window.addEventListener('pagehide', () => this._saveLastView());
+      // Tab switch / mobile backgrounding: pagehide does not always fire, so
+      // flush as soon as the document is hidden.
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') this._saveLastView();
+      });
     }
     window.addEventListener('mousedown', (e) => {
       if (this.mode === 'fly' && this.kneeboard.visible && e.button === 0) {
@@ -327,6 +374,14 @@ class App {
         await this.setTheater('vipava');
         this.aircraft.reset(this.spawn);
         this._syncAircraftModel();
+      } else if (this.ui.theater !== 'temperate' && THEATERS[this.ui.theater]) {
+        // Feature 41: a saved theater (desert, …) must be loaded now too, or
+        // the menu would advertise a map the camera is not actually over.
+        this.ui.setBootProgress(0.96, 'STREAMING ' + THEATERS[this.ui.theater].label);
+        await raf();
+        await this.setTheater(this.ui.theater);
+        this.aircraft.reset(this.spawn);
+        this._syncAircraftModel();
       }
 
       this.ui.setBootProgress(1, 'READY');
@@ -373,10 +428,17 @@ class App {
     if (!q) return;
     this.preset = q;
     this.renderer.setPixelRatio(this._pixelRatio());
+    this.renderer.shadowMap.enabled = q.name !== 'low';
+    this.sky.setShadowQuality?.(q.name);
+    this.renderer.shadowMap.needsUpdate = true;
     this.world.setPreset(q);
     this.postfx.setEnabled(q.name !== 'low');
     this.resize();
     this.ui.toast('QUALITY · ' + name.toUpperCase());
+    // Feature 41: keep the menu pill in sync and persist the choice so the next
+    // page load starts on the same preset.
+    this.ui?.applySettings?.({ quality: name });
+    this._saveSettings();
     this._saveLastView();
   }
 
@@ -815,6 +877,57 @@ class App {
     this.last = performance.now();
   }
 
+  /**
+   * Spawn the F-16 airborne at any map / Free Cam point: 5,000 ft, 300 kts,
+   * pointing exactly where the Free Camera was looking. Used by the Inspector
+   * Map (left-click in SPAWN mode, right-click, "SPAWN HERE") and by the
+   * Free Cam bar's SPAWN F-16 button.
+   */
+  async spawnAircraftAt(x, z, headingDeg = null) {
+    if (!this.ready || !Number.isFinite(x) || !Number.isFinite(z)) return;
+    const heading = Number.isFinite(headingDeg)
+      ? ((headingDeg % 360) + 360) % 360
+      : camYawToHeadingDeg(this.freeCam.yaw);
+
+    // 5,000 ft MSL, but never closer than ~1,000 ft to the ridge under us.
+    const ground = this.world.heightAt(x, z);
+    const altM = Number.isFinite(ground)
+      ? Math.max(MAP_SPAWN_ALT_M, ground + MAP_SPAWN_MIN_AGL_M)
+      : MAP_SPAWN_ALT_M;
+
+    // Leave Free Cam FIRST, then hide the map: InspectorMap.hide() fires
+    // onClose, which only re-grabs the pointer lock while Free Cam is active.
+    // startFlight() asks for the lock itself once the jet exists.
+    this.freeCam.exit();
+    this._freeCamReturnMode = 'fly';
+    this.ui.showFreeCamBar(false);
+    if (this.inspectorMap.visible) this.inspectorMap.hide();
+
+    await this.startFlight({
+      spawn: {
+        x,
+        y: altM,
+        z,
+        alt: altM,
+        heading,
+        speed: MAP_SPAWN_SPEED_MS,
+        throttle: 0.72,
+        airborne: true,
+      },
+    });
+
+    // Snap the chase camera onto the jet immediately, then restream the world
+    // around it so the first frame is not floating over empty terrain.
+    this.aircraft._updateCamera(0, this.input, true);
+    this.world.terrain?.refresh?.(this.camera.position, 24);
+    this.world.update(0.016, this.camera, this.sky, this.weather);
+    this._saveLastView();
+    this.ui.toast(
+      `SPAWN F-16 · ${Math.round(altM / 0.3048)} FT · 300 KT · ` +
+      `HDG ${String(Math.round(heading)).padStart(3, '0')}°`,
+    );
+  }
+
   /** Quick-jump presets (`1`–`9` Vipava highlights, `0` back to aircraft). */
   _freeCamTeleport(slot) {
     if (slot === 0) {
@@ -900,19 +1013,47 @@ class App {
   }
 
   /**
-   * Feature 41: write the Free Cam pose plus the active environment into
-   * localStorage so a reload can drop the user back where they were.
-   * Everything is inside try/catch — private mode, disabled storage, a quota
-   * error or a headless run must never break the frame.
+   * Feature 41: write the Free Cam pose (or the live airframe) plus the active
+   * environment into localStorage so a reload can drop the user back where they
+   * were. `kind` tags the record: 'freecam' for the spectator camera, 'flight'
+   * for a live jet (with a full airframe snapshot) and 'none' for a clean menu
+   * start (crash, menu, boot). Everything is inside try/catch — private mode,
+   * disabled storage, a quota error or a headless run must never break a frame.
    */
   _saveLastView() {
-    if (this._restoringLastView) return;
+    // Never write while a restore is in progress, and never write before the
+    // app is ready: a reload during boot would otherwise overwrite the record
+    // _restoreLastView() has not read yet with a blank 'none' snapshot.
+    if (this._restoringLastView || !this.ready || this.mode === 'boot') return;
     try {
       const fc = this.freeCam;
       if (!fc) return;
       const p = fc.position;
-      localStorage.setItem(LAST_VIEW_KEY, JSON.stringify({
-        active: !!fc.active,
+      const f = this.aircraft?.flight;
+      let kind = 'none';
+      let flight = null;
+      if (fc.active) {
+        kind = 'freecam';
+      } else if ((this.mode === 'fly' || this.mode === 'pause') && f && !f.crashed && !this.ejection?.active) {
+        kind = 'flight';
+        flight = {
+          px: f.position.x, py: f.position.y, pz: f.position.z,
+          qx: f.quaternion.x, qy: f.quaternion.y, qz: f.quaternion.z, qw: f.quaternion.w,
+          vx: f.velocity.x, vy: f.velocity.y, vz: f.velocity.z,
+          rx: f.rates.x, ry: f.rates.y, rz: f.rates.z,
+          throttle: f.throttle, targetThrottle: f.targetThrottle,
+          gearDown: !!f.gearDown, gearPos: f.gearPos, gearTarget: f.gearTarget,
+          flapsIndex: f.flapsIndex, flapPos: f.flapPos,
+          brake: !!f.brake, onGround: !!f.onGround, afterburner: !!f.afterburner,
+          cameraMode: this.aircraft.mode || 'cockpit',
+          mission: this.ui?.mission || 'free',
+          fuelInternal: this.fuel?.internal ?? this.fuel?.fuelLb,
+          fuelExternal: this.fuel?.external,
+        };
+      }
+      const record = {
+        active: kind !== 'none',
+        kind,
         x: p.x,
         y: p.y,
         z: p.z,
@@ -923,7 +1064,9 @@ class App {
         hour: this.time.hour,
         weather: this.weather.presetName,
         quality: this.preset.name,
-      }));
+      };
+      if (flight) record.flight = flight;
+      localStorage.setItem(LAST_VIEW_KEY, JSON.stringify(record));
     } catch {
       // Storage unavailable (private mode, Safari, headless) — persistence is optional.
     }
@@ -942,55 +1085,194 @@ class App {
   }
 
   /**
+   * Feature 41: read the sticky menu choices. Every field is validated against
+   * the live preset tables, so a stale or hand-edited record can never inject
+   * an unknown quality / theater / mission into the boot path.
+   */
+  _loadSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (!raw) return {};
+      const saved = JSON.parse(raw);
+      if (!saved || typeof saved !== 'object') return {};
+      const out = {};
+      if (QUALITY[saved.quality]) out.quality = saved.quality;
+      if (THEATERS[saved.theater]) out.theater = saved.theater;
+      if (MISSIONS[saved.mission]) out.mission = saved.mission;
+      if (WEATHER[saved.weather]) out.weather = saved.weather;
+      if (WIND[saved.wind]) out.wind = saved.wind;
+      if (Number.isFinite(saved.hour) && saved.hour >= 0 && saved.hour <= 24) out.hour = saved.hour;
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  /** Feature 41: persist the sticky menu choices after every menu pick. */
+  _saveSettings() {
+    try {
+      const settings = {
+        quality: this.preset?.name || this.ui?.quality || 'medium',
+        theater: this.ui?.theater || this._activeTheater || 'vipava',
+        mission: this.ui?.mission || 'free',
+        weather: this.ui?.weather || 'few',
+        wind: this.ui?.wind || 'auto',
+        hour: Number.isFinite(this.ui?.hour) ? this.ui.hour : 17.6,
+      };
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+      this._savedSettings = settings;
+    } catch {
+      // Private mode / headless: sticky settings are a nicety, not a contract.
+    }
+  }
+
+  /**
    * Feature 41: after boot, put the user straight back into the Free Cam pose
    * they reloaded from. Returns true when a restore actually happened.
    */
   async _restoreLastView() {
     const saved = this._loadLastView();
     if (!saved || saved.active !== true) return false;
-    if (![saved.x, saved.y, saved.z].every((v) => Number.isFinite(v))) return false;
+    const flightRestore = saved.kind === 'flight' && !!saved.flight;
+    if (!flightRestore && ![saved.x, saved.y, saved.z].every((v) => Number.isFinite(v))) return false;
 
     // Suppress autosaves until the camera is actually in place, so the
     // setTheater/setQuality calls below cannot overwrite the saved pose.
     this._restoringLastView = true;
     try {
       // Environment first, using exactly the calls the Inspector Map makes.
-      if (THEATERS[saved.theater] && saved.theater !== (this._activeTheater || this.ui.theater)) {
-        await this.setTheater(saved.theater);
+      // Sticky settings win over a stale last-view record: a session that has
+      // already moved to `high` (or another theater) must not be dragged back
+      // by an older autosave.
+      const sticky = this._savedSettings || {};
+      const wantTheater = THEATERS[sticky.theater] ? sticky.theater : saved.theater;
+      if (THEATERS[wantTheater] && wantTheater !== (this._activeTheater || this.ui.theater)) {
+        await this.setTheater(wantTheater);
       }
-      if (saved.quality && QUALITY[saved.quality] && saved.quality !== this.preset.name) {
-        this.setQuality(saved.quality);
+      if (THEATERS[wantTheater]) this.ui.applySettings({ theater: wantTheater });
+      const stickyQuality = this._savedSettings?.quality;
+      const wantQuality = QUALITY[stickyQuality] ? stickyQuality : saved.quality;
+      if (QUALITY[wantQuality] && wantQuality !== this.preset.name) {
+        this.setQuality(wantQuality);
       }
-      if (Number.isFinite(saved.hour)) this.time.setHour(saved.hour);
-      if (saved.weather && WEATHER[saved.weather]) this.weather.setPreset(saved.weather, true);
-
-      // Camera pose, lifted clear of the height field so it never starts buried.
-      const ground = this.world.heightAt(saved.x, saved.z);
-      const y = Number.isFinite(ground) ? Math.max(saved.y, ground + 4) : saved.y;
-      this.freeCam.enter(new THREE.Vector3(saved.x, y, saved.z), saved.yaw, saved.pitch);
-      if (Number.isFinite(saved.speed)) {
-        this.freeCam.speed = clamp(saved.speed, LAST_VIEW_SPEED_MIN, LAST_VIEW_SPEED_MAX);
+      this.ui.applySettings({ quality: this.preset.name });
+      const restoredHour = Number.isFinite(saved.hour) ? saved.hour : null;
+      if (restoredHour !== null) this.time.setHour(saved.hour);
+      if (restoredHour !== null) this.ui.applySettings({ hour: restoredHour });
+      if (saved.weather && WEATHER[saved.weather]) {
+        this.weather.setPreset(saved.weather, true);
+        this.ui.applySettings({ weather: saved.weather });
       }
-      this._freeCamReturnMode = 'menu';
-      this.freeCam.update(0, this.camera, {}, (x, z) => this.world.heightAt(x, z));
 
-      // Re-ground the world around the restored camera before the first frame.
-      this.world.terrain?.refresh?.(this.camera.position, 24);
-      this.world.update(0.016, this.camera, this.sky, this.weather);
-      this.sky.update(0.016, this.time, this.weather, this.camera, this.weather.flash);
-      this.clouds.update(0.016, this.camera, this.weather, this.sky);
+      if (flightRestore) {
+        // Validate the airframe snapshot before touching any live system.
+        const fl = saved.flight;
+        const required = ['px', 'py', 'pz', 'qx', 'qy', 'qz', 'qw', 'vx', 'vy', 'vz'];
+        if (!required.every((k) => Number.isFinite(fl[k]))) return false;
+        const qLen = Math.hypot(fl.qx, fl.qy, fl.qz, fl.qw);
+        if (!(qLen > 1e-6)) return false;
 
-      this.mode = 'menu';
-      this.audio.setPaused(true);
-      this.ui.hideBoot();
-      this.ui.hideMenu();
-      this.hud.setVisible(false);
-      this.ui.showFreeCamBar(true);
-      this.ui.toast('RESTORED LAST POSITION · CLICK TO LOOK · CTRL+F / ESC TO EXIT');
-      this._lastViewTimer = 0.5;
+        // Mission + theater must match the instant the jet was saved.
+        if (fl.mission && MISSIONS[fl.mission]) this.ui.mission = fl.mission;
+        // Menu pill must match if the player later returns to the menu.
+        this.ui.applySettings?.({ mission: this.ui.mission });
+        this.ui.theater = THEATERS[saved.theater] ? saved.theater : this.ui.theater;
+
+        const ground = this.world.heightAt(fl.px, fl.pz);
+        const safeY = fl.onGround
+          ? Math.max(fl.py, ground + 1.8)
+          : Math.max(fl.py, ground + 12);
+
+        // Enter flight through the normal path so HUD, mission, targets,
+        // weapons, autopilot, fuel and replay all initialise — flagged as a
+        // restore so it never steals a pointer lock (needs a user gesture) and
+        // never re-runs setTheater over the environment applied above.
+        await this.startFlight({
+          restore: true,
+          spawn: { x: fl.px, y: safeY, z: fl.pz, heading: 0 },
+        });
+
+        // Overwrite the freshly placed airframe with the saved instant.
+        const f = this.aircraft.flight;
+        f.position.set(fl.px, safeY, fl.pz);
+        f.quaternion.set(fl.qx / qLen, fl.qy / qLen, fl.qz / qLen, fl.qw / qLen).normalize();
+        f.velocity.set(fl.vx, fl.vy, fl.vz);
+        if ([fl.rx, fl.ry, fl.rz].every((v) => Number.isFinite(v))) {
+          f.rates.set(fl.rx, fl.ry, fl.rz);
+        }
+        f.speed = f.velocity.length();
+        if (Number.isFinite(fl.throttle)) f.throttle = clamp(fl.throttle, 0, 1);
+        if (Number.isFinite(fl.targetThrottle)) f.targetThrottle = clamp(fl.targetThrottle, 0, 1);
+        f.gearDown = !!fl.gearDown;
+        if (Number.isFinite(fl.gearPos)) f.gearPos = clamp(fl.gearPos, 0, 1);
+        if (Number.isFinite(fl.gearTarget)) f.gearTarget = clamp(fl.gearTarget, 0, 1);
+        if (Number.isFinite(fl.flapsIndex)) f.flapsIndex = clamp(Math.round(fl.flapsIndex), 0, 2);
+        if (Number.isFinite(fl.flapPos)) f.flapPos = clamp(fl.flapPos, 0, 1);
+        f.brake = !!fl.brake;
+        f.onGround = !!fl.onGround;
+        // f.reset() inside startFlight() leaves _lastOnGround true; sync it to
+        // the restored state so an airborne restore does not read as a landing.
+        f._lastOnGround = f.onGround;
+        f.afterburner = !!fl.afterburner;
+        f.crashed = false;
+        f.crashReason = '';
+        f.agl = Math.max(0, f.position.y - ground);
+
+        // Fuel load: internal (+ modelled external) tanks survive the reload.
+        const fuelLb = Number.isFinite(fl.fuelInternal)
+          ? fl.fuelInternal + (Number.isFinite(fl.fuelExternal) ? fl.fuelExternal : 0)
+          : NaN;
+        if (Number.isFinite(fuelLb)) this.fuel.reset(fuelLb);
+
+        const camModes = ['cockpit', 'chase', 'wing', 'orbit', 'flyby'];
+        this.aircraft.setMode(camModes.includes(fl.cameraMode) ? fl.cameraMode : 'cockpit');
+        this._syncAircraftModel();
+        this.aircraft._updateCamera(0, this.input, true);
+
+        // Re-ground the world around the restored jet before the first frame.
+        this.world.terrain?.refresh?.(this.camera.position, 24);
+        this.world.update(0.016, this.camera, this.sky, this.weather);
+        this.sky.update(0.016, this.time, this.weather, this.camera, this.weather.flash);
+        this.clouds.update(0.016, this.camera, this.weather, this.sky);
+
+        this.mode = 'fly';
+        this.audio.setPaused(false);
+        this.ui.hideBoot();
+        this.ui.hideMenu();
+        this.hud.setVisible(!this.uiHidden);
+        this.ui.toast('RESTORED LAST FLIGHT · CLICK TO CONTROL · ESC PAUSE');
+        this._lastViewTimer = 0.5;
+      } else {
+        // Camera pose, lifted clear of the height field so it never starts buried.
+        const ground = this.world.heightAt(saved.x, saved.z);
+        const y = Number.isFinite(ground) ? Math.max(saved.y, ground + 4) : saved.y;
+        this.freeCam.enter(new THREE.Vector3(saved.x, y, saved.z), saved.yaw, saved.pitch);
+        if (Number.isFinite(saved.speed)) {
+          this.freeCam.speed = clamp(saved.speed, LAST_VIEW_SPEED_MIN, LAST_VIEW_SPEED_MAX);
+        }
+        this._freeCamReturnMode = 'menu';
+        this.freeCam.update(0, this.camera, {}, (x, z) => this.world.heightAt(x, z));
+
+        // Re-ground the world around the restored camera before the first frame.
+        this.world.terrain?.refresh?.(this.camera.position, 24);
+        this.world.update(0.016, this.camera, this.sky, this.weather);
+        this.sky.update(0.016, this.time, this.weather, this.camera, this.weather.flash);
+        this.clouds.update(0.016, this.camera, this.weather, this.sky);
+
+        this.mode = 'menu';
+        this.audio.setPaused(true);
+        this.ui.hideBoot();
+        this.ui.hideMenu();
+        this.hud.setVisible(false);
+        this.ui.showFreeCamBar(true);
+        this.ui.toast('RESTORED LAST POSITION · CLICK TO LOOK · CTRL+F / ESC TO EXIT');
+        this._lastViewTimer = 0.5;
+      }
     } catch (err) {
       console.warn('LAST VIEW · restore failed, opening menu', err);
       this.freeCam.exit();
+      this.mode = 'menu';
+      this.hud.setVisible(false);
       this.ui.showMenu();
       return false;
     } finally {
@@ -1120,9 +1402,13 @@ class App {
     this.aircraft.model.quaternion.copy(this.aircraft.flight.quaternion);
   }
 
-  async startFlight() {
+  async startFlight(opts = {}) {
     if (!this.ready) return;
-    this.input.requestPointerLock();
+    // A reload restore enters flight without a user gesture, so it must never
+    // ask for the pointer lock (the browser would reject it anyway) — the
+    // first canvas click grabs it as usual.
+    const restore = opts?.restore === true;
+    if (!restore) this.input.requestPointerLock();
     this.audio.start().then(() => {
       if (this.audio.ctx && this.audio.nodes?.sfxBus) {
         this.combatAudio.attach(this.audio.ctx, this.audio.nodes.sfxBus);
@@ -1131,10 +1417,16 @@ class App {
     this.audio.resetEngine();
     this.audio.setPaused(false);
     // Wait for the baked theater (DEM + OSM) so the spawn is the real runway.
-    await this.setTheater(this.ui.theater || 'vipava');
+    // A restore already applied its theater through setTheater(), and reloading
+    // the DEM again would only stall boot and churn the world.
+    if (!(restore && this._activeTheater === (this.ui.theater || 'vipava'))) {
+      await this.setTheater(this.ui.theater || 'vipava');
+    }
     this.aircraft.setMode('cockpit');
     // Feature 30: the Soča Canyon Run starts airborne right outside Gate 1.
-    const spawn = this.ui.mission === 'soca_run' ? this._socaRunSpawn() : this.spawn;
+    // A restore passes its own origin so mission targets/steerpoints sit around
+    // the recovered jet instead of the default runway.
+    const spawn = opts?.spawn || (this.ui.mission === 'soca_run' ? this._socaRunSpawn() : this.spawn);
     this._placeAtSpawn(spawn);
     this._startActiveMission(spawn);
     this.ui.hideMenu();
@@ -1143,14 +1435,22 @@ class App {
     this.hud.setVisible(true);
     this.mode = 'fly';
     this.weather.night = this.sky.night;
-    const mLabel = MISSIONS[this.ui.mission]?.label || 'FREE FLIGHT';
-    this.ui.toast(`${mLabel} · SHIFT THROTTLE · SPACE FIRE · TAB WEAPON`);
+    if (!restore) {
+      // Persist the fresh spawn right away, so a reload before the first
+      // autosave tick still resumes into flight.
+      this._saveLastView();
+      const mLabel = MISSIONS[this.ui.mission]?.label || 'FREE FLIGHT';
+      this.ui.toast(`${mLabel} · SHIFT THROTTLE · SPACE FIRE · TAB WEAPON`);
+    }
     this.last = performance.now();
   }
 
   pause() {
     if (this.mode !== 'fly') return;
     this.mode = 'pause';
+    // ESC unlocks the pointer so the player can click Reload — persist the
+    // exact flight pose here, before the unload flush can see 'pause' mode.
+    this._saveLastView();
     this.audio.setPaused(true);
     this.input.releasePointerLock();
     const t = this.aircraft.telemetry(this.weather, this.time, this.sky);
@@ -1252,12 +1552,17 @@ class App {
     const f = this.aircraft.flight;
     this.aircraft.reset(spawn);
     if (sp.airborne) {
+      const throttle = Number.isFinite(sp.throttle) ? sp.throttle : 0.85;
       f.gearDown = false;
       f.gearPos = 0;
       f.gearTarget = 0;
       f.onGround = false;
-      f.throttle = 0.85;
-      f.targetThrottle = 0.85;
+      f._lastOnGround = false;
+      // Clean wing: a 5,000 ft / 300 kt map spawn must not take off with flaps.
+      f.flapsIndex = 0;
+      f.flapPos = 0;
+      f.throttle = throttle;
+      f.targetThrottle = throttle;
       f.speed = sp.speed;
       f.velocity.copy(f.forward).multiplyScalar(sp.speed);
       this._syncAircraftModel();
@@ -1333,6 +1638,8 @@ class App {
     this.input.releasePointerLock();
     this._placeAtSpawn(this.spawn);
     this.aircraft.setMode('cockpit');
+    // Feature 41: reloading from the menu must reopen the menu, not the jet.
+    this._saveLastView();
   }
 
   buildCommand() {
@@ -1360,10 +1667,12 @@ class App {
     if (i.wasPressed('KeyV')) {
       const m = this.aircraft.toggleCockpit();
       this.ui.toast('VIEW · ' + m.toUpperCase());
+      this._saveLastView();
     }
     if (i.wasPressed('KeyC')) {
       const m = this.aircraft.nextMode();
       this.ui.toast('CAMERA · ' + m.toUpperCase());
+      this._saveLastView();
     }
     if (i.wasPressed('KeyT')) {
       const s = this.time.cycleScale();
@@ -1837,6 +2146,17 @@ class App {
       }
 
       this.camera.updateMatrixWorld();
+
+      // Feature 41: autosave the live airframe roughly twice a second, so a
+      // hard reload resumes the exact position, attitude, speed and controls.
+      if (!this._replayActive) {
+        this._lastViewTimer -= simDt;
+        if (this._lastViewTimer <= 0) {
+          this._lastViewTimer = 0.5;
+          this._saveLastView();
+        }
+      }
+
       this.hud.update(simDt, t, {
         overlay: this.tactical,
         kneeboard: this.kneeboard,
@@ -1936,6 +2256,9 @@ class App {
     this.input.releasePointerLock();
     this.hud.setVisible(false);
     this.ui.showCrash(this.aircraft.flight.crashReason || 'IMPACT');
+    // Feature 41: a crashed jet must never reload back into the crash — the
+    // record flips to kind 'none' so a reload opens the menu instead.
+    this._saveLastView();
   }
 
   loop(now) {

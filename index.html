@@ -203,6 +203,7 @@
     <span class="pb-hint" id="freecam-info">240 M/S</span>
     <span class="pb-hint">WASD/QE · WHEEL SPEED · SHIFT ×4 · 1-9 JUMP</span>
     <button id="freecam-map" type="button">MAP (M)</button>
+    <button id="freecam-spawn" type="button">SPAWN F-16 (5000FT)</button>
     <button id="freecam-exit" type="button">EXIT (CTRL+F / ESC)</button>
   </div>
 
@@ -210,8 +211,12 @@
   <div id="inspector-map" class="screen hidden">
     <div class="im-panel">
       <div class="im-top">
-        <div class="im-title">ENVIRONMENT INSPECTOR · CLICK MAP TO TELEPORT</div>
+        <div class="im-title">ENVIRONMENT INSPECTOR · TELEPORT CAM OR SPAWN F-16</div>
         <div class="im-controls">
+          <span class="im-lbl">CLICK</span>
+          <button type="button" data-mode="teleport" class="on">TELEPORT CAM</button>
+          <button type="button" data-mode="spawn" class="im-spawn">SPAWN F-16</button>
+          <button type="button" id="inspector-spawn-btn" class="im-spawn">SPAWN HERE (5000FT · 300KT)</button>
           <span class="im-lbl">DROP AGL</span>
           <button type="button" data-agl="45">45M</button>
           <button type="button" data-agl="180" class="on">180M</button>
@@ -239,7 +244,7 @@
         </div>
       </div>
       <div class="im-foot">
-        <span id="inspector-hover">DRAG TO PAN · WHEEL TO ZOOM · CLICK TO TELEPORT · SHIFT+CLICK KEEP MAP OPEN</span>
+        <span id="inspector-hover">DRAG TO PAN · WHEEL TO ZOOM · L-CLICK TELEPORT · R-CLICK SPAWN F-16 (5000 FT · 300 KT) · SHIFT+CLICK KEEP MAP OPEN</span>
         <span id="inspector-stats"></span>
       </div>
     </div>

@@ -10,8 +10,9 @@ import { fileURLToPath } from 'node:url';
 
 import { FlightJuiceSystem } from '../src/sim/juice.js';
 import { WeaponCamSystem, PhotoModeController, FreeCamController } from '../src/aircraft/weapon_cam.js';
-import { InspectorMap } from '../src/ui/inspector_map.js';
+import { InspectorMap, camYawToHeadingDeg } from '../src/ui/inspector_map.js';
 import { PostFXSystem } from '../src/sim/postfx.js';
+import { FlightModel } from '../src/aircraft/flight.js';
 
 let checks = 0;
 const failures = [];
@@ -354,11 +355,11 @@ function proj(id, type, x, y, z, vx, vy, vz) {
     'setEnabled(true) stays inert headlessly');
   ok(fx.setNight(true) === fx, 'setNight is chainable');
   fx.update(2);
-  ok(Math.abs(fx.threshold - 0.88) < 1e-6, 'night threshold reaches 0.88',
+  ok(Math.abs(fx.threshold - 0.94) < 1e-6, 'night threshold reaches 0.94',
     `threshold=${fx.threshold}`);
-  ok(Math.abs(fx.strength - 0.24) < 1e-6, 'night strength reaches 0.24',
+  ok(Math.abs(fx.strength - 0.19) < 1e-6, 'night strength reaches 0.19',
     `strength=${fx.strength}`);
-  ok(Math.abs(fx.radius - 0.36) < 1e-6, 'bloom radius is 0.36');
+  ok(Math.abs(fx.radius - 0.26) < 1e-6, 'bloom radius is a tight 0.26');
 
   fx.setNight(false);
   fx.update(2);
@@ -368,9 +369,9 @@ function proj(id, type, x, y, z, vx, vy, vz) {
   // Golden hour (sky.night ~ 0.05) must stay on the day preset, not snap.
   fx.setNight(0.05);
   fx.update(2);
-  ok(Math.abs(fx.threshold - 1.0415) < 1e-3, 'golden hour keeps the day threshold',
+  ok(Math.abs(fx.threshold - 1.0445) < 1e-3, 'golden hour keeps the day threshold',
     `threshold=${fx.threshold}`);
-  ok(Math.abs(fx.strength - 0.145) < 1e-3, 'golden hour keeps the day strength',
+  ok(Math.abs(fx.strength - 0.1425) < 1e-3, 'golden hour keeps the day strength',
     `strength=${fx.strength}`);
   fx.setNight(false);
   fx.update(2);
@@ -512,7 +513,9 @@ function proj(id, type, x, y, z, vx, vy, vz) {
   // Both storage paths must sit inside try/catch, so private mode never throws.
   for (const fn of ['_saveLastView', '_loadLastView']) {
     const body = mainSrc.slice(mainSrc.indexOf(fn + '() {'));
-    const head = body.slice(0, 700);
+    // Flight snapshots made _saveLastView longer; keep enough of the body to
+    // see the localStorage write and its catch.
+    const head = body.slice(0, fn === '_saveLastView' ? 3200 : 700);
     ok(/try \{/.test(head) && /\} catch/.test(head),
       `${fn}() wraps localStorage in try/catch`);
   }
@@ -543,9 +546,297 @@ function proj(id, type, x, y, z, vx, vy, vz) {
     'restored free cam returns to the menu on exit');
   ok(/RESTORED LAST POSITION/.test(restoreBody), 'restore toasts the user');
 
+  // --- Flight restore (reload while in flight) -----------------------------
+  // The record is tagged by kind so a live jet, the Free Cam and a clean menu
+  // start never get confused with each other.
+  ok(/kind = 'freecam'/.test(mainSrc), "saving tags the spectator camera as kind 'freecam'");
+  ok(/kind = 'flight'/.test(mainSrc), "saving tags a live jet as kind 'flight'");
+  ok(/kind = 'none'/.test(mainSrc) && /active: kind !== 'none'/.test(mainSrc),
+    "anything else saves as kind 'none' with active:false");
+  ok(/\(this\.mode === 'fly' \|\| this\.mode === 'pause'\) && f && !f\.crashed && !this\.ejection\?\.active/.test(mainSrc),
+    "kind 'flight' requires a live, non-crashed, non-ejecting jet (paused too)");
+
+  // ESC → pause() drops the pointer lock so the player can click Reload, so a
+  // paused jet must still save as a flight AND be flushed at the moment of pause.
+  const pauseBody = mainSrc.slice(mainSrc.indexOf('\n  pause() {'));
+  const pauseHead = pauseBody.slice(0, 700);
+  ok(/this\.mode = 'pause';[\s\S]{0,300}this\._saveLastView\(\)/.test(pauseHead),
+    'pause() flushes the view immediately (reload after ESC keeps the flight)');
+
+  // A reload mid-boot must never wipe a record _restoreLastView() has not read.
+  ok(/if \(this\._restoringLastView \|\| !this\.ready \|\| this\.mode === 'boot'\) return;/.test(mainSrc),
+    '_saveLastView() bails out while booting or restoring');
+
+  // Tab switch / mobile backgrounding flushes the pose too.
+  ok(/visibilitychange[\s\S]{0,160}document\.visibilityState === 'hidden'[\s\S]{0,120}this\._saveLastView\(\)/.test(mainSrc),
+    'visibilitychange flushes the view when the tab is hidden');
+
+  // Airframe snapshot: position, attitude, velocity, rates, controls, camera.
+  for (const field of [
+    'px', 'py', 'pz', 'qx', 'qy', 'qz', 'qw', 'vx', 'vy', 'vz', 'rx', 'ry', 'rz',
+    'throttle', 'targetThrottle', 'gearDown', 'gearPos', 'gearTarget',
+    'flapsIndex', 'flapPos', 'brake', 'onGround', 'afterburner', 'cameraMode', 'mission',
+  ]) {
+    ok(new RegExp(`[\\s,{]${field}:`).test(mainSrc), `saved flight snapshot carries ${field}`);
+  }
+  ok(/cameraMode: this\.aircraft\.mode \|\| 'cockpit'/.test(mainSrc),
+    'snapshot stores the active camera mode');
+
+  // Flight autosave + event-driven flushes.
+  const timerSaves = (mainSrc.match(
+    /this\._lastViewTimer = 0\.5;\s*\n\s*this\._saveLastView\(\)/g,
+  ) || []).length;
+  ok(timerSaves >= 2, `flight and free cam both autosave on a 0.5 s throttle (${timerSaves})`);
+  ok(/onCrash\(\) \{[\s\S]{0,800}this\._saveLastView\(\)/.test(mainSrc),
+    'a crash flushes the view so it cannot reload into the crash');
+  ok(/returnToMenu\(\)[\s\S]{0,1600}this\._saveLastView\(\)/.test(mainSrc),
+    'returning to the menu flushes a clean menu record');
+  ok(/'VIEW · ' \+ m\.toUpperCase\(\)\);\s*\n\s*this\._saveLastView\(\)/.test(mainSrc),
+    'a camera view switch flushes the view');
+
+  // Restore branch.
+  ok(/saved\.kind === 'flight' && !!saved\.flight/.test(restoreBody),
+    'restore branches on kind flight');
+  for (const field of ['px', 'py', 'pz', 'qx', 'qy', 'qz', 'qw', 'vx', 'vy', 'vz']) {
+    ok(new RegExp(`'${field}'`).test(restoreBody), `flight restore validates ${field}`);
+  }
+  ok(/Math\.hypot\(fl\.qx, fl\.qy, fl\.qz, fl\.qw\)/.test(restoreBody),
+    'flight restore guards against a zero-length quaternion');
+  ok(/f\.position\.set\(fl\.px, safeY, fl\.pz\)/.test(restoreBody),
+    'flight restore reapplies the saved position at a safe altitude');
+  ok(/fl\.onGround[\s\S]{0,120}ground \+ 1\.8[\s\S]{0,120}ground \+ 12/.test(restoreBody),
+    'grounded restores clear the gear, airborne restores clear the ridge');
+  ok(/f\.quaternion\.set\(fl\.qx \/ qLen/.test(restoreBody),
+    'flight restore reapplies the normalised attitude');
+  ok(/f\.velocity\.set\(fl\.vx, fl\.vy, fl\.vz\)/.test(restoreBody) &&
+    /f\.rates\.set\(fl\.rx, fl\.ry, fl\.rz\)/.test(restoreBody),
+    'flight restore reapplies velocity and body rates');
+  ok(/f\.speed = f\.velocity\.length\(\)/.test(restoreBody),
+    'flight restore recomputes speed from the velocity vector');
+  ok(/f\.onGround = !!fl\.onGround;[\s\S]{0,220}f\._lastOnGround = f\.onGround;/.test(restoreBody),
+    'flight restore syncs _lastOnGround so an airborne restore is not a landing');
+  ok(/this\.ui\.applySettings\?\.\(\{ mission: this\.ui\.mission \}\)/.test(restoreBody),
+    'flight restore syncs the menu mission pill');
+  ok(/this\.aircraft\.setMode\(camModes\.includes\(fl\.cameraMode\)/.test(restoreBody),
+    'flight restore reapplies the camera mode');
+  ok(/this\._syncAircraftModel\(\)/.test(restoreBody) &&
+    /this\.aircraft\._updateCamera\(0, this\.input, true\)/.test(restoreBody),
+    'flight restore syncs the model and camera immediately');
+  ok(/startFlight\(\{\s*\n\s*restore: true/.test(restoreBody),
+    'flight restore enters flight through startFlight() in restore mode');
+  ok(/this\.mode = 'fly'/.test(restoreBody),
+    'flight restore leaves the app in fly mode');
+  ok(!/requestPointerLock/.test(restoreBody),
+    'flight restore never steals a pointer lock inside boot()');
+  ok(/RESTORED LAST FLIGHT · CLICK TO CONTROL · ESC PAUSE/.test(restoreBody),
+    'flight restore toasts the restore contract');
+
+  // startFlight() honours restore mode: no pointer lock, no theater reload.
+  const startFlight = mainSrc.slice(mainSrc.indexOf('async startFlight('));
+  const startBody = startFlight.slice(0, startFlight.indexOf("\n  pause()"));
+  ok(/if \(!restore\) this\.input\.requestPointerLock\(\)/.test(startBody),
+    'restore-mode startFlight skips the pointer lock request');
+  ok(/if \(!\(restore && this\._activeTheater ===/.test(startBody),
+    'restore-mode startFlight keeps the environment already applied');
+
   // Solkan quick-jump follows the recentered stone arch bridge.
   ok(/'SOLKAN BRIDGE & GORGE', x: -18325/.test(mainSrc),
     'quick-jump 3 sits at the recentered Solkan bridge');
+}
+
+// ---------------------------------------------------------------------------
+// 8. Sticky menu settings — quality / theater / mission / weather / wind / hour
+//    survive a page reload (falcon.settings.v1)
+// ---------------------------------------------------------------------------
+{
+  const mainSrc = read('../src/main.js');
+  const menuSrc = read('../src/ui/menu.js');
+
+  ok(/const SETTINGS_KEY = 'falcon\.settings\.v1'/.test(mainSrc),
+    'settings persist under falcon.settings.v1');
+  ok(/\n  _loadSettings\(\) \{/.test(mainSrc), 'main defines _loadSettings()');
+  ok(/\n  _saveSettings\(\) \{/.test(mainSrc), 'main defines _saveSettings()');
+
+  // Both storage paths must be storage-proof: private mode, quota errors and
+  // headless imports may never throw out of a menu click or the boot path.
+  for (const fn of ['_loadSettings', '_saveSettings']) {
+    const body = mainSrc.slice(mainSrc.indexOf(fn + '() {'));
+    const head = body.slice(0, 1200);
+    ok(/try \{/.test(head) && /\} catch/.test(head),
+      `${fn}() wraps localStorage in try/catch`);
+    ok(/localStorage\.(get|set)Item\(\s*SETTINGS_KEY/.test(head),
+      `${fn}() touches the SETTINGS_KEY slot`);
+  }
+
+  // Every stored field is validated against the preset tables on read.
+  const loadBody = mainSrc.slice(mainSrc.indexOf('_loadSettings() {'));
+  const loadHead = loadBody.slice(0, loadBody.indexOf('\n  }'));
+  for (const key of ['QUALITY', 'THEATERS', 'MISSIONS', 'WEATHER', 'WIND']) {
+    ok(new RegExp(`if \\(${key}\\[saved\\.`).test(loadHead),
+      `_loadSettings() validates against ${key}`);
+  }
+  ok(/Number\.isFinite\(saved\.hour\) && saved\.hour >= 0 && saved\.hour <= 24/.test(loadHead),
+    '_loadSettings() clamps the saved hour to 0..24');
+
+  // Quality is picked before the renderer, world and PostFX are built so a
+  // reload on `high` really boots with 2048² shadows and 18000 trees.
+  const loadIdx = mainSrc.indexOf('const savedSettings = this._loadSettings();');
+  const presetIdx = mainSrc.indexOf(
+    'this.preset = (savedSettings.quality && QUALITY[savedSettings.quality]) || QUALITY.medium;',
+  );
+  const rendererIdx = mainSrc.indexOf('new THREE.WebGLRenderer');
+  ok(loadIdx > 0 && presetIdx > loadIdx && rendererIdx > presetIdx,
+    'this.preset initialises from savedSettings.quality before new THREE.WebGLRenderer');
+
+  ok(/this\.sky\.setShadowQuality\?\.\(this\.preset\.name\);/.test(mainSrc),
+    'startup applies the preset shadow quality to the sky');
+
+  // Pills are painted before the time / weather systems read this.ui.
+  const applyIdx = mainSrc.indexOf('this.ui.applySettings(savedSettings);');
+  const timeIdx = mainSrc.indexOf('this.time.setHour(this.ui.hour);');
+  ok(applyIdx > 0 && timeIdx > applyIdx,
+    'saved pills are applied before the time/weather systems start');
+
+  // Menu picks are persisted (all six groups).
+  for (const cb of ['onMission', 'onTheater', 'onWeather', 'onWind', 'onQuality', 'onTime']) {
+    const at = mainSrc.indexOf(cb + ':');
+    ok(at > 0 && /this\._saveSettings\(\)/.test(mainSrc.slice(at, at + 320)),
+      `${cb} persists the sticky settings`);
+  }
+
+  // setQuality keeps the pill, the settings slot and the view slot in sync.
+  const qualityFn = mainSrc.slice(mainSrc.indexOf('setQuality(name) {'));
+  const qualityHead = qualityFn.slice(0, qualityFn.indexOf('\n  }'));
+  ok(/this\.ui\?\.applySettings\?\.\(\{ quality: name \}\)/.test(qualityHead),
+    'setQuality repaints the quality pill');
+  ok(/this\._saveSettings\(\)/.test(qualityHead),
+    'setQuality persists settings via _saveSettings()');
+  ok(/this\._saveLastView\(\)/.test(qualityHead),
+    'setQuality still persists the last view');
+
+  // A saved theater must actually load during boot, not just highlight.
+  ok(/else if \(this\.ui\.theater !== 'temperate' && THEATERS\[this\.ui\.theater\]\)/.test(mainSrc),
+    'boot() branches on a saved non-default theater');
+  ok(/await this\.setTheater\(this\.ui\.theater\);/.test(mainSrc),
+    'boot() loads the saved theater');
+
+  // A stale last-view record can never revert the sticky quality.
+  const restore = mainSrc.slice(mainSrc.indexOf('_restoreLastView() {'));
+  const restoreBody = restore.slice(0, restore.indexOf('\n  /** F5:'));
+  ok(/this\._savedSettings\?\.quality/.test(restoreBody),
+    'restore prefers the sticky settings quality');
+  ok(/QUALITY\[stickyQuality\] \? stickyQuality : saved\.quality/.test(restoreBody),
+    'sticky quality wins over lastView.quality');
+  ok(/this\.ui\.applySettings\(\{ quality: this\.preset\.name \}\)/.test(restoreBody),
+    'restore keeps the quality pill synced');
+  ok(/this\.ui\.applySettings\(\{ theater: wantTheater \}\)/.test(restoreBody),
+    'restore keeps the theater pill synced');
+
+  // menu.js: applySettings() paints all six pill groups.
+  ok(/\n  _setPill\(id, value, isFloat = false\) \{/.test(menuSrc),
+    'UI defines _setPill(id, value, isFloat)');
+  ok(/\n  applySettings\(s = \{\}\) \{/.test(menuSrc), 'UI defines applySettings(s)');
+  ok(/b\.dataset\.v === String\(value\)/.test(menuSrc),
+    '_setPill matches exact pill values');
+  ok(/Math\.abs\(parseFloat\(b\.dataset\.v\) - Number\(value\)\) < 0\.05/.test(menuSrc),
+    '_setPill matches numeric pills within 0.05');
+  ok(/if \(!match\) return;[\s\S]{0,140}classList\.remove\('on'\)[\s\S]{0,80}classList\.add\('on'\)/.test(menuSrc),
+    '_setPill only repaints when a button matches');
+  for (const id of ['opt-mission', 'opt-theater', 'opt-weather', 'opt-wind', 'opt-quality', 'opt-time']) {
+    ok(new RegExp(`_setPill\\('${id}'`).test(menuSrc), `applySettings paints ${id}`);
+  }
+  ok(/_setPill\('opt-time', s\.hour, true\)/.test(menuSrc),
+    'applySettings matches the hour pill numerically');
+  ok(/Number\.isFinite\(s\.hour\)/.test(menuSrc), 'applySettings validates the hour');
+}
+
+// ---------------------------------------------------------------------------
+// 9. Map / Free Cam "Spawn F-16" — heading convention, map defaults & wiring
+// ---------------------------------------------------------------------------
+{
+  // FreeCamController forward is (-sin yaw, 0, -cos yaw). FlightModel.reset()
+  // rotates (0,0,-1) by -heading around Y, which yields (+sin h, 0, -cos h),
+  // so the spawn heading must be -yaw in degrees, normalised to [0, 360).
+  const cases = [
+    [0, 0],
+    [-Math.PI / 2, 90],
+    [Math.PI, 180],
+    [Math.PI / 2, 270],
+  ];
+  for (const [yaw, wantDeg] of cases) {
+    const got = camYawToHeadingDeg(yaw);
+    ok(Math.abs(got - wantDeg) < 1e-9,
+      `camYawToHeadingDeg(${yaw.toFixed(3)}) is ${wantDeg}°`, `got ${got}`);
+
+    const f = new FlightModel();
+    f.reset({ x: 0, y: 1000, z: 0, heading: got, speed: 154 });
+    const fm = f.forward;
+    const gotX = fm.x;
+    const gotY = fm.y;
+    const gotZ = fm.z;
+    const fcX = -Math.sin(yaw);
+    const fcZ = -Math.cos(yaw);
+    ok(Math.abs(gotX - fcX) < 1e-6 && Math.abs(gotY) < 1e-6 && Math.abs(gotZ - fcZ) < 1e-6,
+      `heading ${Math.round(wantDeg)}° flies exactly where the Free Cam looks`,
+      `f16=(${gotX.toFixed(4)}, ${gotY.toFixed(4)}, ${gotZ.toFixed(4)}) ` +
+      `cam=(${fcX.toFixed(4)}, 0, ${fcZ.toFixed(4)})`);
+  }
+  ok(camYawToHeadingDeg(NaN) === 0 && camYawToHeadingDeg(undefined) === 0,
+    'camYawToHeadingDeg falls back to 0 for junk input');
+  ok(camYawToHeadingDeg(2 * Math.PI) === 0 && camYawToHeadingDeg(-2 * Math.PI) === 0,
+    'camYawToHeadingDeg normalises full turns into [0, 360)');
+  const wrapped = camYawToHeadingDeg(3 * Math.PI / 2);
+  ok(wrapped >= 0 && wrapped < 360, `camYawToHeadingDeg stays in range (${wrapped})`);
+
+  // Headless InspectorMap defaults + coordinate round-trip.
+  const imap = new InspectorMap();
+  ok(imap.clickMode === 'teleport', "InspectorMap defaults to clickMode 'teleport'");
+  ok(imap.selectedPoint === null, 'InspectorMap starts with no selected point');
+  ok(Array.isArray(imap._modeBtns) && imap._modeBtns.length === 0,
+    'InspectorMap starts with an empty mode-button list');
+  ok(imap._spawnBtn === null, 'InspectorMap starts with no spawn button');
+  {
+    const c = imap.worldToCanvas(-450, 7135, 840, 620);
+    const w = imap.canvasToWorld(c.px, c.py, 840, 620);
+    ok(Math.abs(w.x - (-450)) < 1e-4 && Math.abs(w.z - 7135) < 1e-4,
+      'InspectorMap round-trip still holds for a spawn target',
+      `x=${w.x} z=${w.z}`);
+  }
+
+  // main.js wiring (browser-only module, asserted statically).
+  const mainSrc = read('../src/main.js');
+  ok(/const MAP_SPAWN_ALT_M = 5000 \* 0\.3048;/.test(mainSrc),
+    'main defines MAP_SPAWN_ALT_M as 5,000 ft in metres');
+  ok(/const MAP_SPAWN_SPEED_MS = 300 \* 0\.514444444;/.test(mainSrc),
+    'main defines MAP_SPAWN_SPEED_MS as 300 kts in m/s');
+  ok(/const MAP_SPAWN_MIN_AGL_M = 305;/.test(mainSrc),
+    'main keeps a ~1,000 ft AGL floor');
+  ok(/async spawnAircraftAt\(x, z, headingDeg = null\) \{/.test(mainSrc),
+    'main implements async spawnAircraftAt(x, z, headingDeg)');
+  ok(/onSpawnAircraft: \(x, z, heading\) => this\.spawnAircraftAt\(x, z, heading\)/.test(mainSrc),
+    'InspectorMap is wired to onSpawnAircraft');
+  ok(/onFreeCamSpawn: \(\) => this\.spawnAircraftAt\(/.test(mainSrc),
+    'Free Cam bar is wired to onFreeCamSpawn');
+  ok(/speed: MAP_SPAWN_SPEED_MS,\s*\n\s*throttle: 0\.72,\s*\n\s*airborne: true,/.test(mainSrc),
+    'spawnAircraftAt drops 300 kts / 0.72 throttle airborne');
+  ok(/f\.flapsIndex = 0;/.test(mainSrc) && /f\.flapPos = 0;/.test(mainSrc) &&
+    /f\._lastOnGround = false;/.test(mainSrc),
+    '_placeAtSpawn gives airborne spawns a clean wing and ground flag');
+
+  // UI surface: the buttons the two callbacks are bound to.
+  const htmlSrc = read('../index.html');
+  ok(/<button id="freecam-spawn"[^>]*>SPAWN F-16 \(5000FT\)<\/button>/.test(htmlSrc),
+    'index.html carries #freecam-spawn');
+  ok(/data-mode="teleport"/.test(htmlSrc) && /data-mode="spawn"/.test(htmlSrc),
+    'index.html carries the teleport/spawn mode toggle');
+  ok(/id="inspector-spawn-btn"/.test(htmlSrc), 'index.html carries #inspector-spawn-btn');
+  const menuSrc = read('../src/ui/menu.js');
+  ok(/this\.freeCamSpawn = this\.\$\('freecam-spawn'\)/.test(menuSrc) &&
+    /this\.freeCamSpawn\?\.addEventListener\('click', \(\) => this\.cb\.onFreeCamSpawn\?\.\(\)\)/.test(menuSrc),
+    'menu.js binds #freecam-spawn to onFreeCamSpawn');
+  const cssSrc = read('../src/ui/style.css');
+  ok(/\.im-controls button\.im-spawn\.on/.test(cssSrc) && /#freecam-spawn,/.test(cssSrc),
+    'style.css gives Spawn F-16 its amber accent');
 }
 
 console.log(`cinematic juice checks: ${checks}, failures: ${failures.length}`);

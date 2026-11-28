@@ -406,6 +406,26 @@ kbd {
   width: 82px;
   accent-color: #8dffb4;
 }
+
+/* Tactical amber accent — Spawn F-16 reads clearly against the green UI. */
+#freecam-spawn,
+.im-controls button.im-spawn {
+  color: #ffe2a6;
+  background: rgba(255, 190, 85, 0.12);
+  border-color: rgba(255, 190, 85, 0.55);
+}
+#freecam-spawn:hover,
+.im-controls button.im-spawn:hover {
+  background: rgba(255, 190, 85, 0.28);
+  border-color: rgba(255, 190, 85, 0.95);
+  color: #ffffff;
+}
+.im-controls button.im-spawn.on {
+  background: rgba(255, 190, 85, 0.9);
+  border-color: #ffd27a;
+  color: #1a1204;
+  box-shadow: 0 0 12px rgba(255, 190, 85, 0.45);
+}
 .im-body {
   display: flex;
   gap: 12px;

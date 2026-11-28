@@ -1089,6 +1089,17 @@ export function createF16() {
     if (o.isSprite) group.userData.navLights.halos.push(o);
   });
 
+  // Real-time shadows: the opaque airframe casts onto terrain and itself, while
+  // glass, additive afterburner glow and the nav-light sprites are skipped (a
+  // transparent shadow would blacken the terrain under the canopy).
+  group.traverse((o) => {
+    if (!o.isMesh) return;
+    const mats = Array.isArray(o.material) ? o.material : [o.material];
+    if (mats.some((m) => !m || m.transparent || m.blending === THREE.AdditiveBlending)) return;
+    o.castShadow = true;
+    o.receiveShadow = true;
+  });
+
   return group;
 }
 

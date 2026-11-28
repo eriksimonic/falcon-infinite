@@ -190,8 +190,10 @@ export class UI {
     this.freeCamBar = this.$('freecam-bar');
     this.freeCamInfo = this.$('freecam-info');
     this.freeCamMap = this.$('freecam-map');
+    this.freeCamSpawn = this.$('freecam-spawn');
     this.freeCamExit = this.$('freecam-exit');
     this.freeCamMap?.addEventListener('click', () => this.cb.onFreeCamMap?.());
+    this.freeCamSpawn?.addEventListener('click', () => this.cb.onFreeCamSpawn?.());
     this.freeCamExit?.addEventListener('click', () => this.cb.onFreeCamExit?.());
 
     this._toastTimer = null;
@@ -209,6 +211,60 @@ export class UI {
       b.classList.add('on');
       cb(b.dataset.v);
     });
+  }
+
+  /**
+   * Feature 41: paint a stored choice onto one pill group. Values that do not
+   * match a button (an old or hand-edited localStorage record) leave the menu
+   * untouched instead of blanking the highlight.
+   */
+  _setPill(id, value, isFloat = false) {
+    const root = this.$(id);
+    if (!root) return;
+    const buttons = root.querySelectorAll('button');
+    let match = null;
+    for (const b of buttons) {
+      const hit = isFloat
+        ? Math.abs(parseFloat(b.dataset.v) - Number(value)) < 0.05
+        : b.dataset.v === String(value);
+      if (hit) { match = b; break; }
+    }
+    if (!match) return;
+    for (const b of buttons) b.classList.remove('on');
+    match.classList.add('on');
+  }
+
+  /**
+   * Feature 41: re-apply sticky settings to the live UI state and its pills so
+   * a reload keeps the player's quality, theater, mission, weather, wind and
+   * time of day exactly as they left them.
+   */
+  applySettings(s = {}) {
+    if (!s || typeof s !== 'object') return;
+    if (typeof s.mission === 'string') {
+      this.mission = s.mission;
+      this._setPill('opt-mission', s.mission);
+    }
+    if (typeof s.theater === 'string') {
+      this.theater = s.theater;
+      this._setPill('opt-theater', s.theater);
+    }
+    if (typeof s.weather === 'string') {
+      this.weather = s.weather;
+      this._setPill('opt-weather', s.weather);
+    }
+    if (typeof s.wind === 'string') {
+      this.wind = s.wind;
+      this._setPill('opt-wind', s.wind);
+    }
+    if (typeof s.quality === 'string') {
+      this.quality = s.quality;
+      this._setPill('opt-quality', s.quality);
+    }
+    if (Number.isFinite(s.hour)) {
+      this.hour = s.hour;
+      this._setPill('opt-time', s.hour, true);
+    }
   }
 
   setBootProgress(p, text) {

@@ -69,6 +69,11 @@ const PLINTH_STONE = [0xa8a193, 0x9c9688, 0xb2aa9c, 0x928c7f];
 const cellKey = (cx, cz) => (cx + 32768) * 65536 + (cz + 32768);
 
 const _c = new THREE.Color();
+// Scratch light colours for the per-frame sky uniforms: night ambient is a
+// dark cool slate-blue and the moon fill is cool blue. Module-level so the
+// update loop allocates nothing.
+const _nightAmb = new THREE.Color(0.010, 0.014, 0.024);
+const _moonCol = new THREE.Color(0.020, 0.030, 0.048);
 const _m = new THREE.Matrix4();
 const _q = new THREE.Quaternion();
 const _p = new THREE.Vector3();
@@ -102,6 +107,7 @@ function makeBuildingMaterial() {
         uSunColor: { value: new THREE.Color(0xfff2d8) },
         uAmbient: { value: new THREE.Color(0x334455) },
         uNight: { value: 0 },
+        uTime: { value: 0 },
         uCullDist: { value: 24000 },
       },
     ]),
@@ -112,6 +118,9 @@ function makeBuildingMaterial() {
       varying vec3 vLocal;
       varying vec3 vScale;
       varying vec3 vCol;
+      // Exact per-building identity straight off the instance translation: two
+      // identical-looking houses in a row never share a window pattern.
+      varying vec2 vInstXZ;
       #include <fog_pars_vertex>
       void main() {
         vec4 wp = modelMatrix * instanceMatrix * vec4(position, 1.0);
@@ -119,6 +128,7 @@ function makeBuildingMaterial() {
         vN = normalize(mat3(instanceMatrix) * normal);
         vLocalN = normal;
         vLocal = position;
+        vInstXZ = instanceMatrix[3].xz;
         // Instance scale in metres, extracted from the matrix columns, lets the
         // fragment shader recover true wall metres per facade axis.
         vScale = vec3(
@@ -138,13 +148,14 @@ function makeBuildingMaterial() {
     `,
     fragmentShader: /* glsl */`
       uniform vec3 uSunDir, uSunColor, uAmbient;
-      uniform float uNight, uCullDist;
+      uniform float uNight, uCullDist, uTime;
       varying vec3 vWorld;
       varying vec3 vN;
       varying vec3 vLocalN;
       varying vec3 vLocal;
       varying vec3 vScale;
       varying vec3 vCol;
+      varying vec2 vInstXZ;
       #include <common>
       #include <fog_pars_fragment>
 
@@ -177,52 +188,109 @@ function makeBuildingMaterial() {
         float u = wallSpan / 3.8;              // ~3.8 m wide window bays
         float v = (vLocal.y * vScale.y) / 3.4; // ~3.4 m floor pitch
         vec2 g = fract(vec2(u, v));
-        float win = step(0.18, g.x) * step(g.x, 0.82) * step(0.30, g.y) * step(g.y, 0.86);
+        // Screen-space derivative anti-aliasing. fwidth() gives the facade cell
+        // size in pixels: it widens the cutouts into analytic smoothstep edges
+        // up close, and drives an analytical Nyquist box filter that fades the
+        // pattern to its average coverage once a bay shrinks below a pixel —
+        // which is what stops distant facades from shimmering and sparkling.
+        vec2 uvCell = vec2(u, v);
+        vec2 fw = max(fwidth(uvCell), vec2(0.003));
+        vec2 aa = clamp(fw * 0.75, vec2(0.004), vec2(0.24));
+        float winX = smoothstep(0.21 - aa.x, 0.21 + aa.x, g.x) *
+                     (1.0 - smoothstep(0.79 - aa.x, 0.79 + aa.x, g.x));
+        float winY = smoothstep(0.32 - aa.y, 0.32 + aa.y, g.y) *
+                     (1.0 - smoothstep(0.84 - aa.y, 0.84 + aa.y, g.y));
+        float nyqX = smoothstep(0.30, 0.85, fw.x);
+        float nyqY = smoothstep(0.30, 0.85, fw.y);
+        float win = mix(winX, 0.58, nyqX) * mix(winY, 0.52, nyqY);
         vec2 cell = floor(vec2(u, v));
         float rnd = h21(cell + floor(vCol.xy * 97.0));
         float wall = 1.0 - smoothstep(0.55, 0.85, abs(ln.y));
         float glass = win * wall;
 
-        // Crisp horizontal floor spandrel band under every row of windows.
-        float spandrel = wall * step(0.04, g.y) * step(g.y, 0.19);
+        // Crisp horizontal floor spandrel band under every row of windows, with the
+        // same derivative anti-aliasing so it never aliases into a dashed ridge.
+        float spandrelRaw = smoothstep(0.04 - aa.y, 0.04 + aa.y, g.y) *
+                            (1.0 - smoothstep(0.19 - aa.y, 0.19 + aa.y, g.y));
+        float spandrel = wall * mix(spandrelRaw, 0.15, nyqY);
         col *= 1.0 - spandrel * 0.22;
 
         float day = 1.0 - uNight;
 
-        // Daylight: dark, sky-tinted reflective glass with a subtle sheen.
-        vec3 skyGlass = mix(vec3(0.14, 0.20, 0.28), vec3(0.46, 0.58, 0.73),
+        // Daylight: restrained, warm-neutral glass so Primorska stucco and
+        // limestone read as masonry with subtle windows instead of bright blue
+        // office glazing.
+        vec3 skyGlass = mix(vec3(0.16, 0.20, 0.25), vec3(0.42, 0.50, 0.60),
                             clamp(wrap, 0.0, 1.0));
-        col = mix(col, skyGlass, glass * 0.62 * day);
+        col = mix(col, skyGlass, glass * 0.42 * day);
 
         // Sun-behind-pilot glint: only when the sun is behind the camera and
         // shining straight onto the facade in front do sun-facing windows
         // return a crisp specular flare (the only daytime building bloom).
         vec3 viewDir = normalize(cameraPosition - vWorld);
         float sunBehind = smoothstep(0.45, 0.94, dot(viewDir, uSunDir));
-        col += uSunColor * glass * ndl * sunBehind * day * 0.95;
+        // Sub-pixel windows would otherwise fire a single-pixel specular flare
+        // that reads as a shimmering firefly wall across a distant facade.
+        float glintAA = 1.0 - max(nyqX, nyqY) * 0.80;
+        col += uSunColor * glass * ndl * sunBehind * day * 0.95 * glintAA;
 
-        // Night: unlit glass reads as a dark hole, lit rooms glow. Occupancy is
-        // hashed per building so whole blocks wake up together (an office tower
-        // burns bright, a row of houses lights three windows); every window
-        // then picks tungsten / amber / cool office white and its own
-        // brightness, which keeps Ajdovscina, Nova Gorica, Gorizia, Trieste and
-        // Koper looking organic from 3-15 km instead of uniformly tiled.
+        // Night: unlit glass reads as a dark hole, lit rooms glow. Each building
+        // hashes a stable seed off its own world translation, so neighbouring
+        // houses with identical wall colours still light completely independent
+        // rooms. Occupancy is realistic instead of decorative: a small Primorska
+        // house shows one or two warm windows (and ~18% of houses are asleep
+        // entirely), while a downtown apartment block lights ~25% of its bays.
+        // Rooms also switch on and off slowly over uTime, with a sliver of rooms
+        // lit by flickering television blue.
         col *= 1.0 - glass * 0.55 * uNight;
-        float buildingSeed = h21(floor(vCol.xy * 97.0) + 3.7);
-        float occupancy = 0.45 + 0.20 * buildingSeed; // 45..65% of windows lit
-        float roomSeed = h21(cell * 1.37 + floor(vCol.yz * 71.0) + 11.3);
-        float lit = step(1.0 - occupancy, roomSeed) * glass;
-        float tone = h21(cell * 2.71 + floor(vCol.yz * 131.0) + 5.9);
-        vec3 winColor = mix(vec3(1.0, 0.78, 0.42), vec3(1.0, 0.62, 0.25), step(0.68, tone));
-        winColor = mix(winColor, vec3(0.78, 0.90, 1.0), step(0.92, tone));
-        float brightness = 0.72 + 0.28 * h21(cell * 3.17 + 7.1) + 0.28 * rnd;
-        // Warm night windows, kept below the bloom threshold so towns read as
-        // lit clusters at altitude instead of glowing blobs.
-        col += winColor * lit * uNight * 1.45 * brightness;
+        vec2 instCell = floor(vInstXZ * 0.25);
+        float buildingSeed = h21(instCell + floor(vCol.xy * 97.0) + 3.7);
+        float isBig = clamp(smoothstep(10.0, 14.5, vScale.y) +
+                            smoothstep(16.0, 24.0, max(vScale.x, vScale.z)), 0.0, 1.0);
+        // Residential: 10..18% of bays lit, and roughly one house in five is
+        // dark all night, which keeps village rows from glowing like a lantern.
+        float resOcc = (0.10 + 0.08 * buildingSeed) *
+                       step(0.18, h21(instCell + 19.3));
+        // Larger blocks: 20..30% of bays lit, ~25% on average.
+        float bigOcc = 0.20 + 0.10 * buildingSeed;
+        float occupancy = mix(resOcc, bigOcc, isBig);
 
-        // Subtle base ambient occlusion over the bottom of each block so every
-        // building sits crisply anchored on the terrain without crushing to black.
-        col *= mix(0.72, 1.0, smoothstep(0.0, 0.18, vLocal.y));
+        float roomSeed = h21(cell * 1.37 + instCell + 11.3);
+        // Every room rolls a fresh on/off state every 45-140 s and cross-fades
+        // over the first ~1.5% of that period, so lights fade in and out over a
+        // minute or two instead of popping or strobing.
+        float swPeriod = 45.0 + 95.0 * h21(cell * 1.9 + instCell + 23.1);
+        float swT = uTime / swPeriod + roomSeed * 17.0;
+        float swRoll = floor(swT);
+        float swFade = smoothstep(0.0, 0.015, fract(swT));
+        float rollA = step(1.0 - occupancy,
+                           h21(cell * 2.13 + instCell + swRoll * 7.7 + 31.7));
+        float rollB = step(1.0 - occupancy,
+                           h21(cell * 2.13 + instCell + (swRoll + 1.0) * 7.7 + 31.7));
+        float lit = mix(rollA, rollB, swFade) * glass;
+        // Palette in shares: ~46% tungsten, ~28% amber, ~14% cool LED/office and
+        // ~12% television blue.
+        float tone = h21(cell * 2.71 + instCell + 5.9);
+        vec3 winColor = mix(vec3(1.0, 0.78, 0.42), vec3(1.0, 0.62, 0.25), step(0.46, tone));
+        winColor = mix(winColor, vec3(0.78, 0.90, 1.0), step(0.74, tone));
+        float isTV = step(0.88, tone);
+        float rndTv = h21(cell * 3.83 + instCell + 47.9);
+        // Two incommensurate sines give an organic living-room screen flicker
+        // (never a hard strobe), and the glow drifts to cool cyan as it brightens.
+        float tvWave = 0.70 + 0.30 * (0.5 + 0.5 * sin(uTime * (2.6 + rndTv * 2.8) + roomSeed * 41.0) * sin(uTime * 5.9 + rndTv * 17.0));
+        vec3 tvColor = mix(vec3(0.34, 0.60, 1.0), vec3(0.36, 0.64, 1.0), tvWave);
+        tvColor = mix(tvColor, vec3(0.68, 0.84, 1.0), tvWave * 0.45);
+        winColor = mix(winColor, tvColor, isTV);
+        // Wide per-room intensity spread: a dim bedside lamp (0.38) up to a
+        // bright kitchen/living room (1.05). Overall emission sits ~20% below the
+        // old 1.45x so facades read as lived-in, not floodlit.
+        float brightness = 0.38 + 0.60 * h21(cell * 3.17 + instCell + 7.1) + 0.07 * rnd;
+        col += winColor * lit * uNight * 1.15 * brightness;
+
+        // Ground contact ambient occlusion over the bottom of each block so every
+        // building sits firmly anchored on the satellite imagery instead of
+        // hovering, while still never crushing the wall to black.
+        col *= mix(0.56, 1.0, smoothstep(0.0, 0.24, vLocal.y));
 
         // Vipava/Adriatic roofs: mostly weathered terracotta tiles with a
         // minority of dark slate, hashed per building, mottled per tile and lit
@@ -231,12 +299,36 @@ function makeBuildingMaterial() {
         vec2 rp = vec2(vLocal.x * vScale.x, vLocal.z * vScale.z) * 0.4;
         float mottle = h21(floor(rp) + floor(vCol.yz * 131.0));
         float tileGrain = h21(floor(rp * 5.0) + floor(vCol.yz * 57.0) + 2.3);
+        // Roof island texels (tile grain, corrugation ribs) are far below a pixel
+        // at distance: fade them to their mean instead of letting the hash noise
+        // sparkle. roofDetailAA = 1 on screen, -> 0 once detail is sub-pixel.
+        float roofDetailAA = 1.0 - smoothstep(0.12, 0.50, length(fwidth(rp)));
         float roofPick = h21(vec2(buildingSeed * 131.7 + 0.5, 7.3));
-        vec3 terracotta = mix(vec3(0.32, 0.18, 0.12), vec3(0.24, 0.14, 0.10), mottle);
-        vec3 slate = mix(vec3(0.16, 0.17, 0.18), vec3(0.24, 0.23, 0.22), mottle);
-        vec3 roofBase = mix(terracotta, slate, step(0.58, roofPick));
-        roofBase *= 0.94 + 0.12 * tileGrain;
+
+        // Small flat / terrace roofs: warm weathered terracotta and paler
+        // weathered slate, never candy red and never crushed to black.
+        vec3 terrace = mix(vec3(0.36, 0.21, 0.14), vec3(0.27, 0.16, 0.11), mottle);
+        vec3 slate = mix(vec3(0.24, 0.25, 0.26), vec3(0.32, 0.31, 0.30), mottle);
+        vec3 flatRoof = mix(terrace, slate, step(0.58, roofPick));
+        flatRoof *= mix(1.0, 0.94 + 0.12 * tileGrain, roofDetailAA);
+
+        // Large commercial / warehouse footprints read as weathered light-grey
+        // corrugated steel or concrete gravel with rib lines and a darker
+        // parapet rim, instead of the pitch-black industrial slabs a single
+        // roof albedo produced.
+        float isLarge = smoothstep(14.0, 22.0, max(vScale.x, vScale.z));
+        float edgeDist = min((0.5 - abs(vLocal.x)) * vScale.x,
+                             (0.5 - abs(vLocal.z)) * vScale.z);
+        float parapet = 1.0 - smoothstep(0.30, 1.40, edgeDist);
+        vec3 industrial = mix(vec3(0.36, 0.37, 0.36), vec3(0.48, 0.47, 0.45), mottle);
+        industrial *= 1.0 + sin(rp.x * 14.0) * 0.03 * roofDetailAA;
+        industrial *= 1.0 - parapet * 0.18;
+
+        vec3 roofBase = mix(flatRoof, industrial, isLarge);
         vec3 roofCol = roofBase * (uAmbient * 1.12 + uSunColor * (ndl * 0.72 + wrap * 0.22));
+        // Lift the big slabs slightly so the corrugation and gravel stay
+        // legible in oblique views under ACES tone mapping.
+        roofCol *= mix(1.0, 1.08, isLarge);
         col = mix(col, roofCol, roof);
 
         gl_FragColor = vec4(col, 1.0);
@@ -415,16 +507,26 @@ function makeRoofMaterial() {
         float ndl = max(dot(n, uSunDir), 0.0);
         float wrap = max(dot(n, uSunDir) * 0.5 + 0.5, 0.0);
 
-        // Tile courses + subtle ridge highlight + sun-bleached weathering.
+        // Tile courses, fine tile grain and a soft ridge-to-eave AO so pitched
+        // roofs read as modelled clay tiles instead of flat planes. The lift
+        // keeps weathered terracotta/taupe/slate bright in oblique views under
+        // ACES tone mapping instead of crushing towards black.
         vec2 rp = vec2(vLocal.x * vScale.x, vLocal.z * vScale.z);
         float course = 0.93 + 0.07 * sin(vLocal.y * vScale.y * 14.0);
         float mottle = 0.90 + 0.18 * h21(floor(rp * 0.8) + floor(vCol.rg * 83.0));
-        float ridgeAO = mix(0.88, 1.04, smoothstep(0.0, 1.0, vLocal.y));
-        vec3 base = vCol * course * mottle * ridgeAO;
+        float grain = 0.94 + 0.12 * h21(floor(rp * 6.0) + floor(vCol.gb * 57.0) + 1.7);
+        float ridgeAO = mix(0.84, 1.06, clamp(vLocal.y, 0.0, 1.0));
+        vec3 base = vCol * course * mottle * grain * ridgeAO * 1.05;
         float lum = dot(base, vec3(0.299, 0.587, 0.114));
-        base = mix(base, vec3(lum), 0.18);
+        base = mix(base, vec3(lum), 0.12);
 
-        vec3 col = base * (uAmbient * 1.12 + uSunColor * (ndl * 0.72 + wrap * 0.22));
+        vec3 col = base * (uAmbient * 1.14 + uSunColor * (ndl * 0.72 + wrap * 0.22));
+        // Warm-neutral sky bounce on the roof plane: without it the shaded
+        // slate/industrial slopes crush to near-black once ACES tone mapping
+        // compresses them, and a cool fill would grey out the clay tiles.
+        vec3 skyFill = vec3(0.74, 0.70, 0.64) * (0.05 + 0.05 * wrap);
+        col += skyFill * (1.0 - uNight);
+        col *= 1.04;
         col *= 1.0 - uNight * 0.20;
 
         gl_FragColor = vec4(col, 1.0);
@@ -893,6 +995,11 @@ export class BuildingSystem {
     this.mesh.frustumCulled = false;
     this.mesh.count = 0;
     this.mesh.name = 'buildings';
+    // Instanced depth material means every block casts a real-time shadow onto
+    // the satellite-draped terrain; the custom shader never samples the shadow
+    // map itself, so receiving is explicitly off.
+    this.mesh.castShadow = true;
+    this.mesh.receiveShadow = false;
     this.scene.add(this.mesh);
 
     // Batched weathered Karst stone foundation plinths (windowless, grounding
@@ -905,6 +1012,8 @@ export class BuildingSystem {
     this.plinthMesh.frustumCulled = false;
     this.plinthMesh.count = 0;
     this.plinthMesh.name = 'building-plinths';
+    this.plinthMesh.castShadow = true;
+    this.plinthMesh.receiveShadow = false;
     this.scene.add(this.plinthMesh);
 
     // Batched 3D pitched gable roofs & hipped roofs / church spires.
@@ -914,6 +1023,8 @@ export class BuildingSystem {
     this.gableRoofMesh.frustumCulled = false;
     this.gableRoofMesh.count = 0;
     this.gableRoofMesh.name = 'building-gable-roofs';
+    this.gableRoofMesh.castShadow = true;
+    this.gableRoofMesh.receiveShadow = false;
     this.scene.add(this.gableRoofMesh);
 
     this.hipRoofMesh = new THREE.InstancedMesh(makeHipRoofGeometry(), this.roofMaterial, Math.max(8000, Math.floor(poolCap * 0.5)));
@@ -921,6 +1032,8 @@ export class BuildingSystem {
     this.hipRoofMesh.frustumCulled = false;
     this.hipRoofMesh.count = 0;
     this.hipRoofMesh.name = 'building-hip-roofs';
+    this.hipRoofMesh.castShadow = true;
+    this.hipRoofMesh.receiveShadow = false;
     this.scene.add(this.hipRoofMesh);
 
     // Ruined footprints live in their own instanced mesh: a bombed block is
@@ -1006,6 +1119,12 @@ export class BuildingSystem {
   update(dt, camera, sky) {
     const step = Number.isFinite(dt) ? Math.max(0, dt) : 0;
 
+    // Night windows switch rooms on and off over real time, so the shader needs
+    // a clock that advances even headlessly (no camera, no sky, no scene).
+    if (this.material && this.material.uniforms.uTime) {
+      this.material.uniforms.uTime.value += step;
+    }
+
     // Smouldering ruins age first, so a building that finishes collapsing in
     // this very step starts its 75 s burn at t = 0 instead of being aged away.
     if (this.ruinFires.length > 0) {
@@ -1037,18 +1156,36 @@ export class BuildingSystem {
     if (this._cratersDirty && !this._needsRebuild) this._rebuildCraters();
     if (!camera) return;
     if (sky) {
+      // The sunlight colour in sky.js stays saturated orange-red even after the
+      // sun drops below the horizon (only the DirectionalLight intensity dies),
+      // so attenuate it ourselves — otherwise the underground sun lights every
+      // wall, plinth and roof bright red in pitch darkness.
+      const night = clamp(sky.night || 0, 0, 1);
+      const sunElev = Number.isFinite(sky.sunElevation) ? sky.sunElevation : (sky.sunDir?.y ?? 0.5);
+      const tSun = clamp((sunElev + 0.02) / 0.22, 0, 1);
+      const sunVis = tSun * tSun * (3 - 2 * tSun);
+      const moonElev = sky.moonDir ? sky.moonDir.y : 0.4;
+      const tMoon = clamp((moonElev + 0.05) / 0.30, 0, 1);
+      const moonVis = night * (1 - sunVis) * (tMoon * tMoon * (3 - 2 * tMoon));
       for (const mat of [this.material, this.plinthMaterial, this.roofMaterial]) {
         if (!mat) continue;
-        mat.uniforms.uSunDir.value.copy(sky.sunDir);
-        mat.uniforms.uSunColor.value.copy(sky.sunColor);
+        if (sunVis > 0.005) {
+          mat.uniforms.uSunDir.value.copy(sky.sunDir);
+          mat.uniforms.uSunColor.value.copy(sky.sunColor).multiplyScalar(sunVis);
+        } else {
+          if (sky.moonDir) mat.uniforms.uSunDir.value.copy(sky.moonDir);
+          mat.uniforms.uSunColor.value.copy(_moonCol).multiplyScalar(moonVis);
+        }
+        // Daytime ambient is untouched; at night it fades to dark cool slate
+        // blue instead of warm bright neutral grey.
         mat.uniforms.uAmbient.value
           .copy(sky.skyColor)
           .multiplyScalar(0.65)
           .addScalar(0.18)
-          .multiplyScalar(1.0 - sky.night * 0.75);
-        mat.uniforms.uNight.value = sky.night;
+          .lerp(_nightAmb, night);
+        mat.uniforms.uNight.value = night;
       }
-      this.lightMaterial.opacity = clamp(sky.night * 1.3, 0, 0.95);
+      this.lightMaterial.opacity = clamp(sky.night * 1.08, 0, 0.80);
       this.lightMesh.visible = sky.night > 0.12 && this.lightMesh.count > 0;
     }
 

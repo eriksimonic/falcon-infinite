@@ -4,7 +4,9 @@
 // Vipava Valley or procedural world), overlays real OSM rivers, highways,
 // bridges, airports, towns, landmarks, the aircraft and the Free Camera cone.
 // Clicking anywhere on the map teleports the Free Camera directly above that
-// world coordinate for instant visual inspection and debugging.
+// world coordinate for instant visual inspection and debugging — or, with SPAWN
+// mode (or a right-click), drops the F-16 airborne at 5,000 ft / 300 kt pointing
+// exactly where the Free Camera is looking.
 //
 // Headless-safe: all coordinate conversions work without a DOM; rendering only
 // runs when a canvas element is attached.
@@ -12,6 +14,17 @@
 import { terrainHeight, airportsNear } from '../world/terrain.js';
 
 const M_PER_LAT = 111132.92;
+
+/**
+ * Convert a FreeCamController yaw (radians, forward = (-sin y, 0, -cos y))
+ * into a compass heading in degrees. FlightModel.reset({ heading }) rotates
+ * (0,0,-1) by -heading around Y, which yields (+sin h, 0, -cos h) — so
+ * heading = -yaw, normalised into [0, 360).
+ */
+export function camYawToHeadingDeg(yaw) {
+  if (!Number.isFinite(yaw)) return 0;
+  return (((-yaw * 180) / Math.PI) % 360 + 360) % 360;
+}
 
 export class InspectorMap {
   constructor(callbacks = {}) {
@@ -21,6 +34,10 @@ export class InspectorMap {
     this.centerX = -6000;
     this.centerZ = -1000;
     this.clickAgl = 180;
+    // 'teleport' = left-click drops the Free Cam, 'spawn' = left-click spawns
+    // the F-16 airborne. Right-click always spawns, in either mode.
+    this.clickMode = 'teleport';
+    this.selectedPoint = null; // { x, z } in world metres
 
     this._root = null;
     this._canvas = null;
@@ -29,6 +46,8 @@ export class InspectorMap {
     this._statsEl = null;
     this._listEl = null;
     this._aglBtns = [];
+    this._modeBtns = [];
+    this._spawnBtn = null;
     this._timeInput = null;
     this._timeLabel = null;
     this._weatherSelect = null;
@@ -94,6 +113,26 @@ export class InspectorMap {
       });
     }
 
+    // Click-mode toggle: TELEPORT CAM vs SPAWN F-16.
+    this._modeBtns = [...rootEl.querySelectorAll('[data-mode]')];
+    for (const btn of this._modeBtns) {
+      btn.addEventListener('click', () => {
+        this.clickMode = btn.dataset.mode === 'spawn' ? 'spawn' : 'teleport';
+        this._syncModeButtons();
+        this._updateHoverReadout();
+        this.render();
+      });
+    }
+    this._syncModeButtons();
+
+    // Direct spawn at the last picked point (or the Free Cam itself).
+    this._spawnBtn = rootEl.querySelector('#inspector-spawn-btn');
+    this._spawnBtn?.addEventListener('click', () => {
+      const pt = this.selectedPoint || this._lastState?.camPos;
+      if (!pt || !Number.isFinite(pt.x) || !Number.isFinite(pt.z)) return;
+      this.cb.onSpawnAircraft?.(pt.x, pt.z, camYawToHeadingDeg(this._lastState?.camYaw));
+    });
+
     this._timeInput?.addEventListener('input', () => {
       const h = Number(this._timeInput.value);
       if (Number.isFinite(h)) {
@@ -147,12 +186,21 @@ export class InspectorMap {
         const wasDrag = this._dragMoved;
         this._dragging = false;
         this._dragMoved = false;
-        if (!this.visible || wasDrag || e.button !== 0 || !this._canvas) return;
+        if (!this.visible || wasDrag || !this._canvas) return;
+        if (e.button !== 0 && e.button !== 2) return;
         const rect = this._canvas.getBoundingClientRect();
         if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) return;
         const px = ((e.clientX - rect.left) / Math.max(1, rect.width)) * this._canvas.width;
         const py = ((e.clientY - rect.top) / Math.max(1, rect.height)) * this._canvas.height;
         const w = this.canvasToWorld(px, py, this._canvas.width, this._canvas.height);
+        this.selectedPoint = { x: w.x, z: w.z };
+        // Paint the reticle before a callback can hide the map.
+        this.render();
+        const heading = camYawToHeadingDeg(this._lastState?.camYaw);
+        if (e.button === 2 || (e.button === 0 && this.clickMode === 'spawn')) {
+          this.cb.onSpawnAircraft?.(w.x, w.z, heading);
+          return;
+        }
         this.cb.onTeleport?.(w.x, w.z, this.clickAgl, !e.shiftKey);
       });
       this._canvas.addEventListener('wheel', (e) => {
@@ -213,6 +261,7 @@ export class InspectorMap {
       this._weatherSelect.value = state.weather;
     }
     this._rebuildQuickList();
+    this._updateHoverReadout();
     this.render(state);
   }
 
@@ -236,8 +285,25 @@ export class InspectorMap {
     this._timeLabel.textContent = `${String(hr).padStart(2, '0')}:${String(mn).padStart(2, '0')}`;
   }
 
+  /** Repaint the TELEPORT / SPAWN mode buttons from `this.clickMode`. */
+  _syncModeButtons() {
+    for (const btn of this._modeBtns) {
+      const mode = btn.dataset.mode === 'spawn' ? 'spawn' : 'teleport';
+      btn.classList.toggle('on', mode === this.clickMode);
+    }
+  }
+
   _updateHoverReadout() {
-    if (!this._hoverEl || !this._hoverWorld) return;
+    if (!this._hoverEl) return;
+    const hdg = Math.round(camYawToHeadingDeg(this._lastState?.camYaw)) % 360;
+    const hdgStr = String(hdg).padStart(3, '0');
+    const hint = this.clickMode === 'spawn'
+      ? ` · CLICK TO SPAWN F-16 (5000 FT · 300 KT · HDG ${hdgStr}°)`
+      : ` · L-CLICK TELEPORT · R-CLICK SPAWN F-16 (5000 FT · 300 KT · HDG ${hdgStr}°)`;
+    if (!this._hoverWorld) {
+      this._hoverEl.textContent = `DRAG TO PAN · WHEEL TO ZOOM${hint}`;
+      return;
+    }
     const { x, z } = this._hoverWorld;
     const h = terrainHeight(x, z);
     let gps = '';
@@ -249,7 +315,7 @@ export class InspectorMap {
       gps = ` · ${lat.toFixed(4)}°N ${lon.toFixed(4)}°E`;
     }
     this._hoverEl.textContent =
-      `CURSOR X ${Math.round(x)}  Z ${Math.round(z)} · ELEV ${Math.round(h)} M${gps} · CLICK TO TELEPORT`;
+      `CURSOR X ${Math.round(x)}  Z ${Math.round(z)} · ELEV ${Math.round(h)} M${gps}${hint}`;
   }
 
   _rebuildQuickList() {
@@ -279,7 +345,12 @@ export class InspectorMap {
       if (!btn) return;
       const it = this._quickItems[Number(btn.dataset.idx)];
       if (!it) return;
-      this.cb.onTeleport?.(it.x, it.z, this.clickAgl || it.agl, true);
+      this.selectedPoint = { x: it.x, z: it.z };
+      if (this.clickMode === 'spawn') {
+        this.cb.onSpawnAircraft?.(it.x, it.z, camYawToHeadingDeg(this._lastState?.camYaw));
+      } else {
+        this.cb.onTeleport?.(it.x, it.z, this.clickAgl || it.agl, true);
+      }
     };
   }
 
@@ -529,6 +600,48 @@ export class InspectorMap {
       ctx.beginPath();
       ctx.arc(px, py, 4.5, 0, Math.PI * 2);
       ctx.fill();
+    }
+
+    // 9b. Selected spawn point: amber crosshair + cyan heading vector, so the
+    //     player sees exactly where the F-16 will appear and which way it flies.
+    if (this.selectedPoint && Number.isFinite(this.selectedPoint.x) && Number.isFinite(this.selectedPoint.z)) {
+      const { px, py } = this.worldToCanvas(this.selectedPoint.x, this.selectedPoint.z, W, H);
+      const yaw = Number.isFinite(state.camYaw) ? state.camYaw : 0;
+      const dirX = -Math.sin(yaw);
+      const dirY = -Math.cos(yaw);
+
+      ctx.strokeStyle = '#ffbe55';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.arc(px, py, 10, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      for (const [ax, ay] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        ctx.moveTo(px + ax * 14, py + ay * 14);
+        ctx.lineTo(px + ax * 19, py + ay * 19);
+      }
+      ctx.stroke();
+
+      const len = 46;
+      const tipX = px + dirX * len;
+      const tipY = py + dirY * len;
+      ctx.strokeStyle = '#6fe3ff';
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      ctx.moveTo(px, py);
+      ctx.lineTo(tipX, tipY);
+      ctx.stroke();
+      const ang = Math.atan2(dirY, dirX);
+      ctx.beginPath();
+      ctx.moveTo(tipX, tipY);
+      ctx.lineTo(tipX - Math.cos(ang - 0.42) * 10, tipY - Math.sin(ang - 0.42) * 10);
+      ctx.moveTo(tipX, tipY);
+      ctx.lineTo(tipX - Math.cos(ang + 0.42) * 10, tipY - Math.sin(ang + 0.42) * 10);
+      ctx.stroke();
+
+      ctx.fillStyle = '#ffd892';
+      ctx.font = 'bold 10px monospace';
+      ctx.fillText('SPAWN F-16', px + 13, py + 22);
     }
 
     // 10. Scale bar

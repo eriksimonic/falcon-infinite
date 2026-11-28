@@ -221,7 +221,10 @@ const DETAIL_ALBEDO = /* glsl */`
   // The detail gradient is assembled per octave in the micro-bump pass, where
   // each band is weighted by its own fade.
 
-  vec3 terrN = normalize( vec4( normalize( vNormal ), 0.0 ) * viewMatrix ).xyz;
+  // Swizzle to .xyz BEFORE normalizing: vec4(n, 0.0) * viewMatrix puts the
+  // view-matrix translation dot product (~camera distance) into .w, so a 4D
+  // normalize() would divide .xyz by ~1e4 and collapse terrN to ~0.
+  vec3 terrN = normalize( ( vec4( normalize( vNormal ), 0.0 ) * viewMatrix ).xyz );
   float terrSlope = length( terrN.xz ) / max( abs( terrN.y ), 0.08 );
 
   vec3 terrAlb = terrBase;
@@ -980,6 +983,8 @@ export class TerrainView {
 
     const mesh = new THREE.Mesh(geo, this.material);
     mesh.name = 'tile-' + node.key;
+    // Receive real-time shadows from buildings, landmarks, trees and the F-16.
+    mesh.receiveShadow = true;
     mesh.matrixAutoUpdate = false;
     mesh.updateMatrix();
     mesh.userData = { level, size };
